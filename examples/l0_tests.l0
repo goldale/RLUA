@@ -178,7 +178,7 @@ printf("\n--- Успешные тесты завершены ---\n\n")
 -- =========================================================================
 
 -- 1. Ожидаемые ошибки (VM падает при их выполнении):
--- print(this) 
+-- print(this)
 -- this.run()
 -- struct BadBoard { size: i8; function show_board(x) end }
 -- let t: table<i8> = table { score = 1 }; t.score = 300

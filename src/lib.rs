@@ -2,8 +2,8 @@
 //! The public FFI boundary is C ABI, so it is callable both from C and Rust.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
-use std::ffi::CStr;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::{CStr, CString};
 use std::fs;
 use std::fmt;
 use std::io::{self, Write};
@@ -152,16 +152,24 @@ impl Heap {
     }
 
     fn mark_value(&mut self, value: &Value) {
-        let reference = match value { Value::Array(r, _) | Value::Tensor(r, _, _) | Value::String(r) | Value::Table(r, _) | Value::Struct(r, _) => *r, _ => return };
-        let Some(slot) = self.slots.get_mut(reference.0).and_then(Option::as_mut) else { return };
-        if slot.marked { return; }
-        slot.marked = true;
-        let children = match &slot.object {
-            HeapObject::Array { .. } | HeapObject::Tensor { .. } | HeapObject::String(_) => Vec::new(),
-            HeapObject::Table { entries, .. } => entries.values().cloned().collect(),
-            HeapObject::Struct { values, .. } => values.clone(),
-        };
-        for child in &children { self.mark_value(child); }
+        // Heap graphs can be arbitrarily deep. Mark iteratively so a valid
+        // script cannot exhaust the host thread stack during collection.
+        let mut work = vec![value.clone()];
+        while let Some(value) = work.pop() {
+            let reference = match value {
+                Value::Array(r, _) | Value::Tensor(r, _, _) | Value::String(r)
+                | Value::Table(r, _) | Value::Struct(r, _) => r,
+                _ => continue,
+            };
+            let Some(slot) = self.slots.get_mut(reference.0).and_then(Option::as_mut) else { continue };
+            if slot.marked { continue; }
+            slot.marked = true;
+            match &slot.object {
+                HeapObject::Table { entries, .. } => work.extend(entries.values().cloned()),
+                HeapObject::Struct { values, .. } => work.extend(values.iter().cloned()),
+                HeapObject::Array { .. } | HeapObject::Tensor { .. } | HeapObject::String(_) => {}
+            }
+        }
     }
     fn collect(&mut self, roots: impl IntoIterator<Item = Value>) -> usize {
         for root in roots { self.mark_value(&root); }
@@ -201,26 +209,15 @@ fn scalar_size(ty: &Type) -> Result<usize, Error> { type_size(ty).ok_or_else(|| 
 
 fn encode_scalar(value: &Value, element: &Type, bytes: &mut Vec<u8>) -> Result<(), Error> {
     if &value.ty() != element { return Err(Error::Runtime("VM array type invariant broken".into())); }
-    let size = scalar_size(element)?;
-    let start = bytes.len();
-    bytes.reserve(size);
-    unsafe {
-        bytes.set_len(start + size);
-        let ptr = bytes.as_mut_ptr().add(start);
-        match value {
-            Value::I8(v) => *ptr = *v as u8,
-            Value::U8(v) => *ptr = *v,
-            Value::Bool(v) => *ptr = u8::from(*v),
-            Value::I16(v) => std::ptr::write_unaligned(ptr as *mut i16, *v),
-            Value::U16(v) | Value::F16(v) => std::ptr::write_unaligned(ptr as *mut u16, *v),
-            Value::I32(v) => std::ptr::write_unaligned(ptr as *mut i32, *v),
-            Value::U32(v) => std::ptr::write_unaligned(ptr as *mut u32, *v),
-            Value::F32(v) => std::ptr::write_unaligned(ptr as *mut f32, *v),
-            Value::I64(v) => std::ptr::write_unaligned(ptr as *mut i64, *v),
-            Value::U64(v) => std::ptr::write_unaligned(ptr as *mut u64, *v),
-            Value::F64(v) => std::ptr::write_unaligned(ptr as *mut f64, *v),
-            _ => return Err(Error::Type("packed arrays can contain only scalar values".into())),
-        }
+    match value {
+        Value::I8(v) => bytes.push(*v as u8), Value::U8(v) => bytes.push(*v),
+        Value::Bool(v) => bytes.push(u8::from(*v)),
+        Value::I16(v) => bytes.extend(v.to_le_bytes()), Value::U16(v) | Value::F16(v) => bytes.extend(v.to_le_bytes()),
+        Value::I32(v) => bytes.extend(v.to_le_bytes()), Value::U32(v) => bytes.extend(v.to_le_bytes()),
+        Value::F32(v) => bytes.extend(v.to_bits().to_le_bytes()),
+        Value::I64(v) => bytes.extend(v.to_le_bytes()), Value::U64(v) => bytes.extend(v.to_le_bytes()),
+        Value::F64(v) => bytes.extend(v.to_bits().to_le_bytes()),
+        _ => return Err(Error::Type("packed arrays can contain only scalar values".into())),
     }
     Ok(())
 }
@@ -231,23 +228,15 @@ fn decode_scalar(bytes: &[u8], index: usize, element: &Type) -> Result<Value, Er
         return Err(Error::Runtime(format!("array index {} is out of bounds", index)));
     }
 
-    let ptr = unsafe { bytes.as_ptr().add(offset) };
-    unsafe {
-        match element {
-            Type::I8 => Ok(Value::I8(*ptr as i8)),
-            Type::U8 => Ok(Value::U8(*ptr)),
-            Type::Bool => Ok(Value::Bool(*ptr != 0)),
-            Type::I16 => Ok(Value::I16(std::ptr::read_unaligned(ptr as *const i16))),
-            Type::U16 => Ok(Value::U16(std::ptr::read_unaligned(ptr as *const u16))),
-            Type::F16 => Ok(Value::F16(std::ptr::read_unaligned(ptr as *const u16))),
-            Type::I32 => Ok(Value::I32(std::ptr::read_unaligned(ptr as *const i32))),
-            Type::U32 => Ok(Value::U32(std::ptr::read_unaligned(ptr as *const u32))),
-            Type::F32 => Ok(Value::F32(std::ptr::read_unaligned(ptr as *const f32))),
-            Type::I64 => Ok(Value::I64(std::ptr::read_unaligned(ptr as *const i64))),
-            Type::U64 => Ok(Value::U64(std::ptr::read_unaligned(ptr as *const u64))),
-            Type::F64 => Ok(Value::F64(std::ptr::read_unaligned(ptr as *const f64))),
-            _ => Err(Error::Type("not a scalar type".into())),
-        }
+    let cell = &bytes[offset..offset + size];
+    match element {
+        Type::I8 => Ok(Value::I8(cell[0] as i8)), Type::U8 => Ok(Value::U8(cell[0])), Type::Bool => Ok(Value::Bool(cell[0] != 0)),
+        Type::I16 => Ok(Value::I16(i16::from_le_bytes(cell.try_into().unwrap()))), Type::U16 => Ok(Value::U16(u16::from_le_bytes(cell.try_into().unwrap()))),
+        Type::F16 => Ok(Value::F16(u16::from_le_bytes(cell.try_into().unwrap()))), Type::I32 => Ok(Value::I32(i32::from_le_bytes(cell.try_into().unwrap()))),
+        Type::U32 => Ok(Value::U32(u32::from_le_bytes(cell.try_into().unwrap()))), Type::F32 => Ok(Value::F32(f32::from_bits(u32::from_le_bytes(cell.try_into().unwrap())))),
+        Type::I64 => Ok(Value::I64(i64::from_le_bytes(cell.try_into().unwrap()))), Type::U64 => Ok(Value::U64(u64::from_le_bytes(cell.try_into().unwrap()))),
+        Type::F64 => Ok(Value::F64(f64::from_bits(u64::from_le_bytes(cell.try_into().unwrap())))),
+        _ => Err(Error::Type("not a scalar type".into())),
     }
 }
 
@@ -258,24 +247,9 @@ fn write_scalar(bytes: &mut [u8], index: usize, value: &Value, element: &Type) -
         return Err(Error::Runtime(format!("array index {} is out of bounds", index)));
     }
 
-    let ptr = unsafe { bytes.as_mut_ptr().add(offset) };
-    unsafe {
-        match value {
-            Value::I8(v) => *ptr = *v as u8,
-            Value::U8(v) => *ptr = *v,
-            Value::Bool(v) => *ptr = u8::from(*v),
-            Value::I16(v) => std::ptr::write_unaligned(ptr as *mut i16, *v),
-            Value::U16(v) => std::ptr::write_unaligned(ptr as *mut u16, *v),
-            Value::F16(v) => std::ptr::write_unaligned(ptr as *mut u16, *v),
-            Value::I32(v) => std::ptr::write_unaligned(ptr as *mut i32, *v),
-            Value::U32(v) => std::ptr::write_unaligned(ptr as *mut u32, *v),
-            Value::F32(v) => std::ptr::write_unaligned(ptr as *mut f32, *v),
-            Value::I64(v) => std::ptr::write_unaligned(ptr as *mut i64, *v),
-            Value::U64(v) => std::ptr::write_unaligned(ptr as *mut u64, *v),
-            Value::F64(v) => std::ptr::write_unaligned(ptr as *mut f64, *v),
-            _ => return Err(Error::Type("not a scalar type".into())),
-        }
-    }
+    let mut encoded = Vec::with_capacity(size);
+    encode_scalar(value, element, &mut encoded)?;
+    bytes[offset..offset + size].copy_from_slice(&encoded);
     Ok(())
 }
 impl fmt::Display for Value {
@@ -813,12 +787,13 @@ struct Compiler {
     methods: HashMap<(String, String), Option<usize>>, pending_method_calls: Vec<(usize, String, String)>,
     current_method_fields: Option<HashMap<String, StructField>>, current_method_struct: Option<String>,
     module_root: Option<PathBuf>, module_artifacts: HashMap<String, ModuleArtifact>,
+    compiling_modules: Rc<RefCell<HashSet<String>>>,
     exports: HashMap<String, ModuleExport>, extern_functions: HashMap<String, HostSignature>, code: Vec<Op>,
     interned_names: HashMap<String, Rc<str>>,
     next_slot: usize, loops: Vec<LoopContext>
 }
 
-impl Default for Compiler { fn default() -> Self { Self { names: HashMap::new(), structs: HashMap::new(), methods: HashMap::new(), pending_method_calls: Vec::new(), current_method_fields: None, current_method_struct: None, module_root: None, module_artifacts: HashMap::new(), exports: HashMap::new(), extern_functions: HashMap::new(), code: Vec::new(), interned_names: HashMap::new(), next_slot: 0, loops: Vec::new() } } }
+impl Default for Compiler { fn default() -> Self { Self { names: HashMap::new(), structs: HashMap::new(), methods: HashMap::new(), pending_method_calls: Vec::new(), current_method_fields: None, current_method_struct: None, module_root: None, module_artifacts: HashMap::new(), compiling_modules: Rc::new(RefCell::new(HashSet::new())), exports: HashMap::new(), extern_functions: HashMap::new(), code: Vec::new(), interned_names: HashMap::new(), next_slot: 0, loops: Vec::new() } } }
 
 impl Compiler {
     fn with_module_root(module_root: PathBuf) -> Self { Self { module_root: Some(module_root), ..Self::default() } }
@@ -829,6 +804,17 @@ impl Compiler {
         let interned: Rc<str> = Rc::from(name);
         self.interned_names.insert(name.to_owned(), interned.clone());
         interned
+    }
+
+    /// Compile a lexical block and then discard bindings and slots introduced
+    /// inside it. Slots are reused by later blocks.
+    fn scoped_block(&mut self, body: Vec<Statement>) -> Result<(), Error> {
+        let saved_names = self.names.clone();
+        let saved_next_slot = self.next_slot;
+        let result = body.into_iter().try_for_each(|statement| self.statement(statement));
+        self.names = saved_names;
+        self.next_slot = saved_next_slot;
+        result
     }
 
     fn binary_opcode(op: BinOp, ty: &Type) -> Result<BinaryOp, Error> {
@@ -873,11 +859,19 @@ impl Compiler {
         if !canonical.starts_with(root) { return Err(Error::Type(format!("module '{requested}' escapes the module root"))); }
         let id = canonical.to_string_lossy().into_owned();
         if let Some(module) = self.module_artifacts.get(&id) { return Ok(module.clone()); }
-        let source = fs::read_to_string(&canonical).map_err(|error| Error::Runtime(format!("cannot read module '{requested}': {error}")))?;
-        let program = Parser::new(lex(&source)?).program()?;
-        let mut module_compiler = Compiler::with_module_root(root.to_path_buf());
-        module_compiler.extern_functions = self.extern_functions.clone();
-        let module = module_compiler.compile_module(id.clone(), program)?;
+        if !self.compiling_modules.borrow_mut().insert(id.clone()) {
+            return Err(Error::Type(format!("cyclic module import involving '{requested}'")));
+        }
+        let module = (|| {
+            let source = fs::read_to_string(&canonical).map_err(|error| Error::Runtime(format!("cannot read module '{requested}': {error}")))?;
+            let program = Parser::new(lex(&source)?).program()?;
+            let mut module_compiler = Compiler::with_module_root(root.to_path_buf());
+            module_compiler.compiling_modules = self.compiling_modules.clone();
+            module_compiler.extern_functions = self.extern_functions.clone();
+            module_compiler.compile_module(id.clone(), program)
+        })();
+        self.compiling_modules.borrow_mut().remove(&id);
+        let module = module?;
         self.module_artifacts.insert(id, module.clone());
         Ok(module)
     }
@@ -890,7 +884,7 @@ impl Compiler {
     fn compile_module_function(&mut self, name: String, body: Vec<Statement>) -> Result<(), Error> {
         if self.exports.contains_key(&name) { return Err(Error::Type(format!("module already exports '{name}'"))); }
         let skip_body = self.code.len(); self.code.push(Op::Jump(usize::MAX)); let entry = self.code.len();
-        for statement in body { self.statement(statement)?; }
+        self.scoped_block(body)?;
         self.code.push(Op::Return); let after_body = self.code.len(); self.code[skip_body] = Op::Jump(after_body);
         self.exports.insert(name, ModuleExport::Function { entry }); Ok(())
     }
@@ -909,6 +903,8 @@ impl Compiler {
         let method_fields = layout.fields.iter().cloned().map(|field| (field.name.clone(), field)).collect();
         let previous_fields = self.current_method_fields.replace(method_fields);
         let previous_struct = self.current_method_struct.replace(struct_name.to_owned());
+        let saved_names = self.names.clone();
+        let saved_next_slot = self.next_slot;
         // Read the arguments and bind them to local variable slots
         for (arg_name, arg_ty) in args.into_iter().rev() {
             let slot = self.next_slot;
@@ -916,9 +912,12 @@ impl Compiler {
             self.names.insert(arg_name, (slot, arg_ty));
             self.code.push(Op::Store(slot));
         }
-        for statement in body { self.statement(statement)?; }
+        let body_result = body.into_iter().try_for_each(|statement| self.statement(statement));
         self.current_method_fields = previous_fields;
         self.current_method_struct = previous_struct;
+        self.names = saved_names;
+        self.next_slot = saved_next_slot;
+        body_result?;
         self.code.push(Op::Return);
         let after_body = self.code.len();
         self.code[skip_body] = Op::Jump(after_body);
@@ -1037,7 +1036,7 @@ impl Compiler {
             Ok(())
         },
         Statement::Putc(expr) => { self.expr(expr, None)?; self.code.push(Op::Putc); Ok(()) },
-        Statement::If { condition, then_body, else_body } => { let ty = self.expr(condition, None)?; if ty != Type::Bool { return Err(Error::Type(format!("if condition must be bool, got {ty}"))); } let false_jump = self.code.len(); self.code.push(Op::JumpIfFalse(usize::MAX)); for statement in then_body { self.statement(statement)?; } if else_body.is_empty() { let end = self.code.len(); self.code[false_jump] = Op::JumpIfFalse(end); } else { let end_jump = self.code.len(); self.code.push(Op::Jump(usize::MAX)); let else_start = self.code.len(); self.code[false_jump] = Op::JumpIfFalse(else_start); for statement in else_body { self.statement(statement)?; } let end = self.code.len(); self.code[end_jump] = Op::Jump(end); } Ok(()) },
+        Statement::If { condition, then_body, else_body } => { let ty = self.expr(condition, None)?; if ty != Type::Bool { return Err(Error::Type(format!("if condition must be bool, got {ty}"))); } let false_jump = self.code.len(); self.code.push(Op::JumpIfFalse(usize::MAX)); self.scoped_block(then_body)?; if else_body.is_empty() { let end = self.code.len(); self.code[false_jump] = Op::JumpIfFalse(end); } else { let end_jump = self.code.len(); self.code.push(Op::Jump(usize::MAX)); let else_start = self.code.len(); self.code[false_jump] = Op::JumpIfFalse(else_start); self.scoped_block(else_body)?; let end = self.code.len(); self.code[end_jump] = Op::Jump(end); } Ok(()) },
         Statement::While { condition, body } => {
             let loop_start = self.code.len();
             let ty = self.expr(condition, None)?;
@@ -1045,7 +1044,7 @@ impl Compiler {
             let exit_jump = self.code.len();
             self.code.push(Op::JumpIfFalse(usize::MAX));
             self.loops.push(LoopContext { break_jumps: Vec::new(), continue_jumps: Vec::new(), continue_target: loop_start });
-            for statement in body { self.statement(statement)?; }
+            self.scoped_block(body)?;
             self.code.push(Op::Jump(loop_start));
             let end = self.code.len();
             self.code[exit_jump] = Op::JumpIfFalse(end);
@@ -1074,7 +1073,7 @@ impl Compiler {
             let exit_jump = self.code.len();
             self.code.push(Op::JumpIfFalse(usize::MAX));
             self.loops.push(LoopContext { break_jumps: Vec::new(), continue_jumps: Vec::new(), continue_target: usize::MAX });
-            for statement in body { self.statement(statement)?; }
+            self.scoped_block(body)?;
             let increment_start = self.code.len();
             self.code.push(Op::Load(index_slot));
             self.code.push(Op::Push(Value::I32(1)));
@@ -1088,6 +1087,7 @@ impl Compiler {
             for jump in context.break_jumps { self.code[jump] = Op::Jump(loop_end); }
             for jump in context.continue_jumps { self.code[jump] = Op::Jump(context.continue_target); }
             self.names.remove(&name);
+            self.next_slot = index_slot;
             Ok(())
         },
         Statement::Break => {
@@ -1160,7 +1160,7 @@ impl Compiler {
                 "len" => {
                     if args.len() != 1 { return Err(Error::Type("len expects 1 argument".into())); }
                     let ty = self.expr(args.remove(0), None)?;
-                    if !matches!(ty, Type::Array(_)) { return Err(Error::Type(format!("len requires a vector, got {ty}"))); }
+                    if !matches!(ty, Type::Array(_) | Type::String | Type::Table(_) | Type::Tensor(_, _)) { return Err(Error::Type(format!("len requires a vector, string, table, or tensor, got {ty}"))); }
                     self.code.push(Op::Len);
                     Ok(Type::I32)
                 },
@@ -1575,7 +1575,7 @@ impl Vm {
                         let start = offset.checked_mul(4).ok_or_else(|| Error::Runtime("tensor offset is too large".into()))?;
                         if start + 4 > bytes.len() { return Err(Error::Runtime("tensor offset out of bounds".into())); }
                         if let Value::F32(v) = value {
-                            unsafe { std::ptr::write_unaligned(bytes.as_mut_ptr().add(start) as *mut f32, v); }
+                            bytes[start..start + 4].copy_from_slice(&v.to_bits().to_le_bytes());
                         }
                     },
                     _ => return Err(Error::Runtime("tensor heap invariant broken".into())),
@@ -1617,7 +1617,8 @@ impl Vm {
                     HeapObject::Tensor { bytes, shape, .. } => {
                         let offset = Self::tensor_offset(shape, &indices)?;
                         let start = offset.checked_mul(4).ok_or_else(|| Error::Runtime("tensor offset is too large".into()))?;
-                        unsafe { Value::F32(std::ptr::read_unaligned(bytes.as_ptr().add(start) as *const f32)) }
+                        let raw: [u8; 4] = bytes.get(start..start + 4).ok_or_else(|| Error::Runtime("tensor offset out of bounds".into()))?.try_into().expect("exact f32 cell");
+                        Value::F32(f32::from_bits(u32::from_le_bytes(raw)))
                     },
                     _ => return Err(Error::Runtime("tensor heap invariant broken".into())),
                 };
@@ -1639,10 +1640,24 @@ impl Vm {
             Op::Unary(op, ty) => { let val = self.pop()?; self.push(evaluate_unary(val, op, ty)?); },
             Op::Len => {
                 let value = self.pop()?;
-                let Value::Array(reference, element) = value else { return Err(Error::Runtime("VM len invariant broken".into())); };
-                let length = match self.heap.borrow().get(reference)? {
-                    HeapObject::Array { bytes, element: stored_element } if stored_element == element.as_ref() => bytes.len() / scalar_size(&element)?,
-                    _ => return Err(Error::Runtime("array heap invariant broken".into())),
+                let length = match value {
+                    Value::Array(reference, element) => match self.heap.borrow().get(reference)? {
+                        HeapObject::Array { bytes, element: stored_element } if stored_element == element.as_ref() => bytes.len() / scalar_size(&element)?,
+                        _ => return Err(Error::Runtime("array heap invariant broken".into())),
+                    },
+                    Value::String(reference) => match self.heap.borrow().get(reference)? {
+                        HeapObject::String(text) => text.chars().count(),
+                        _ => return Err(Error::Runtime("string heap invariant broken".into())),
+                    },
+                    Value::Table(reference, _) => match self.heap.borrow().get(reference)? {
+                        HeapObject::Table { entries, .. } => entries.len(),
+                        _ => return Err(Error::Runtime("table heap invariant broken".into())),
+                    },
+                    Value::Tensor(reference, _, _) => match self.heap.borrow().get(reference)? {
+                        HeapObject::Tensor { shape, .. } => shape.iter().try_fold(1usize, |total, dimension| total.checked_mul(*dimension)).ok_or_else(|| Error::Runtime("tensor is too large".into()))?,
+                        _ => return Err(Error::Runtime("tensor heap invariant broken".into())),
+                    },
+                    _ => return Err(Error::Runtime("VM len invariant broken".into())),
                 };
                 let length = i32::try_from(length).map_err(|_| Error::Runtime("vector length exceeds i32".into()))?;
                 self.push(Value::I32(length));
@@ -2020,7 +2035,12 @@ pub fn execute_file(path: impl AsRef<Path>) -> Result<Vec<String>, Error> { let 
 pub fn execute_interactive_file(path: impl AsRef<Path>) -> Result<(), Error> { let path = fs::canonicalize(path.as_ref()).map_err(|error| Error::Runtime(format!("cannot open source file: {error}")))?; let root = path.parent().ok_or_else(|| Error::Runtime("source file has no parent directory".into()))?.to_path_buf(); let source = fs::read_to_string(&path).map_err(|error| Error::Runtime(format!("cannot read source file: {error}")))?; let program = Parser::new(lex(&source)?).program()?; let code = Compiler::with_module_root(root).compile(program)?; let mut vm = Vm { interactive: true, ..Vm::default() }; vm.run(&code)?; Ok(()) }
 
 /// Opaque C ABI state. Only this crate may access its interior.
-#[repr(C)] pub struct L0State { vm: Vm, ffi_call: Option<FfiCall> }
+#[repr(C)] pub struct L0State {
+    vm: Vm,
+    ffi_call: Option<FfiCall>,
+    is_executing: bool,
+    last_error: Option<CString>,
+}
 pub type L0CFunction = unsafe extern "C" fn(*mut L0State) -> c_int;
 
 /// Stable scalar type IDs accepted by the C FFI registration API.
@@ -2094,7 +2114,13 @@ c_scalar_helpers!(l0_push_f64, l0_to_f64, F64, f64);
 }
 
 #[no_mangle] pub extern "C" fn l0_abi_version() -> u32 { ABI_VERSION }
-#[no_mangle] pub extern "C" fn l0_new_state() -> *mut L0State { Box::into_raw(Box::new(L0State { vm: Vm::default(), ffi_call: None })) }
+#[no_mangle] pub extern "C" fn l0_new_state() -> *mut L0State { Box::into_raw(Box::new(L0State { vm: Vm::default(), ffi_call: None, is_executing: false, last_error: None })) }
+/// # Safety
+/// `state` must be valid. The returned pointer remains valid until the next
+/// operation on this state and must not be freed by the caller.
+#[no_mangle] pub unsafe extern "C" fn l0_last_error(state: *const L0State) -> *const std::os::raw::c_char {
+    state.as_ref().and_then(|state| state.last_error.as_ref()).map_or(std::ptr::null(), |message| message.as_ptr())
+}
 /// # Safety
 /// `state` must have been returned by `l0_new_state` and not freed already.
 #[no_mangle] pub unsafe extern "C" fn l0_free_state(state: *mut L0State) { if !state.is_null() { drop(Box::from_raw(state)); } }
@@ -2125,10 +2151,26 @@ c_scalar_helpers!(l0_push_f64, l0_to_f64, F64, f64);
     let Some(state_ref) = state.as_mut() else { return 0 };
     if source.is_null() { return 0; }
     let Ok(source) = CStr::from_ptr(source).to_str() else { return 0; };
-    let previous_state = state_ref.vm.callback_state.replace(state);
-    let result = state_ref.vm.execute(source);
-    state_ref.vm.callback_state = previous_state;
-    if result.is_ok() { 1 } else { 0 }
+    if state_ref.is_executing { return 0; }
+    state_ref.last_error = None;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        state_ref.is_executing = true;
+        let previous_state = state_ref.vm.callback_state.replace(state);
+        let result = state_ref.vm.execute(source);
+        state_ref.vm.callback_state = previous_state;
+        state_ref.is_executing = false;
+        result
+    }));
+    match result {
+        Ok(Ok(_)) => 1,
+        Ok(Err(error)) => { state_ref.last_error = CString::new(error.to_string()).ok(); 0 }
+        Err(_) => {
+            state_ref.is_executing = false;
+            state_ref.vm.callback_state = None;
+            state_ref.last_error = CString::new("panic prevented from crossing the C ABI boundary").ok();
+            0
+        }
+    }
 }
 // IEEE binary16 conversion, dependency-free so the language's f16 type is portable.
 pub fn f32_to_f16(value: f32) -> u16 { let bits=value.to_bits(); let sign=((bits>>16)&0x8000) as u16; let exp=((bits>>23)&0xff) as i32-127+15; let mant=bits&0x7fffff; if exp<=0 { if exp < -10{return sign}; return sign|(((mant|0x800000)>>(14-exp)) as u16); } if exp>=31 { return sign|0x7c00|if mant==0{0}else{1}; } sign|((exp as u16)<<10)|((mant>>13) as u16) }
@@ -2137,13 +2179,11 @@ pub fn f16_to_f32(bits: u16) -> f32 { let sign=((bits as u32)&0x8000)<<16; let e
 #[cfg(test)]
 mod immediate_regression_tests {
     use super::*;
-
     #[test]
     fn float_literals_cannot_claim_non_float_types() {
         assert!(matches!(execute("let value: i32 = 1.0"), Err(Error::Type(_))));
         assert!(matches!(execute("let value: bool = 1.0"), Err(Error::Type(_))));
     }
-
     #[test]
     fn specialized_i32_addition_reports_overflow() {
         assert!(matches!(
@@ -2151,17 +2191,40 @@ mod immediate_regression_tests {
             Err(Error::Runtime(message)) if message == "addition overflow"
         ));
     }
-
     #[test]
     fn unary_not_is_lexed_parsed_and_evaluated() {
         assert_eq!(execute("let no: bool = 1 == 0; print(!no)").unwrap(), vec!["true".to_owned()]);
     }
-
     #[test]
     fn strings_compare_by_content() {
         assert_eq!(
             execute("let left: string = \"same\"; let right: string = \"same\"; print(left == right)").unwrap(),
             vec!["true".to_owned()]
         );
+    }
+    #[test]
+    fn block_locals_do_not_escape_or_consume_slots_forever() {
+        assert!(matches!(
+            execute("if 1 == 1 then let inner: i32 = 7 end print(inner)"),
+            Err(Error::Type(message)) if message == "unknown name 'inner'"
+        ));
+        assert!(matches!(
+            execute("for i = 1, 2 do let temporary: i32 = i end print(i)"),
+            Err(Error::Type(message)) if message == "unknown name 'i'"
+        ));
+    }
+    #[test]
+    fn len_supports_all_sized_runtime_values() {
+        assert_eq!(
+            execute("let text: string = \"ёж\"; let map: table<i32> = table { a = 1, b = 2 }; print(len(text)); print(len(map))").unwrap(),
+            vec!["2".to_owned(), "2".to_owned()]
+        );
+    }
+    #[test]
+    fn packed_scalars_are_little_endian() {
+        let mut bytes = Vec::new();
+        encode_scalar(&Value::I32(0x0102_0304), &Type::I32, &mut bytes).unwrap();
+        assert_eq!(bytes, [4, 3, 2, 1]);
+        assert_eq!(decode_scalar(&bytes, 0, &Type::I32).unwrap(), Value::I32(0x0102_0304));
     }
 }
