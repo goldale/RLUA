@@ -1,12 +1,14 @@
 //! L0: experimental typed Lua-like language with a stack bytecode VM.
 //! The public FFI boundary is C ABI, so it is callable both from C and Rust.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::fmt;
 use std::io::{self, Write};
 use std::os::raw::c_int;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 pub const ABI_VERSION: u32 = 1;
 
@@ -34,15 +36,18 @@ impl fmt::Display for Type {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HeapRef(usize);
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     I8(i8), I16(i16), I32(i32), I64(i64), U8(u8), U16(u16), U32(u32), U64(u64),
     /// IEEE-754 binary16 bits. Arithmetic widens to f32 and rounds back to f16.
-    F16(u16), F32(f32), F64(f64), Bool(bool), String(String),
-    /// Homogeneous scalar values encoded consecutively in canonical little-endian form.
-    Array(Vec<u8>, Box<Type>),
-    Table(HashMap<TableKey, Value>, Box<Type>),
-    Struct(Vec<Value>, StructLayout),
+    F16(u16), F32(f32), F64(f64), Bool(bool), String(HeapRef),
+    /// A handle to homogeneous scalar values packed in canonical little-endian form.
+    Array(HeapRef, Box<Type>),
+    Table(HeapRef, Box<Type>),
+    Struct(HeapRef, StructLayout),
     Module(String),
 }
 
@@ -69,50 +74,82 @@ impl Value {
         }
     }
 
-    fn array(values: Vec<Value>, element: Type) -> Result<Value, Error> {
-        let element_size = scalar_size(&element)?;
+    fn pack_array(values: Vec<Value>, element: &Type) -> Result<Vec<u8>, Error> {
+        let element_size = scalar_size(element)?;
         let mut bytes = Vec::with_capacity(values.len().checked_mul(element_size).ok_or_else(|| Error::Runtime("array is too large".into()))?);
-        for value in values { encode_scalar(&value, &element, &mut bytes)?; }
-        Ok(Self::Array(bytes, Box::new(element)))
+        for value in values { encode_scalar(&value, element, &mut bytes)?; }
+        Ok(bytes)
     }
 
-    fn index(&self, index: usize) -> Result<Value, Error> {
-        match self {
-            Self::Array(bytes, element) => decode_scalar(bytes, index, element),
-            _ => Err(Error::Runtime(format!("cannot index a {}", self.ty()))),
+}
+
+#[derive(Clone, Debug)]
+enum HeapObject {
+    Array { bytes: Vec<u8>, element: Type },
+    String(String),
+    Table { entries: HashMap<TableKey, Value>, element: Type },
+    Struct { values: Vec<Value>, layout: StructLayout },
+}
+
+#[derive(Clone, Debug)]
+struct HeapSlot { marked: bool, object: HeapObject }
+
+/// Non-moving mark-and-sweep storage for every reference value in the VM.
+#[derive(Debug)]
+struct Heap {
+    slots: Vec<Option<HeapSlot>>,
+    free: Vec<usize>,
+    allocations_since_collection: usize,
+    threshold: usize,
+}
+
+impl Default for Heap {
+    fn default() -> Self { Self { slots: Vec::new(), free: Vec::new(), allocations_since_collection: 0, threshold: 64 } }
+}
+
+impl Heap {
+    fn allocate(&mut self, object: HeapObject) -> HeapRef {
+        let index = self.free.pop().unwrap_or_else(|| { self.slots.push(None); self.slots.len() - 1 });
+        self.slots[index] = Some(HeapSlot { marked: false, object });
+        self.allocations_since_collection += 1;
+        HeapRef(index)
+    }
+
+    fn get(&self, reference: HeapRef) -> Result<&HeapObject, Error> {
+        self.slots.get(reference.0).and_then(Option::as_ref).map(|slot| &slot.object).ok_or_else(|| Error::Runtime("dangling heap reference".into()))
+    }
+
+    fn get_mut(&mut self, reference: HeapRef) -> Result<&mut HeapObject, Error> {
+        self.slots.get_mut(reference.0).and_then(Option::as_mut).map(|slot| &mut slot.object).ok_or_else(|| Error::Runtime("dangling heap reference".into()))
+    }
+
+    fn mark_value(&mut self, value: &Value) {
+        let reference = match value { Value::Array(r, _) | Value::String(r) | Value::Table(r, _) | Value::Struct(r, _) => *r, _ => return };
+        let Some(slot) = self.slots.get_mut(reference.0).and_then(Option::as_mut) else { return };
+        if slot.marked { return; }
+        slot.marked = true;
+        let children = match &slot.object {
+            HeapObject::Array { .. } | HeapObject::String(_) => Vec::new(),
+            HeapObject::Table { entries, .. } => entries.values().cloned().collect(),
+            HeapObject::Struct { values, .. } => values.clone(),
+        };
+        for child in &children { self.mark_value(child); }
+    }
+
+    fn collect(&mut self, roots: impl IntoIterator<Item = Value>) -> usize {
+        for root in roots { self.mark_value(&root); }
+        let mut reclaimed = 0;
+        for (index, slot) in self.slots.iter_mut().enumerate() {
+            let Some(live) = slot.as_mut() else { continue };
+            if live.marked { live.marked = false; } else { *slot = None; self.free.push(index); reclaimed += 1; }
         }
+        self.allocations_since_collection = 0;
+        self.threshold = (self.slots.len().max(64) * 2).max(64);
+        reclaimed
     }
 
-    fn set_index(&mut self, index: usize, value: Value) -> Result<(), Error> {
-        let Self::Array(bytes, element) = self else { return Err(Error::Runtime("VM array slot invariant broken".into())); };
-        let size = scalar_size(element)?;
-        let start = index.checked_mul(size).ok_or_else(|| Error::Runtime("array index too large".into()))?;
-        let end = start.checked_add(size).ok_or_else(|| Error::Runtime("array index too large".into()))?;
-        if end > bytes.len() { return Err(Error::Runtime(format!("array index {index} is out of bounds (length {})", bytes.len() / size))); }
-        let mut encoded = Vec::with_capacity(size);
-        encode_scalar(&value, element, &mut encoded)?;
-        bytes[start..end].copy_from_slice(&encoded);
-        Ok(())
-    }
-
-    fn table_index(&self, key: TableKey) -> Result<Value, Error> {
-        let Self::Table(entries, _) = self else { return Err(Error::Runtime("VM table invariant broken".into())); };
-        entries.get(&key).cloned().ok_or_else(|| Error::Runtime(format!("table has no key {}", table_key_display(&key))))
-    }
-
-    fn set_table_key(&mut self, key: TableKey, value: Value) -> Result<(), Error> {
-        let Self::Table(entries, element) = self else { return Err(Error::Runtime("VM table invariant broken".into())); };
-        if &value.ty() != element.as_ref() { return Err(Error::Runtime("VM table type invariant broken".into())); }
-        entries.insert(key, value);
-        Ok(())
-    }
-
-    fn field(&self, field: &StructField) -> Result<Value, Error> {
-        match self { Self::Struct(values, _) => values.get(field.index).cloned().ok_or_else(|| Error::Runtime("invalid struct field index".into())), _ => Err(Error::Runtime("VM struct invariant broken".into())) } }
-    fn set_field(&mut self, field: &StructField, value: Value) -> Result<(), Error> {
-        let Self::Struct(values, _) = self else { return Err(Error::Runtime("VM struct invariant broken".into())); }; if value.ty() != field.ty { return Err(Error::Runtime("VM struct field type invariant broken".into())); } let target = values.get_mut(field.index).ok_or_else(|| Error::Runtime("invalid struct field index".into()))?; *target = value; Ok(()) }
-    fn set_field_index(&mut self, field: &StructField, index: usize, value: Value) -> Result<(), Error> {
-        let Self::Struct(values, _) = self else { return Err(Error::Runtime("VM struct invariant broken".into())); }; let target = values.get_mut(field.index).ok_or_else(|| Error::Runtime("invalid struct field index".into()))?; target.set_index(index, value) }
+    fn should_collect(&self) -> bool { self.allocations_since_collection >= self.threshold }
+    #[cfg(test)] fn allocated_count(&self) -> usize { self.slots.iter().filter(|slot| slot.is_some()).count() }
 }
 
 fn table_key_display(key: &TableKey) -> String { match key { TableKey::Index(index) => format!("[{index}]"), TableKey::Name(name) => name.clone() } }
@@ -181,13 +218,8 @@ impl fmt::Display for Value {
             Self::U32(v) => write!(f, "{v}"), Self::U64(v) => write!(f, "{v}"),
             Self::F16(v) => write!(f, "{}", f16_to_f32(*v)), Self::F32(v) => write!(f, "{v}"),
             Self::F64(v) => write!(f, "{v}"), Self::Bool(v) => write!(f, "{v}"),
-            Self::String(s) => write!(f, "{s}"),
-            Self::Array(bytes, element) => {
-                write!(f, "[")?;
-                let size = scalar_size(element).map_err(|_| fmt::Error)?;
-                for i in 0..bytes.len() / size { if i != 0 { write!(f, ", ")?; } write!(f, "{}", decode_scalar(bytes, i, element).map_err(|_| fmt::Error)?)?; }
-                write!(f, "]")
-            }, Self::Table(entries, element) => write!(f, "table<{}>({})", element, entries.len()), Self::Struct(values, layout) => { write!(f, "{}{{", layout.name)?; for (i, field) in layout.fields.iter().enumerate() { if i != 0 { write!(f, ", ")?; } let value = values.get(field.index).ok_or(fmt::Error)?; write!(f, "{}: {value}", field.name)?; } write!(f, "}}") }, Self::Module(id) => write!(f, "module({id})")
+            Self::String(reference) => write!(f, "string@{}", reference.0),
+            Self::Array(reference, element) => write!(f, "vector<{}>@{}", element, reference.0), Self::Table(reference, element) => write!(f, "table<{}>@{}", element, reference.0), Self::Struct(reference, layout) => write!(f, "{}@{}", layout.name, reference.0), Self::Module(id) => write!(f, "module({id})")
         }
     }
 }
@@ -839,10 +871,69 @@ fn int_value(n: i128, ty: &Type) -> Result<Value, Error> { macro_rules! v { ($t:
 fn float_value(n: f64, ty: &Type) -> Value { match ty { Type::F16=>Value::F16(f32_to_f16(n as f32)),Type::F32=>Value::F32(n as f32),_=>Value::F64(n) } }
 
 struct ModuleInstance { artifact: ModuleArtifact, vm: Vm }
-#[derive(Default)]
-pub struct Vm { stack: Vec<Value>, locals: Vec<Value>, output: Vec<String>, interactive: bool, input: VecDeque<String>, modules: HashMap<String, ModuleInstance> }
+pub struct Vm {
+    stack: Vec<Value>,
+    locals: Vec<Value>,
+    output: Vec<String>,
+    interactive: bool,
+    input: VecDeque<String>,
+    modules: HashMap<String, ModuleInstance>,
+    heap: Rc<RefCell<Heap>>,
+    gc_owner: bool,
+}
+
+impl Default for Vm {
+    fn default() -> Self {
+        Self { stack: Vec::new(), locals: Vec::new(), output: Vec::new(), interactive: false, input: VecDeque::new(), modules: HashMap::new(), heap: Rc::new(RefCell::new(Heap::default())), gc_owner: true }
+    }
+}
 
 impl Vm {
+    fn with_shared_heap(heap: Rc<RefCell<Heap>>) -> Self { Self { heap, gc_owner: false, ..Self::default() } }
+
+    fn roots(&self) -> Vec<Value> {
+        let mut roots = Vec::with_capacity(self.stack.len() + self.locals.len());
+        roots.extend(self.stack.iter().cloned());
+        roots.extend(self.locals.iter().cloned());
+        for module in self.modules.values() { roots.extend(module.vm.roots()); }
+        roots
+    }
+
+    /// Run a full collection. The return value is the number of reclaimed
+    /// objects; it is public so the runtime can be integration-tested.
+    pub fn collect_garbage(&mut self) -> usize {
+        self.heap.borrow_mut().collect(self.roots())
+    }
+
+    fn collect_if_needed(&mut self) {
+        if self.gc_owner && self.heap.borrow().should_collect() { self.collect_garbage(); }
+    }
+
+    fn allocate(&mut self, object: HeapObject) -> HeapRef { self.heap.borrow_mut().allocate(object) }
+
+    fn format_value(&self, value: &Value) -> Result<String, Error> {
+        match value {
+            Value::Array(reference, element) => match self.heap.borrow().get(*reference)? {
+                HeapObject::Array { bytes, element: stored_element } if stored_element == element.as_ref() => {
+                    let size = scalar_size(element)?;
+                    let mut values = Vec::with_capacity(bytes.len() / size);
+                    for index in 0..bytes.len() / size { values.push(decode_scalar(bytes, index, element)?.to_string()); }
+                    Ok(format!("[{}]", values.join(", ")))
+                },
+                _ => Err(Error::Runtime("array heap invariant broken".into())),
+            },
+            Value::String(reference) => match self.heap.borrow().get(*reference)? { HeapObject::String(text) => Ok(text.clone()), _ => Err(Error::Runtime("string heap invariant broken".into())) },
+            Value::Table(reference, element) => match self.heap.borrow().get(*reference)? { HeapObject::Table { entries, .. } => Ok(format!("table<{}>({})", element, entries.len())), _ => Err(Error::Runtime("table heap invariant broken".into())) },
+            Value::Struct(reference, _) => {
+                let (values, layout) = match self.heap.borrow().get(*reference)? { HeapObject::Struct { values, layout } => (values.clone(), layout.clone()), _ => return Err(Error::Runtime("struct heap invariant broken".into())) };
+                let mut fields = Vec::with_capacity(layout.fields.len());
+                for field in &layout.fields { fields.push(format!("{}: {}", field.name, self.format_value(values.get(field.index).ok_or_else(|| Error::Runtime("invalid struct field index".into()))?)?)); }
+                Ok(format!("{}{{{}}}", layout.name, fields.join(", ")))
+            },
+            _ => Ok(value.to_string()),
+        }
+    }
+
     fn run(&mut self, code: &[Op]) -> Result<&[String], Error> { self.run_from(code, 0, false) }
     
     fn run_from(&mut self, code: &[Op], mut pc: usize, terminal_return: bool) -> Result<&[String], Error> { 
@@ -851,30 +942,30 @@ impl Vm {
         
         while pc < code.len() { match &code[pc] {
             Op::Push(v) => self.stack.push(v.clone()), 
-            Op::MakeString(s) => self.stack.push(Value::String(s.clone())),
+            Op::MakeString(s) => { let reference = self.allocate(HeapObject::String(s.clone())); self.stack.push(Value::String(reference)); self.collect_if_needed(); },
             Op::Input(ty) => { let val = self.read_input(ty)?; self.stack.push(val); }, 
             Op::Require(module) => self.load_module(module.clone())?, 
             Op::Load(slot) => self.stack.push(self.locals.get(*slot).cloned().ok_or_else(|| Error::Runtime("invalid local slot".into()))?), 
             Op::LoadCurrentReceiver => { let receiver = current_receiver.ok_or_else(|| Error::Runtime("this is available only inside a method".into()))?; self.stack.push(self.locals.get(receiver).cloned().ok_or_else(|| Error::Runtime("invalid method receiver".into()))?); }, 
-            Op::LoadCurrentField(field) => { let receiver = current_receiver.ok_or_else(|| Error::Runtime("field access outside method".into()))?; let value = self.locals.get(receiver).ok_or_else(|| Error::Runtime("invalid method receiver".into()))?.field(field)?; self.stack.push(value); },
+            Op::LoadCurrentField(field) => { let receiver = current_receiver.ok_or_else(|| Error::Runtime("field access outside method".into()))?; let Value::Struct(reference, _) = self.locals.get(receiver).ok_or_else(|| Error::Runtime("invalid method receiver".into()))? else { return Err(Error::Runtime("VM method receiver invariant broken".into())); }; let value = match self.heap.borrow().get(*reference)? { HeapObject::Struct { values, .. } => values.get(field.index).cloned().ok_or_else(|| Error::Runtime("invalid struct field index".into()))?, _ => return Err(Error::Runtime("struct heap invariant broken".into())) }; self.stack.push(value); },
             Op::Store(slot) => { 
                 let v = self.pop()?; 
                 if *slot >= self.locals.len() { self.locals.resize(*slot + 1, Value::Bool(false)); } 
                 self.locals[*slot] = v; 
             },
-            Op::StoreIndex(slot, element) => { let value = self.pop()?; if &value.ty() != element { return Err(Error::Runtime("VM type invariant broken".into())); } let index = integer_to_usize(&self.pop()?)?; match self.locals.get_mut(*slot) { Some(array @ Value::Array(_, _)) => array.set_index(index, value)?, _ => return Err(Error::Runtime("VM array slot invariant broken".into())), } },
-            Op::StoreTableIndex(slot, element) => { let value = self.pop()?; if &value.ty() != element { return Err(Error::Runtime("VM table type invariant broken".into())); } let key = table_key_from_value(&self.pop()?)?; match self.locals.get_mut(*slot) { Some(table @ Value::Table(_, _)) => table.set_table_key(key, value)?, _ => return Err(Error::Runtime("VM table slot invariant broken".into())), } },
-            Op::StoreField(slot, field) => { let new_value = self.pop()?; if &new_value.ty() != &field.ty { return Err(Error::Runtime("VM type invariant broken".into())); } match self.locals.get_mut(*slot) { Some(struct_value @ Value::Struct(_, _)) => struct_value.set_field(field, new_value)?, _ => return Err(Error::Runtime("VM struct slot invariant broken".into())), } },
-            Op::StoreFieldIndex(slot, field, element) => { let value = self.pop()?; if &value.ty() != element { return Err(Error::Runtime("VM vector type invariant broken".into())); } let index = integer_to_usize(&self.pop()?)?; match self.locals.get_mut(*slot) { Some(struct_value @ Value::Struct(_, _)) => struct_value.set_field_index(field, index, value)?, _ => return Err(Error::Runtime("VM struct slot invariant broken".into())), } },
-            Op::StoreTableField(slot, name, element) => { let value = self.pop()?; if &value.ty() != element { return Err(Error::Runtime("VM table type invariant broken".into())); } match self.locals.get_mut(*slot) { Some(table @ Value::Table(_, _)) => table.set_table_key(TableKey::Name(name.clone()), value)?, _ => return Err(Error::Runtime("VM table slot invariant broken".into())), } },
-            Op::StoreCurrentField(field) => { let new_value = self.pop()?; if &new_value.ty() != &field.ty { return Err(Error::Runtime("VM type invariant broken".into())); } let receiver = current_receiver.ok_or_else(|| Error::Runtime("field assignment outside method".into()))?; match self.locals.get_mut(receiver) { Some(struct_value @ Value::Struct(_, _)) => struct_value.set_field(field, new_value)?, _ => return Err(Error::Runtime("VM method receiver invariant broken".into())), } },
-            Op::MakeArray(len, ty) => { if self.stack.len() < *len { return Err(Error::Runtime("stack underflow".into())); } let at = self.stack.len() - len; let values = self.stack.split_off(at); self.stack.push(Value::array(values, ty.clone())?); },
-            Op::MakeTable(entries, element) => { let value_count = entries.iter().map(|entry| match entry { TableEntry::Index => 2usize, TableEntry::Name(_) => 1usize }).sum(); if self.stack.len() < value_count { return Err(Error::Runtime("stack underflow".into())); } let at = self.stack.len() - value_count; let values = self.stack.split_off(at); let mut cursor = 0; let mut table = HashMap::with_capacity(entries.len()); for entry in entries { let key = match entry { TableEntry::Index => { let key = table_key_from_value(values.get(cursor).ok_or_else(|| Error::Runtime("stack underflow".into()))?)?; cursor += 1; key }, TableEntry::Name(name) => TableKey::Name(name.clone()), }; let value = values.get(cursor).cloned().ok_or_else(|| Error::Runtime("stack underflow".into()))?; cursor += 1; if &value.ty() != element { return Err(Error::Runtime("VM table type invariant broken".into())); } if table.insert(key.clone(), value).is_some() { return Err(Error::Runtime(format!("table key {} is declared more than once", table_key_display(&key)))); } } self.stack.push(Value::Table(table, Box::new(element.clone()))); },
-            Op::MakeStruct(layout) => { if self.stack.len() < layout.fields.len() { return Err(Error::Runtime("stack underflow".into())); } let at = self.stack.len() - layout.fields.len(); let values = self.stack.split_off(at); for (field, value) in layout.fields.iter().zip(values.iter()) { if value.ty() != field.ty { return Err(Error::Runtime("VM struct type invariant broken".into())); } } self.stack.push(Value::Struct(values, layout.clone())); },
-            Op::Index => { let index = integer_to_usize(&self.pop()?)?; let object = self.pop()?; self.stack.push(object.index(index)?); },
-            Op::TableIndex => { let key = table_key_from_value(&self.pop()?)?; let object = self.pop()?; self.stack.push(object.table_index(key)?); },
-            Op::Field(field) => { let object = self.pop()?; self.stack.push(object.field(field)?); },
-            Op::TableField(name) => { let object = self.pop()?; self.stack.push(object.table_index(TableKey::Name(name.clone()))?); },
+            Op::StoreIndex(slot, element) => { let value = self.pop()?; if &value.ty() != element { return Err(Error::Runtime("VM type invariant broken".into())); } let index = integer_to_usize(&self.pop()?)?; let Value::Array(reference, _) = self.locals.get(*slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? else { return Err(Error::Runtime("VM array slot invariant broken".into())); }; let mut encoded = Vec::new(); encode_scalar(&value, element, &mut encoded)?; match self.heap.borrow_mut().get_mut(*reference)? { HeapObject::Array { bytes, element: stored_element } if stored_element == element => { let start = index.checked_mul(encoded.len()).ok_or_else(|| Error::Runtime("array index too large".into()))?; let end = start.checked_add(encoded.len()).ok_or_else(|| Error::Runtime("array index too large".into()))?; if end > bytes.len() { return Err(Error::Runtime(format!("array index {index} is out of bounds (length {})", bytes.len() / encoded.len()))); } bytes[start..end].copy_from_slice(&encoded); }, _ => return Err(Error::Runtime("array heap invariant broken".into())), } },
+            Op::StoreTableIndex(slot, element) => { let value = self.pop()?; if &value.ty() != element { return Err(Error::Runtime("VM table type invariant broken".into())); } let key = table_key_from_value(&self.pop()?)?; let Value::Table(reference, _) = self.locals.get(*slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? else { return Err(Error::Runtime("VM table slot invariant broken".into())); }; match self.heap.borrow_mut().get_mut(*reference)? { HeapObject::Table { entries, element: stored_element } if stored_element == element => { entries.insert(key, value); }, _ => return Err(Error::Runtime("table heap invariant broken".into())), } },
+            Op::StoreField(slot, field) => { let new_value = self.pop()?; if &new_value.ty() != &field.ty { return Err(Error::Runtime("VM type invariant broken".into())); } let Value::Struct(reference, _) = self.locals.get(*slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? else { return Err(Error::Runtime("VM struct slot invariant broken".into())); }; match self.heap.borrow_mut().get_mut(*reference)? { HeapObject::Struct { values, .. } => { *values.get_mut(field.index).ok_or_else(|| Error::Runtime("invalid struct field index".into()))? = new_value; }, _ => return Err(Error::Runtime("struct heap invariant broken".into())), } },
+            Op::StoreFieldIndex(slot, field, element) => { let value = self.pop()?; if &value.ty() != element { return Err(Error::Runtime("VM vector type invariant broken".into())); } let index = integer_to_usize(&self.pop()?)?; let Value::Struct(struct_reference, _) = self.locals.get(*slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? else { return Err(Error::Runtime("VM struct slot invariant broken".into())); }; let array_reference = match self.heap.borrow().get(*struct_reference)? { HeapObject::Struct { values, .. } => match values.get(field.index) { Some(Value::Array(reference, _)) => *reference, _ => return Err(Error::Runtime("VM struct vector field invariant broken".into())), }, _ => return Err(Error::Runtime("struct heap invariant broken".into())), }; let mut encoded = Vec::new(); encode_scalar(&value, element, &mut encoded)?; match self.heap.borrow_mut().get_mut(array_reference)? { HeapObject::Array { bytes, element: stored_element } if stored_element == element => { let start = index.checked_mul(encoded.len()).ok_or_else(|| Error::Runtime("array index too large".into()))?; let end = start.checked_add(encoded.len()).ok_or_else(|| Error::Runtime("array index too large".into()))?; if end > bytes.len() { return Err(Error::Runtime(format!("array index {index} is out of bounds (length {})", bytes.len() / encoded.len()))); } bytes[start..end].copy_from_slice(&encoded); }, _ => return Err(Error::Runtime("array heap invariant broken".into())), } },
+            Op::StoreTableField(slot, name, element) => { let value = self.pop()?; if &value.ty() != element { return Err(Error::Runtime("VM table type invariant broken".into())); } let Value::Table(reference, _) = self.locals.get(*slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? else { return Err(Error::Runtime("VM table slot invariant broken".into())); }; match self.heap.borrow_mut().get_mut(*reference)? { HeapObject::Table { entries, element: stored_element } if stored_element == element => { entries.insert(TableKey::Name(name.clone()), value); }, _ => return Err(Error::Runtime("table heap invariant broken".into())), } },
+            Op::StoreCurrentField(field) => { let new_value = self.pop()?; if &new_value.ty() != &field.ty { return Err(Error::Runtime("VM type invariant broken".into())); } let receiver = current_receiver.ok_or_else(|| Error::Runtime("field assignment outside method".into()))?; let Value::Struct(reference, _) = self.locals.get(receiver).ok_or_else(|| Error::Runtime("invalid method receiver".into()))? else { return Err(Error::Runtime("VM method receiver invariant broken".into())); }; match self.heap.borrow_mut().get_mut(*reference)? { HeapObject::Struct { values, .. } => { *values.get_mut(field.index).ok_or_else(|| Error::Runtime("invalid struct field index".into()))? = new_value; }, _ => return Err(Error::Runtime("struct heap invariant broken".into())), } },
+            Op::MakeArray(len, ty) => { if self.stack.len() < *len { return Err(Error::Runtime("stack underflow".into())); } let at = self.stack.len() - len; let values = self.stack.split_off(at); let bytes = Value::pack_array(values, ty)?; let reference = self.allocate(HeapObject::Array { bytes, element: ty.clone() }); self.stack.push(Value::Array(reference, Box::new(ty.clone()))); self.collect_if_needed(); },
+            Op::MakeTable(entries, element) => { let value_count = entries.iter().map(|entry| match entry { TableEntry::Index => 2usize, TableEntry::Name(_) => 1usize }).sum(); if self.stack.len() < value_count { return Err(Error::Runtime("stack underflow".into())); } let at = self.stack.len() - value_count; let values = self.stack.split_off(at); let mut cursor = 0; let mut table = HashMap::with_capacity(entries.len()); for entry in entries { let key = match entry { TableEntry::Index => { let key = table_key_from_value(values.get(cursor).ok_or_else(|| Error::Runtime("stack underflow".into()))?)?; cursor += 1; key }, TableEntry::Name(name) => TableKey::Name(name.clone()), }; let value = values.get(cursor).cloned().ok_or_else(|| Error::Runtime("stack underflow".into()))?; cursor += 1; if &value.ty() != element { return Err(Error::Runtime("VM table type invariant broken".into())); } if table.insert(key.clone(), value).is_some() { return Err(Error::Runtime(format!("table key {} is declared more than once", table_key_display(&key)))); } } let reference = self.allocate(HeapObject::Table { entries: table, element: element.clone() }); self.stack.push(Value::Table(reference, Box::new(element.clone()))); self.collect_if_needed(); },
+            Op::MakeStruct(layout) => { if self.stack.len() < layout.fields.len() { return Err(Error::Runtime("stack underflow".into())); } let at = self.stack.len() - layout.fields.len(); let values = self.stack.split_off(at); for (field, value) in layout.fields.iter().zip(values.iter()) { if value.ty() != field.ty { return Err(Error::Runtime("VM struct type invariant broken".into())); } } let reference = self.allocate(HeapObject::Struct { values, layout: layout.clone() }); self.stack.push(Value::Struct(reference, layout.clone())); self.collect_if_needed(); },
+            Op::Index => { let index = integer_to_usize(&self.pop()?)?; let object = self.pop()?; let Value::Array(reference, element) = object else { return Err(Error::Runtime("VM array invariant broken".into())); }; let value = match self.heap.borrow().get(reference)? { HeapObject::Array { bytes, element: stored_element } if stored_element == element.as_ref() => decode_scalar(bytes, index, &element)?, _ => return Err(Error::Runtime("array heap invariant broken".into())) }; self.stack.push(value); },
+            Op::TableIndex => { let key = table_key_from_value(&self.pop()?)?; let object = self.pop()?; let Value::Table(reference, _) = object else { return Err(Error::Runtime("VM table invariant broken".into())); }; let value = match self.heap.borrow().get(reference)? { HeapObject::Table { entries, .. } => entries.get(&key).cloned().ok_or_else(|| Error::Runtime(format!("table has no key {}", table_key_display(&key))))?, _ => return Err(Error::Runtime("table heap invariant broken".into())) }; self.stack.push(value); },
+            Op::Field(field) => { let object = self.pop()?; let Value::Struct(reference, _) = object else { return Err(Error::Runtime("VM struct invariant broken".into())); }; let value = match self.heap.borrow().get(reference)? { HeapObject::Struct { values, .. } => values.get(field.index).cloned().ok_or_else(|| Error::Runtime("invalid struct field index".into()))?, _ => return Err(Error::Runtime("struct heap invariant broken".into())) }; self.stack.push(value); },
+            Op::TableField(name) => { let object = self.pop()?; let Value::Table(reference, _) = object else { return Err(Error::Runtime("VM table invariant broken".into())); }; let value = match self.heap.borrow().get(reference)? { HeapObject::Table { entries, .. } => entries.get(&TableKey::Name(name.clone())).cloned().ok_or_else(|| Error::Runtime(format!("table has no key {name}")))?, _ => return Err(Error::Runtime("table heap invariant broken".into())) }; self.stack.push(value); },
             Op::ModuleField(name) => { let Value::Module(id) = self.pop()? else { return Err(Error::Runtime("VM module invariant broken".into())); }; let value = { let instance = self.modules.get(&id).ok_or_else(|| Error::Runtime("loaded module is missing".into()))?; let ModuleExport::Value { slot, .. } = instance.artifact.exports.get(name).ok_or_else(|| Error::Runtime(format!("module has no exported value '{name}'")))? else { return Err(Error::Runtime(format!("'{name}' is not an exported module value"))); }; instance.vm.locals.get(*slot).cloned().ok_or_else(|| Error::Runtime("invalid module export slot".into()))? }; self.stack.push(value); },
             Op::Binary(op, ty) => { let right = self.pop()?; let left = self.pop()?; self.stack.push(evaluate_binary(left, right, op, ty)?); },
             Op::Unary(op, ty) => { let val = self.pop()?; self.stack.push(evaluate_unary(val, op, ty)?); },
@@ -886,13 +977,13 @@ impl Vm {
             Op::CallCurrentMethod(target) => { let receiver = current_receiver.ok_or_else(|| Error::Runtime("this is available only inside a method".into()))?; call_stack.push((pc + 1, current_receiver)); current_receiver = Some(receiver); pc = *target; continue; },
             Op::CallModule(slot, name) => { self.call_module_function(*slot, name)?; },
             Op::Return => { if let Some((return_pc, previous_receiver)) = call_stack.pop() { current_receiver = previous_receiver; pc = return_pc; continue; } if terminal_return { return Ok(&self.output); } return Err(Error::Runtime("return outside method".into())); },
-            Op::Print => { let value = self.pop()?; self.emit(value.to_string()); },
+            Op::Print => { let value = self.pop()?; let text = self.format_value(&value)?; self.emit(text); },
             Op::Printf(num_args) => {
                 let format_val = self.pop()?;
                 let mut arg_vals = Vec::with_capacity(*num_args);
                 for _ in 0..*num_args { arg_vals.push(self.pop()?); }
                 arg_vals.reverse();
-                let format_str = if let Value::String(s) = format_val { s } else { return Err(Error::Runtime("printf format is not a string".into())); };
+                let format_str = if let Value::String(reference) = format_val { match self.heap.borrow().get(reference)? { HeapObject::String(text) => text.clone(), _ => return Err(Error::Runtime("string heap invariant broken".into())) } } else { return Err(Error::Runtime("printf format is not a string".into())); };
                 
                 let mut result = String::new();
                 let mut arg_idx = 0;
@@ -901,7 +992,7 @@ impl Vm {
                 while let Some(c) = chars.next() {
                     if c == '{' && chars.peek() == Some(&'}') {
                         chars.next();
-                        if arg_idx < arg_vals.len() { result.push_str(&arg_vals[arg_idx].to_string()); arg_idx += 1; } 
+                        if arg_idx < arg_vals.len() { result.push_str(&self.format_value(&arg_vals[arg_idx])?); arg_idx += 1; }
                         else { result.push_str("{}"); }
                     } else { result.push(c); }
                 }
@@ -919,7 +1010,7 @@ impl Vm {
     fn load_module(&mut self, artifact: ModuleArtifact) -> Result<(), Error> {
         let id = artifact.id.clone();
         if !self.modules.contains_key(&id) {
-            let mut vm = Vm::default();
+            let mut vm = Vm::with_shared_heap(self.heap.clone());
             vm.run(&artifact.code)?;
             let output = std::mem::take(&mut vm.output);
             self.modules.insert(id.clone(), ModuleInstance { artifact, vm });
@@ -1310,10 +1401,10 @@ mod tests {
             (Value::F64(-2.25), Type::F64), (Value::Bool(true), Type::Bool),
         ];
         for (value, ty) in cases {
-            let vector = Value::array(vec![value.clone()], ty).unwrap();
-            assert_eq!(vector.index(0).unwrap(), value);
+            let bytes = Value::pack_array(vec![value.clone()], &ty).unwrap();
+            assert_eq!(decode_scalar(&bytes, 0, &ty).unwrap(), value);
         }
-        let Value::Array(bytes, _) = Value::array(vec![Value::I32(0x0102_0304)], Type::I32).unwrap() else { panic!() };
+        let bytes = Value::pack_array(vec![Value::I32(0x0102_0304)], &Type::I32).unwrap();
         assert_eq!(bytes, [4, 3, 2, 1]);
     }
 
@@ -1359,6 +1450,48 @@ mod tests {
         let output = execute_file(root.join("main.l0")).unwrap();
         let _ = fs::remove_dir_all(&root);
         assert_eq!(output, ["1", "2", "2", "5"]);
+    }
+
+    #[test]
+    fn complex_values_are_shared_by_heap_reference() {
+        let source = "struct Counter { value: i32; } let first: Counter = Counter { value = 1 }; let second: Counter = first; second.value = 9; print(first.value);";
+        assert_eq!(execute(source).unwrap(), ["9"]);
+    }
+
+    #[test]
+    fn vectors_are_shared_by_heap_reference() {
+        let source = "let first: vector<i32> = [1, 2]; let second: vector<i32> = first; second[0] = 9; print(first[0]);";
+        assert_eq!(execute(source).unwrap(), ["9"]);
+    }
+
+    #[test]
+    fn heap_strings_keep_print_and_printf_semantics() {
+        let source = "let greeting: string = \"hello\"; print(greeting); printf(\"{} {}\", greeting, 7);";
+        assert_eq!(execute(source).unwrap(), ["hello", "hello 7"]);
+    }
+
+    #[test]
+    fn mark_and_sweep_collects_unreachable_cycles() {
+        let mut vm = Vm::default();
+        let layout = StructLayout {
+            name: "Node".into(),
+            fields: vec![StructField { name: "next".into(), ty: Type::Struct("Node".into()), index: 0 }],
+        };
+        let first = vm.allocate(HeapObject::Struct { values: vec![Value::Bool(false)], layout: layout.clone() });
+        let second = vm.allocate(HeapObject::Struct { values: vec![Value::Bool(false)], layout: layout.clone() });
+        {
+            let mut heap = vm.heap.borrow_mut();
+            let HeapObject::Struct { values, .. } = heap.get_mut(first).unwrap() else { panic!() };
+            values[0] = Value::Struct(second, layout.clone());
+            let HeapObject::Struct { values, .. } = heap.get_mut(second).unwrap() else { panic!() };
+            values[0] = Value::Struct(first, layout.clone());
+        }
+        vm.locals.push(Value::Struct(first, layout));
+        assert_eq!(vm.collect_garbage(), 0);
+        assert_eq!(vm.heap.borrow().allocated_count(), 2);
+        vm.locals.clear();
+        assert_eq!(vm.collect_garbage(), 2);
+        assert_eq!(vm.heap.borrow().allocated_count(), 0);
     }
 
     #[test]
