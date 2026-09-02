@@ -57,7 +57,7 @@ pub enum Value {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum TableKey { Index(i128), Name(String) }
+pub enum TableKey { Index(i128), Name(Rc<str>) }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StructField { name: String, ty: Type, index: usize }
@@ -159,7 +159,7 @@ impl Heap {
     #[cfg(test)] fn allocated_count(&self) -> usize { self.slots.iter().filter(|slot| slot.is_some()).count() }
 }
 
-fn table_key_display(key: &TableKey) -> String { match key { TableKey::Index(index) => format!("[{index}]"), TableKey::Name(name) => name.clone() } }
+fn table_key_display(key: &TableKey) -> String { match key { TableKey::Index(index) => format!("[{index}]"), TableKey::Name(name) => name.to_string() } }
 fn table_key_from_value(value: &Value) -> Result<TableKey, Error> {
     let index = match value {
         Value::I8(v) => *v as i128, Value::I16(v) => *v as i128, Value::I32(v) => *v as i128, Value::I64(v) => *v as i128,
@@ -235,14 +235,14 @@ pub enum Error { Lex(String), Parse(String), Type(String), Runtime(String) }
 impl fmt::Display for Error { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{:?}", self) } }
 impl std::error::Error for Error {}
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BinOp { Add, Sub, Mul, Div, Mod, Eq, Neq, Lt, Le, Gt, Ge, And, Or, BitAnd, BitOr, BitXor, Shl, Shr }
 #[derive(Clone, Debug, PartialEq)]
 pub enum UnOp { Neg, Not }
 
 #[derive(Clone, Debug, PartialEq)]
 enum Token {
-    Let, Print, Printf, Putc, Input, This, Function, Export, Require, If, Then, Else, While, Do, Struct, Table, End,
+    Let, Print, Printf, Putc, Input, This, Function, Export, Require, If, Then, Else, While, For, Do, Break, Continue, Struct, Table, End,
     Ident(String), Integer(i128), Float(f64), StringLit(String), Colon, DoubleColon,
     Equal, EqualEqual, BangEq, Plus, Minus, Star, Slash, Percent,
     Ampersand, Pipe, Caret, Shl, Shr, AndAnd, OrOr,
@@ -326,7 +326,8 @@ fn lex(source: &str) -> Result<Vec<Token>, Error> {
                     "putc" => Token::Putc, "input" => Token::Input, "this" => Token::This, 
                     "function" => Token::Function, "export" => Token::Export, "require" => Token::Require, 
                     "if" => Token::If, "then" => Token::Then, "else" => Token::Else, 
-                    "while" => Token::While, "do" => Token::Do, "struct" => Token::Struct, 
+                    "while" => Token::While, "for" => Token::For, "do" => Token::Do,
+                    "break" => Token::Break, "continue" => Token::Continue, "struct" => Token::Struct,
                     "table" => Token::Table, "end" => Token::End, _ => Token::Ident(word) 
                 });
             }
@@ -363,7 +364,10 @@ enum Statement {
     SetFieldIndex { name: String, field: String, index: Expr, expr: Expr }, 
     Print(Expr), Printf { format: Expr, args: Vec<Expr> }, Putc(Expr),
     If { condition: Expr, then_body: Vec<Statement>, else_body: Vec<Statement> }, 
-    While { condition: Expr, body: Vec<Statement> }
+    While { condition: Expr, body: Vec<Statement> },
+    For { name: String, start: Expr, end: Expr, body: Vec<Statement> },
+    Break,
+    Continue,
 }
 
 struct Parser { tokens: Vec<Token>, at: usize }
@@ -422,6 +426,19 @@ impl Parser {
         Token::Putc => { let parenthesized = *self.peek() == Token::LParen; if parenthesized { self.next(); } let expr = self.expr()?; if parenthesized { self.need(Token::RParen)?; } Ok(Statement::Putc(expr)) },
         Token::If => { let condition = self.expr()?; self.need(Token::Then)?; let then_body = self.block()?; let else_body = if *self.peek() == Token::Else { self.next(); self.block()? } else { Vec::new() }; self.need(Token::End)?; Ok(Statement::If { condition, then_body, else_body }) },
         Token::While => { let condition = self.expr()?; self.need(Token::Do)?; let body = self.block()?; self.need(Token::End)?; Ok(Statement::While { condition, body }) },
+        Token::For => {
+            let name = match self.next() { Token::Ident(name) => name, token => return Err(Error::Parse(format!("expected loop variable, got {token:?}"))) };
+            self.need(Token::Equal)?;
+            let start = self.expr()?;
+            self.need(Token::Comma)?;
+            let end = self.expr()?;
+            self.need(Token::Do)?;
+            let body = self.block()?;
+            self.need(Token::End)?;
+            Ok(Statement::For { name, start, end, body })
+        },
+        Token::Break => Ok(Statement::Break),
+        Token::Continue => Ok(Statement::Continue),
         Token::This => { self.need(Token::Dot)?; let method = match self.next() { Token::Ident(method) => method, token => return Err(Error::Parse(format!("expected method name, got {token:?}"))) }; self.need(Token::LParen)?; self.need(Token::RParen)?; Ok(Statement::CallMethod { receiver: MethodReceiver::This, method }) },
         Token::Ident(name) => match self.next() { 
             Token::Equal => Ok(Statement::Assign { name, expr: self.expr()? }), 
@@ -641,10 +658,19 @@ impl Parser {
     }
 }
 #[derive(Clone, Debug)]
-enum TableEntry { Index, Name(String) }
+enum TableEntry { Index, Name(Rc<str>) }
 
 #[derive(Clone, Debug)]
 enum ModuleExport { Value { slot: usize, ty: Type }, Function { entry: usize }, Struct(StructLayout) }
+
+/// A numeric type is selected while compiling, not by the VM hot loop.
+#[derive(Clone, Debug)]
+enum BinaryOp {
+    I8(BinOp), I16(BinOp), I32(BinOp), I64(BinOp),
+    U8(BinOp), U16(BinOp), U32(BinOp), U64(BinOp),
+    F16(BinOp), F32(BinOp), F64(BinOp),
+    Equal, NotEqual,
+}
 
 #[derive(Clone, Debug)]
 struct ModuleArtifact { id: String, code: Vec<Op>, exports: HashMap<String, ModuleExport> }
@@ -657,10 +683,10 @@ enum Op {
     Push(Value), MakeString(String), Input(Type), Require(ModuleArtifact), Load(usize), LoadCurrentReceiver, 
     LoadCurrentField(StructField), Store(usize), StoreIndex(usize, Type), StoreTableIndex(usize, Type), 
     StoreTensorIndex(usize, Type, usize),
-    StoreField(usize, StructField), StoreFieldIndex(usize, StructField, Type), StoreTableField(usize, String, Type), 
+    StoreField(usize, StructField), StoreFieldIndex(usize, StructField, Type), StoreTableField(usize, Rc<str>, Type),
     StoreCurrentField(StructField), MakeArray(usize, Type), MakeTable(Vec<TableEntry>, Type), MakeStruct(StructLayout), 
-    MakeTensor(TensorInit, Type, usize), Index, TensorIndex(Type, usize), TableIndex, Field(StructField), TableField(String), ModuleField(String),
-    Binary(BinOp, Type), Unary(UnOp, Type),
+    MakeTensor(TensorInit, Type, usize), Index, TensorIndex(Type, usize), TableIndex, Field(StructField), TableField(Rc<str>), ModuleField(String),
+    Binary(BinaryOp), Unary(UnOp, Type), Len, ConcatString,
     Builtin1(String, Type), Builtin2(String, Type),
     CallExternal(String, usize),
     JumpIfFalse(usize), Jump(usize), CallMethod(usize, usize), CallCurrentMethod(usize), CallModule(usize, String), 
@@ -670,19 +696,46 @@ enum Op {
 #[derive(Clone, Copy, Debug)]
 enum TensorInit { Zeros, Random }
 
+struct LoopContext { break_jumps: Vec<usize>, continue_jumps: Vec<usize>, continue_target: usize }
+
 struct Compiler { 
     names: HashMap<String, (usize, Type)>, structs: HashMap<String, StructLayout>, 
     methods: HashMap<(String, String), Option<usize>>, pending_method_calls: Vec<(usize, String, String)>, 
     current_method_fields: Option<HashMap<String, StructField>>, current_method_struct: Option<String>, 
     module_root: Option<PathBuf>, module_artifacts: HashMap<String, ModuleArtifact>, 
-    exports: HashMap<String, ModuleExport>, extern_functions: HashMap<String, HostSignature>, code: Vec<Op>
+    exports: HashMap<String, ModuleExport>, extern_functions: HashMap<String, HostSignature>, code: Vec<Op>,
+    interned_names: HashMap<String, Rc<str>>,
+    next_slot: usize, loops: Vec<LoopContext>
 }
 
-impl Default for Compiler { fn default() -> Self { Self { names: HashMap::new(), structs: HashMap::new(), methods: HashMap::new(), pending_method_calls: Vec::new(), current_method_fields: None, current_method_struct: None, module_root: None, module_artifacts: HashMap::new(), exports: HashMap::new(), extern_functions: HashMap::new(), code: Vec::new() } } }
+impl Default for Compiler { fn default() -> Self { Self { names: HashMap::new(), structs: HashMap::new(), methods: HashMap::new(), pending_method_calls: Vec::new(), current_method_fields: None, current_method_struct: None, module_root: None, module_artifacts: HashMap::new(), exports: HashMap::new(), extern_functions: HashMap::new(), code: Vec::new(), interned_names: HashMap::new(), next_slot: 0, loops: Vec::new() } } }
 
 impl Compiler {
     fn with_module_root(module_root: PathBuf) -> Self { Self { module_root: Some(module_root), ..Self::default() } }
     fn with_extern_functions(extern_functions: HashMap<String, HostSignature>) -> Self { Self { extern_functions, ..Self::default() } }
+
+    fn intern_name(&mut self, name: &str) -> Rc<str> {
+        if let Some(interned) = self.interned_names.get(name) { return interned.clone(); }
+        let interned: Rc<str> = Rc::from(name);
+        self.interned_names.insert(name.to_owned(), interned.clone());
+        interned
+    }
+
+    fn binary_opcode(op: BinOp, ty: &Type) -> Result<BinaryOp, Error> {
+        match op {
+            BinOp::Eq => Ok(BinaryOp::Equal),
+            BinOp::Neq => Ok(BinaryOp::NotEqual),
+            _ => match ty {
+                Type::I8 => Ok(BinaryOp::I8(op)), Type::I16 => Ok(BinaryOp::I16(op)),
+                Type::I32 => Ok(BinaryOp::I32(op)), Type::I64 => Ok(BinaryOp::I64(op)),
+                Type::U8 => Ok(BinaryOp::U8(op)), Type::U16 => Ok(BinaryOp::U16(op)),
+                Type::U32 => Ok(BinaryOp::U32(op)), Type::U64 => Ok(BinaryOp::U64(op)),
+                Type::F16 => Ok(BinaryOp::F16(op)), Type::F32 => Ok(BinaryOp::F32(op)),
+                Type::F64 => Ok(BinaryOp::F64(op)),
+                _ => Err(Error::Type(format!("unsupported binary operand type {ty}"))),
+            },
+        }
+    }
     
     fn compile(mut self, program: Vec<Statement>) -> Result<Vec<Op>, Error> { self.compile_program(program)?; Ok(self.code) }
     
@@ -795,7 +848,8 @@ impl Compiler {
                 if existing_ty != &ty { return Err(Error::Type(format!("cannot redefine '{name}' with a different type"))); }
                 *existing_slot 
             } else {
-                let s = self.names.len();
+                let s = self.next_slot;
+                self.next_slot += 1;
                 self.names.insert(name.clone(), (s, found.clone()));
                 s 
             };
@@ -831,7 +885,7 @@ impl Compiler {
                 _ => Err(Error::Type(format!("'{name}' is not indexable"))),
             }
         },
-        Statement::SetField { name, field, expr } => { let (slot, ty) = self.names.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))?; match ty { Type::Struct(struct_name) => { let layout = self.structs.get(&struct_name).ok_or_else(|| Error::Type(format!("unknown struct '{struct_name}'")))?; let field = layout.fields.iter().find(|candidate| candidate.name == field).cloned().ok_or_else(|| Error::Type(format!("struct '{struct_name}' has no field '{field}'")))?; let found = self.expr(expr, Some(&field.ty))?; if found != field.ty { return Err(Error::Type("struct field type mismatch".into())); } self.code.push(Op::StoreField(slot, field)); Ok(()) }, Type::Table(element) => { let element = *element; let found = self.expr(expr, Some(&element))?; if found != element { return Err(Error::Type("table value type mismatch".into())); } self.code.push(Op::StoreTableField(slot, field, element)); Ok(()) }, _ => Err(Error::Type(format!("'{name}' has no named keys"))), } },
+        Statement::SetField { name, field, expr } => { let (slot, ty) = self.names.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))?; match ty { Type::Struct(struct_name) => { let layout = self.structs.get(&struct_name).ok_or_else(|| Error::Type(format!("unknown struct '{struct_name}'")))?; let field = layout.fields.iter().find(|candidate| candidate.name == field).cloned().ok_or_else(|| Error::Type(format!("struct '{struct_name}' has no field '{field}'")))?; let found = self.expr(expr, Some(&field.ty))?; if found != field.ty { return Err(Error::Type("struct field type mismatch".into())); } self.code.push(Op::StoreField(slot, field)); Ok(()) }, Type::Table(element) => { let element = *element; let found = self.expr(expr, Some(&element))?; if found != element { return Err(Error::Type("table value type mismatch".into())); } let field = self.intern_name(&field); self.code.push(Op::StoreTableField(slot, field, element)); Ok(()) }, _ => Err(Error::Type(format!("'{name}' has no named keys"))), } },
         Statement::SetFieldIndex { name, field, index, expr } => { let (slot, Type::Struct(struct_name)) = self.names.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))? else { return Err(Error::Type(format!("'{name}' is not a struct"))); }; let layout = self.structs.get(&struct_name).ok_or_else(|| Error::Type(format!("unknown struct '{struct_name}'")))?; let field = layout.fields.iter().find(|candidate| candidate.name == field).cloned().ok_or_else(|| Error::Type(format!("struct '{struct_name}' has no field '{field}'")))?; let Type::Array(element) = field.ty.clone() else { return Err(Error::Type(format!("field '{}' is not a vector", field.name))); }; let element = *element; scalar_size(&element)?; let index_ty = self.expr(index, None)?; if !matches!(index_ty, Type::I8|Type::I16|Type::I32|Type::I64|Type::U8|Type::U16|Type::U32|Type::U64) { return Err(Error::Type("index must be an integer".into())); } let found = self.expr(expr, Some(&element))?; if found != element { return Err(Error::Type(format!("item is {found}; expected {element}"))); } self.code.push(Op::StoreFieldIndex(slot, field, element)); Ok(()) },
         Statement::Print(expr) => { self.expr(expr, None)?; self.code.push(Op::Print); Ok(()) },
         Statement::Printf { format, args } => {
@@ -844,7 +898,73 @@ impl Compiler {
         },
         Statement::Putc(expr) => { self.expr(expr, None)?; self.code.push(Op::Putc); Ok(()) },
         Statement::If { condition, then_body, else_body } => { let ty = self.expr(condition, None)?; if ty != Type::Bool { return Err(Error::Type(format!("if condition must be bool, got {ty}"))); } let false_jump = self.code.len(); self.code.push(Op::JumpIfFalse(usize::MAX)); for statement in then_body { self.statement(statement)?; } if else_body.is_empty() { let end = self.code.len(); self.code[false_jump] = Op::JumpIfFalse(end); } else { let end_jump = self.code.len(); self.code.push(Op::Jump(usize::MAX)); let else_start = self.code.len(); self.code[false_jump] = Op::JumpIfFalse(else_start); for statement in else_body { self.statement(statement)?; } let end = self.code.len(); self.code[end_jump] = Op::Jump(end); } Ok(()) },
-        Statement::While { condition, body } => { let loop_start = self.code.len(); let ty = self.expr(condition, None)?; if ty != Type::Bool { return Err(Error::Type(format!("while condition must be bool, got {ty}"))); } let exit_jump = self.code.len(); self.code.push(Op::JumpIfFalse(usize::MAX)); for statement in body { self.statement(statement)?; } self.code.push(Op::Jump(loop_start)); let end = self.code.len(); self.code[exit_jump] = Op::JumpIfFalse(end); Ok(()) }, } 
+        Statement::While { condition, body } => {
+            let loop_start = self.code.len();
+            let ty = self.expr(condition, None)?;
+            if ty != Type::Bool { return Err(Error::Type(format!("while condition must be bool, got {ty}"))); }
+            let exit_jump = self.code.len();
+            self.code.push(Op::JumpIfFalse(usize::MAX));
+            self.loops.push(LoopContext { break_jumps: Vec::new(), continue_jumps: Vec::new(), continue_target: loop_start });
+            for statement in body { self.statement(statement)?; }
+            self.code.push(Op::Jump(loop_start));
+            let end = self.code.len();
+            self.code[exit_jump] = Op::JumpIfFalse(end);
+            let context = self.loops.pop().expect("loop context");
+            for jump in context.break_jumps { self.code[jump] = Op::Jump(end); }
+            for jump in context.continue_jumps { self.code[jump] = Op::Jump(context.continue_target); }
+            Ok(())
+        },
+        Statement::For { name, start, end, body } => {
+            if self.names.contains_key(&name) { return Err(Error::Type(format!("loop variable '{name}' is already defined"))); }
+            let start_ty = self.expr(start, Some(&Type::I32))?;
+            let end_ty = self.expr(end, Some(&Type::I32))?;
+            if start_ty != Type::I32 || end_ty != Type::I32 { return Err(Error::Type("for bounds must be i32".into())); }
+            let index_slot = self.next_slot;
+            self.next_slot += 1;
+            let end_slot = self.next_slot;
+            self.next_slot += 1;
+            // The expressions were emitted in source order, so store the end first.
+            self.code.push(Op::Store(end_slot));
+            self.code.push(Op::Store(index_slot));
+            self.names.insert(name.clone(), (index_slot, Type::I32));
+            let loop_start = self.code.len();
+            self.code.push(Op::Load(index_slot));
+            self.code.push(Op::Load(end_slot));
+            self.code.push(Op::Binary(BinaryOp::I32(BinOp::Le)));
+            let exit_jump = self.code.len();
+            self.code.push(Op::JumpIfFalse(usize::MAX));
+            self.loops.push(LoopContext { break_jumps: Vec::new(), continue_jumps: Vec::new(), continue_target: usize::MAX });
+            for statement in body { self.statement(statement)?; }
+            let increment_start = self.code.len();
+            self.code.push(Op::Load(index_slot));
+            self.code.push(Op::Push(Value::I32(1)));
+            self.code.push(Op::Binary(BinaryOp::I32(BinOp::Add)));
+            self.code.push(Op::Store(index_slot));
+            self.code.push(Op::Jump(loop_start));
+            let loop_end = self.code.len();
+            self.code[exit_jump] = Op::JumpIfFalse(loop_end);
+            let mut context = self.loops.pop().expect("loop context");
+            context.continue_target = increment_start;
+            for jump in context.break_jumps { self.code[jump] = Op::Jump(loop_end); }
+            for jump in context.continue_jumps { self.code[jump] = Op::Jump(context.continue_target); }
+            self.names.remove(&name);
+            Ok(())
+        },
+        Statement::Break => {
+            let context = self.loops.last_mut().ok_or_else(|| Error::Type("break is available only inside a loop".into()))?;
+            let jump = self.code.len();
+            self.code.push(Op::Jump(usize::MAX));
+            context.break_jumps.push(jump);
+            Ok(())
+        },
+        Statement::Continue => {
+            let context = self.loops.last_mut().ok_or_else(|| Error::Type("continue is available only inside a loop".into()))?;
+            let jump = self.code.len();
+            self.code.push(Op::Jump(usize::MAX));
+            context.continue_jumps.push(jump);
+            Ok(())
+        },
+    }
     }
 
     fn expr(&mut self, expr: Expr, expected: Option<&Type>) -> Result<Type, Error> { match expr {
@@ -855,8 +975,27 @@ impl Compiler {
         Expr::This => { let struct_name = self.current_method_struct.clone().ok_or_else(|| Error::Type("this is available only inside a struct method".into()))?; self.code.push(Op::LoadCurrentReceiver); Ok(Type::Struct(struct_name)) },
         Expr::Require(path) => { let module = self.load_module(&path)?; let id = module.id.clone(); self.code.push(Op::Require(module)); Ok(Type::Module(id)) },
         Expr::Name(name) => { if let Some(field) = self.current_method_fields.as_ref().and_then(|fields| fields.get(&name)).cloned() { let ty = field.ty.clone(); self.code.push(Op::LoadCurrentField(field)); Ok(ty) } else { let (slot, ty) = self.names.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))?; self.code.push(Op::Load(slot)); Ok(ty) } },
-        Expr::Array(items) => { let element = match expected { Some(Type::Array(t)) => (**t).clone(), _ => return Err(Error::Type("array needs an explicit element type, e.g. vector<i32>".into())) }; scalar_size(&element)?; let count = items.len(); for item in items { let found = self.expr(item, Some(&element))?; if found != element { return Err(Error::Type(format!("array item is {found}; expected {element}"))); } } self.code.push(Op::MakeArray(count, element.clone())); Ok(Type::Array(Box::new(element))) },
-        Expr::Table(items) => { let element = match expected { Some(Type::Table(t)) => (**t).clone(), _ => return Err(Error::Type("table needs an explicit value type, e.g. table<i32>".into())) }; let mut entries = Vec::with_capacity(items.len()); for (key, value) in items { match key { TableLiteralKey::Name(name) => entries.push(TableEntry::Name(name)), TableLiteralKey::Index(index) => { let key_ty = self.expr(index, None)?; if !matches!(key_ty, Type::I8|Type::I16|Type::I32|Type::I64|Type::U8|Type::U16|Type::U32|Type::U64) { return Err(Error::Type("table index must be an integer".into())); } entries.push(TableEntry::Index); } } let found = self.expr(value, Some(&element))?; if found != element { return Err(Error::Type(format!("table value is {found}; expected {element}"))); } } self.code.push(Op::MakeTable(entries, element.clone())); Ok(Type::Table(Box::new(element))) },
+        Expr::Array(mut items) => {
+            let inferred = expected.is_none();
+            let element = match expected {
+                Some(Type::Array(t)) => (**t).clone(),
+                Some(other) => return Err(Error::Type(format!("expected {other}, but array literal creates a vector"))),
+                None => {
+                    let first = items.first().ok_or_else(|| Error::Type("cannot infer the element type of an empty array".into()))?.clone();
+                    self.expr(first, None)?
+                },
+            };
+            scalar_size(&element)?;
+            let count = items.len();
+            if inferred { items.remove(0); }
+            for item in items {
+                let found = self.expr(item, Some(&element))?;
+                if found != element { return Err(Error::Type(format!("array item is {found}; expected {element}"))); }
+            }
+            self.code.push(Op::MakeArray(count, element.clone()));
+            Ok(Type::Array(Box::new(element)))
+        },
+        Expr::Table(items) => { let element = match expected { Some(Type::Table(t)) => (**t).clone(), _ => return Err(Error::Type("table needs an explicit value type, e.g. table<i32>".into())) }; let mut entries = Vec::with_capacity(items.len()); for (key, value) in items { match key { TableLiteralKey::Name(name) => { let name = self.intern_name(&name); entries.push(TableEntry::Name(name)); }, TableLiteralKey::Index(index) => { let key_ty = self.expr(index, None)?; if !matches!(key_ty, Type::I8|Type::I16|Type::I32|Type::I64|Type::U8|Type::U16|Type::U32|Type::U64) { return Err(Error::Type("table index must be an integer".into())); } entries.push(TableEntry::Index); } } let found = self.expr(value, Some(&element))?; if found != element { return Err(Error::Type(format!("table value is {found}; expected {element}"))); } } self.code.push(Op::MakeTable(entries, element.clone())); Ok(Type::Table(Box::new(element))) },
         Expr::TensorFactory { name, element, shape } => {
             let Type::Tensor(expected_element, rank) = expected.cloned().ok_or_else(|| Error::Type(format!("{name}<T> needs an expected tensor type, e.g. let x: tensor<f32, 2> = {name}<f32>([2, 3])")))? else { return Err(Error::Type(format!("{name}<{}> creates a tensor, but the expected type is not tensor", element))); };
             if expected_element.as_ref() != &element { return Err(Error::Type(format!("{name} element type is {element}; expected {expected_element}"))); }
@@ -870,6 +1009,13 @@ impl Compiler {
         Expr::StructLiteral(name, fields) => { let layout = self.structs.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown struct '{name}'")))?; if let Some(expected) = expected { if expected != &Type::Struct(name.clone()) { return Err(Error::Type(format!("expected {expected}, got {name}"))); } } if fields.len() != layout.fields.len() { return Err(Error::Type(format!("struct '{name}' needs {} field(s)", layout.fields.len()))); } let mut provided = HashMap::new(); for (field_name, field_expr) in fields { if provided.insert(field_name.clone(), field_expr).is_some() { return Err(Error::Type(format!("struct '{name}' initializes field '{field_name}' more than once"))); } } for field in &layout.fields { let expr = provided.remove(&field.name).ok_or_else(|| Error::Type(format!("struct '{name}' is missing field '{}'", field.name)))?; let found = self.expr(expr, Some(&field.ty))?; if found != field.ty { return Err(Error::Type(format!("field '{}' is {found}; expected {}", field.name, field.ty))); } } if let Some((unknown, _)) = provided.into_iter().next() { return Err(Error::Type(format!("struct '{name}' has no field '{unknown}'"))); } self.code.push(Op::MakeStruct(layout)); Ok(Type::Struct(name)) },
         Expr::Call(name, mut args) => {
             match name.as_str() {
+                "len" => {
+                    if args.len() != 1 { return Err(Error::Type("len expects 1 argument".into())); }
+                    let ty = self.expr(args.remove(0), None)?;
+                    if !matches!(ty, Type::Array(_)) { return Err(Error::Type(format!("len requires a vector, got {ty}"))); }
+                    self.code.push(Op::Len);
+                    Ok(Type::I32)
+                },
                 "sqrt" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "floor" | "ceil" | "round" => {
                     if args.len() != 1 { return Err(Error::Type(format!("{} expects 1 argument", name))); }
                     let arg = args.remove(0);
@@ -919,30 +1065,62 @@ impl Compiler {
             Ok(ty)
         },
         Expr::Binary(left, op, right) => {
+            if matches!(op, BinOp::And | BinOp::Or) {
+                let left_ty = self.expr(*left, Some(&Type::Bool))?;
+                if left_ty != Type::Bool { return Err(Error::Type("logical operators require bool".into())); }
+                let branch = self.code.len();
+                self.code.push(Op::JumpIfFalse(usize::MAX));
+                match op {
+                    BinOp::And => {
+                        let right_ty = self.expr(*right, Some(&Type::Bool))?;
+                        if right_ty != Type::Bool { return Err(Error::Type("logical operators require bool".into())); }
+                        let end_jump = self.code.len();
+                        self.code.push(Op::Jump(usize::MAX));
+                        let false_branch = self.code.len();
+                        self.code.push(Op::Push(Value::Bool(false)));
+                        let end = self.code.len();
+                        self.code[branch] = Op::JumpIfFalse(false_branch);
+                        self.code[end_jump] = Op::Jump(end);
+                    },
+                    BinOp::Or => {
+                        self.code.push(Op::Push(Value::Bool(true)));
+                        let end_jump = self.code.len();
+                        self.code.push(Op::Jump(usize::MAX));
+                        let right_branch = self.code.len();
+                        let right_ty = self.expr(*right, Some(&Type::Bool))?;
+                        if right_ty != Type::Bool { return Err(Error::Type("logical operators require bool".into())); }
+                        let end = self.code.len();
+                        self.code[branch] = Op::JumpIfFalse(right_branch);
+                        self.code[end_jump] = Op::Jump(end);
+                    },
+                    _ => unreachable!(),
+                }
+                return Ok(Type::Bool);
+            }
             let left_expected = match op { BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => None, _ => expected };
             let lt = self.expr(*left, left_expected)?;
             let rt = self.expr(*right, Some(&lt))?;
             if !types_compatible(&lt, &rt) { return Err(Error::Type(format!("operator {:?} needs matching types, got {} and {}", op, lt, rt))); }
             match op {
+                BinOp::Add if lt == Type::String => {
+                    self.code.push(Op::ConcatString); Ok(Type::String)
+                },
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
                     if !is_numeric(&lt) { return Err(Error::Type("arithmetic requires numeric types".into())); }
-                    self.code.push(Op::Binary(op, lt.clone())); Ok(lt)
+                    self.code.push(Op::Binary(Self::binary_opcode(op, &lt)?)); Ok(lt)
                 },
                 BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
                     if !is_integer(&lt) { return Err(Error::Type("bitwise operations require integer types".into())); }
-                    self.code.push(Op::Binary(op, lt.clone())); Ok(lt)
+                    self.code.push(Op::Binary(Self::binary_opcode(op, &lt)?)); Ok(lt)
                 },
                 BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                     if !is_numeric(&lt) { return Err(Error::Type("comparisons require numeric types".into())); }
-                    self.code.push(Op::Binary(op, lt.clone())); Ok(Type::Bool)
+                    self.code.push(Op::Binary(Self::binary_opcode(op, &lt)?)); Ok(Type::Bool)
                 },
                 BinOp::Eq | BinOp::Neq => {
-                    self.code.push(Op::Binary(op, lt.clone())); Ok(Type::Bool)
+                    self.code.push(Op::Binary(Self::binary_opcode(op, &lt)?)); Ok(Type::Bool)
                 },
-                BinOp::And | BinOp::Or => {
-                    if lt != Type::Bool { return Err(Error::Type("logical operators require bool".into())); }
-                    self.code.push(Op::Binary(op, lt.clone())); Ok(Type::Bool)
-                }
+                BinOp::And | BinOp::Or => unreachable!(),
             }
         },
         Expr::Index(container, indices) => {
@@ -954,7 +1132,7 @@ impl Compiler {
                 _ => Err(Error::Type(format!("cannot index {ct}"))),
             }
         },
-        Expr::Field(container, field_name) => { let container_ty = self.expr(*container, None)?; match container_ty { Type::Struct(struct_name) => { let layout = self.structs.get(&struct_name).ok_or_else(|| Error::Type(format!("unknown struct '{struct_name}'")))?; let field = layout.fields.iter().find(|field| field.name == field_name).cloned().ok_or_else(|| Error::Type(format!("struct '{struct_name}' has no field '{field_name}'")))?; self.code.push(Op::Field(field.clone())); Ok(field.ty) }, Type::Table(element) => { let element = *element; self.code.push(Op::TableField(field_name)); Ok(element) }, Type::Module(module_id) => { let ty = { let module = self.module_artifacts.get(&module_id).ok_or_else(|| Error::Runtime("missing compiled module".into()))?; let ModuleExport::Value { ty, .. } = module.exports.get(&field_name).ok_or_else(|| Error::Type(format!("module has no exported value '{field_name}'")))? else { return Err(Error::Type(format!("'{field_name}' is not an exported module value"))); }; ty.clone() }; self.code.push(Op::ModuleField(field_name)); Ok(ty) }, _ => Err(Error::Type("field access requires a struct, table, or module".into())), } },
+        Expr::Field(container, field_name) => { let container_ty = self.expr(*container, None)?; match container_ty { Type::Struct(struct_name) => { let layout = self.structs.get(&struct_name).ok_or_else(|| Error::Type(format!("unknown struct '{struct_name}'")))?; let field = layout.fields.iter().find(|field| field.name == field_name).cloned().ok_or_else(|| Error::Type(format!("struct '{struct_name}' has no field '{field_name}'")))?; self.code.push(Op::Field(field.clone())); Ok(field.ty) }, Type::Table(element) => { let element = *element; let field_name = self.intern_name(&field_name); self.code.push(Op::TableField(field_name)); Ok(element) }, Type::Module(module_id) => { let ty = { let module = self.module_artifacts.get(&module_id).ok_or_else(|| Error::Runtime("missing compiled module".into()))?; let ModuleExport::Value { ty, .. } = module.exports.get(&field_name).ok_or_else(|| Error::Type(format!("module has no exported value '{field_name}'")))? else { return Err(Error::Type(format!("'{field_name}' is not an exported module value"))); }; ty.clone() }; self.code.push(Op::ModuleField(field_name)); Ok(ty) }, _ => Err(Error::Type("field access requires a struct, table, or module".into())), } },
     } }
 
     fn compile_tensor_indices(&mut self, indices: Vec<Expr>) -> Result<(), Error> {
@@ -1003,7 +1181,7 @@ pub struct Vm {
 
 impl Default for Vm {
     fn default() -> Self {
-        Self { stack: Vec::new(), locals: Vec::new(), output: Vec::new(), interactive: false, input: VecDeque::new(), modules: HashMap::new(), extern_functions: HashMap::new(), heap: Rc::new(RefCell::new(Heap::default())), gc_owner: true, callback_state: None, random_state: 0x5EED_CAFE_D15C_A11E }
+        Self { stack: Vec::with_capacity(256), locals: Vec::with_capacity(64), output: Vec::new(), interactive: false, input: VecDeque::new(), modules: HashMap::new(), extern_functions: HashMap::new(), heap: Rc::new(RefCell::new(Heap::default())), gc_owner: true, callback_state: None, random_state: 0x5EED_CAFE_D15C_A11E }
     }
 }
 
@@ -1239,8 +1417,32 @@ impl Vm {
             Op::Field(field) => { let object = self.pop()?; let Value::Struct(reference, _) = object else { return Err(Error::Runtime("VM struct invariant broken".into())); }; let value = match self.heap.borrow().get(reference)? { HeapObject::Struct { values, .. } => values.get(field.index).cloned().ok_or_else(|| Error::Runtime("invalid struct field index".into()))?, _ => return Err(Error::Runtime("struct heap invariant broken".into())) }; self.stack.push(value); },
             Op::TableField(name) => { let object = self.pop()?; let Value::Table(reference, _) = object else { return Err(Error::Runtime("VM table invariant broken".into())); }; let value = match self.heap.borrow().get(reference)? { HeapObject::Table { entries, .. } => entries.get(&TableKey::Name(name.clone())).cloned().ok_or_else(|| Error::Runtime(format!("table has no key {name}")))?, _ => return Err(Error::Runtime("table heap invariant broken".into())) }; self.stack.push(value); },
             Op::ModuleField(name) => { let Value::Module(id) = self.pop()? else { return Err(Error::Runtime("VM module invariant broken".into())); }; let value = { let instance = self.modules.get(&id).ok_or_else(|| Error::Runtime("loaded module is missing".into()))?; let ModuleExport::Value { slot, .. } = instance.artifact.exports.get(name).ok_or_else(|| Error::Runtime(format!("module has no exported value '{name}'")))? else { return Err(Error::Runtime(format!("'{name}' is not an exported module value"))); }; instance.vm.locals.get(*slot).cloned().ok_or_else(|| Error::Runtime("invalid module export slot".into()))? }; self.stack.push(value); },
-            Op::Binary(op, ty) => { let right = self.pop()?; let left = self.pop()?; self.stack.push(evaluate_binary(left, right, op, ty)?); },
+            Op::Binary(op) => { let right = self.pop()?; let left = self.pop()?; self.stack.push(evaluate_binary(left, right, op)?); },
             Op::Unary(op, ty) => { let val = self.pop()?; self.stack.push(evaluate_unary(val, op, ty)?); },
+            Op::Len => {
+                let value = self.pop()?;
+                let Value::Array(reference, element) = value else { return Err(Error::Runtime("VM len invariant broken".into())); };
+                let length = match self.heap.borrow().get(reference)? {
+                    HeapObject::Array { bytes, element: stored_element } if stored_element == element.as_ref() => bytes.len() / scalar_size(&element)?,
+                    _ => return Err(Error::Runtime("array heap invariant broken".into())),
+                };
+                let length = i32::try_from(length).map_err(|_| Error::Runtime("vector length exceeds i32".into()))?;
+                self.stack.push(Value::I32(length));
+            },
+            Op::ConcatString => {
+                let right = self.pop()?;
+                let left = self.pop()?;
+                let Value::String(left_ref) = left else { return Err(Error::Runtime("VM string invariant broken".into())); };
+                let Value::String(right_ref) = right else { return Err(Error::Runtime("VM string invariant broken".into())); };
+                let heap = self.heap.borrow();
+                let (left, right) = match (heap.get(left_ref)?, heap.get(right_ref)?) {
+                    (HeapObject::String(left), HeapObject::String(right)) => (left.clone(), right.clone()),
+                    _ => return Err(Error::Runtime("string heap invariant broken".into())),
+                };
+                let reference = self.allocate(HeapObject::String(format!("{left}{right}")));
+                self.stack.push(Value::String(reference));
+                self.collect_if_needed();
+            },
             Op::Builtin1(name, _ty) => { let arg = self.pop()?; self.stack.push(evaluate_builtin1(name, arg)?); },
             Op::Builtin2(name, ty) => { let arg2 = self.pop()?; let arg1 = self.pop()?; self.stack.push(evaluate_builtin2(name, arg1, arg2, ty)?); },
             Op::CallExternal(name, argument_count) => self.call_external(name, *argument_count)?,
@@ -1440,9 +1642,9 @@ fn evaluate_builtin2(name: &str, a: Value, b: Value, ty: &Type) -> Result<Value,
     }
 }
 
-fn evaluate_binary(a: Value, b: Value, op: &BinOp, ty: &Type) -> Result<Value, Error> {
-    if matches!(op, BinOp::Eq) { return Ok(Value::Bool(a == b)); }
-    if matches!(op, BinOp::Neq) { return Ok(Value::Bool(a != b)); }
+fn evaluate_binary(a: Value, b: Value, opcode: &BinaryOp) -> Result<Value, Error> {
+    if matches!(opcode, BinaryOp::Equal) { return Ok(Value::Bool(a == b)); }
+    if matches!(opcode, BinaryOp::NotEqual) { return Ok(Value::Bool(a != b)); }
     macro_rules! int_op {
         ($x:ident) => {
             if let (Value::$x(l), Value::$x(r)) = (a, b) {
@@ -1487,14 +1689,14 @@ fn evaluate_binary(a: Value, b: Value, op: &BinOp, ty: &Type) -> Result<Value, E
         }
     }
 
-    match ty {
-        Type::I8 => { int_op!(I8); }, Type::I16 => { int_op!(I16); },
-        Type::I32 => { int_op!(I32); }, Type::I64 => { int_op!(I64); },
-        Type::U8 => { int_op!(U8); }, Type::U16 => { int_op!(U16); },
-        Type::U32 => { int_op!(U32); }, Type::U64 => { int_op!(U64); },
-        Type::F32 => { float_op!(F32, l, r, f32); },
-        Type::F64 => { float_op!(F64, l, r, f64); },
-        Type::F16 => {
+    match opcode {
+        BinaryOp::I8(op) => { int_op!(I8); }, BinaryOp::I16(op) => { int_op!(I16); },
+        BinaryOp::I32(op) => { int_op!(I32); }, BinaryOp::I64(op) => { int_op!(I64); },
+        BinaryOp::U8(op) => { int_op!(U8); }, BinaryOp::U16(op) => { int_op!(U16); },
+        BinaryOp::U32(op) => { int_op!(U32); }, BinaryOp::U64(op) => { int_op!(U64); },
+        BinaryOp::F32(op) => { float_op!(F32, l, r, f32); },
+        BinaryOp::F64(op) => { float_op!(F64, l, r, f64); },
+        BinaryOp::F16(op) => {
             if let (Value::F16(l_raw), Value::F16(r_raw)) = (a, b) {
                 let l = f16_to_f32(l_raw);
                 let r = f16_to_f32(r_raw);
@@ -1512,16 +1714,7 @@ fn evaluate_binary(a: Value, b: Value, op: &BinOp, ty: &Type) -> Result<Value, E
                 }
             }
         },
-        Type::Bool => {
-            if let (Value::Bool(l), Value::Bool(r)) = (a, b) {
-                match op {
-                    BinOp::And => return Ok(Value::Bool(l && r)),
-                    BinOp::Or  => return Ok(Value::Bool(l || r)),
-                    _ => return Err(Error::Runtime("VM bool operator invariant broken".into()))
-                }
-            }
-        }
-        _ => {}
+        BinaryOp::Equal | BinaryOp::NotEqual => unreachable!(),
     }
     Err(Error::Runtime("VM execution invariant broken: unsupported binary op".into()))
 }
@@ -1758,6 +1951,31 @@ mod tests {
     #[test]
     fn parenthesized_expressions_work() {
         assert_eq!(execute("let a: i32 = 2; print((a + 2));").unwrap(), ["4"]);
+    }
+
+    #[test]
+    fn logical_operators_short_circuit_their_right_hand_side() {
+        let source = "let yes: bool = 1 == 1; let no: bool = 1 == 0; print(yes || [1][9] == 1); print(no && [1][9] == 1);";
+        assert_eq!(execute(source).unwrap(), ["true", "false"]);
+    }
+
+    #[test]
+    fn range_for_break_and_continue_work() {
+        let source = "let total: i32 = 0; for i = 0, 5 do if i == 2 then continue end total = total + i; if i == 4 then break end end print(total);";
+        assert_eq!(execute(source).unwrap(), ["8"]);
+    }
+
+    #[test]
+    fn break_and_continue_are_rejected_outside_loops() {
+        assert!(execute("break;").is_err());
+        assert!(execute("continue;").is_err());
+    }
+
+    #[test]
+    fn len_string_concatenation_and_inferred_arrays_work() {
+        let source = "let values: vector<i32> = [1, 2, 3]; let message: string = \"value=\" + \"3\"; print(len(values)); print([4, 5][1]); print(message);";
+        assert_eq!(execute(source).unwrap(), ["3", "5", "value=3"]);
+        assert!(execute("print([]);").is_err());
     }
 
     #[test]

@@ -17,6 +17,33 @@ let board: Board = Board { cells = [0, 0, 0], score = 0 }
 
 Tables never gain methods as part of this model. Object behaviour belongs only to `struct` and its member functions.
 
+## Expressions and control flow
+
+`&&` and `||` use short-circuit evaluation: the right-hand expression is
+evaluated only when its value is needed. This makes guarded accesses safe:
+
+```l0
+if ready && board[0] == 1 then
+    print("winner")
+end
+```
+
+The `+` operator concatenates two `string` values. Array literals infer their
+scalar element type when no surrounding declaration supplies one; an empty
+literal still needs an explicit type. `len(vector)` returns an `i32` length.
+
+`while` loops support `break` and `continue`. The initial `for` form is an
+inclusive `i32` range:
+
+```l0
+for i = 0, len(cells) - 1 do
+    if cells[i] == 0 then
+        continue
+    end
+    print(i)
+end
+```
+
 ## Modules
 
 A source file run through the RLUA executable establishes its own directory as the module root. `require` accepts a string literal path relative to that root; an omitted extension means `.l0`. Absolute paths and paths that resolve outside the root are rejected. A canonical module is initialized once per VM and then returned from the module cache.
@@ -63,7 +90,7 @@ The C ABI provides the same path for `i32` functions: call `l0_register_i32_func
 
 ## Runtime roadmap
 
-1. **Current stage:** typed vector fields in structures and cached filesystem modules with explicit exports.
+1. **Current stage:** typed vector fields in structures and cached filesystem modules with explicit exports. Bytecode records the static numeric operand family, avoiding a runtime `Type` dispatch for binary arithmetic and comparisons. Named table keys are interned by the compiler and retained as shared `Rc<str>` values in bytecode and tables.
 2. **Current runtime layer — garbage collector:** vectors, tables, structures, and strings are heap objects addressed by stable `HeapRef` handles, so copying a `Value` preserves object identity instead of copying its payload. Loaded module VMs are long-lived roots. The non-moving mark-and-sweep arena traces the operand stack, local slots, and those module roots; collection runs automatically after an allocation threshold and can also be requested explicitly through `Vm::collect_garbage()`. This makes cycles collectible without reference counting.
 3. **Later stage:** extend the C callback helpers beyond `i32`, add richer module interfaces, cross-module struct method dispatch, parameter and return-value design, and standard libraries.
 
