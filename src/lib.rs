@@ -306,7 +306,7 @@ pub enum UnOp { Neg, Not }
 enum Token {
     Let, Print, Printf, Putc, Input, This, Function, Export, Require, If, Then, Else, While, For, Do, Break, Continue, Struct, Table, End,
     Ident(String), Integer(i128), Float(f64), StringLit(String), Colon, DoubleColon,
-    Equal, EqualEqual, BangEq, Plus, Minus, Star, Slash, Percent,
+    Equal, EqualEqual, Bang, BangEq, Plus, Minus, Star, Slash, Percent,
     Ampersand, Pipe, Caret, Shl, Shr, AndAnd, OrOr,
     Dot, Lt, Le, Gt, Ge, LParen, RParen, LBracket, RBracket, LBrace, RBrace, Comma, Semi, Eof
 }
@@ -336,6 +336,7 @@ fn lex(source: &str) -> Result<Vec<Token>, Error> {
             ':' if chars.get(i + 1) == Some(&':') => { result.push(Token::DoubleColon); i += 2; }, ':' => { result.push(Token::Colon); i += 1; },
             '=' if chars.get(i + 1) == Some(&'=') => { result.push(Token::EqualEqual); i += 2; }, '=' => { result.push(Token::Equal); i += 1; },
             '!' if chars.get(i + 1) == Some(&'=') => { result.push(Token::BangEq); i += 2; },
+            '!' => { result.push(Token::Bang); i += 1; },
             '<' if chars.get(i + 1) == Some(&'=') => { result.push(Token::Le); i += 2; },
             '<' if chars.get(i + 1) == Some(&'<') => { result.push(Token::Shl); i += 2; },
             '<' => { result.push(Token::Lt); i += 1; },
@@ -668,10 +669,9 @@ impl Parser {
         if *self.peek() == Token::Minus {
             self.next();
             Ok(Expr::Unary(UnOp::Neg, Box::new(self.unary()?)))
-        } else if *self.peek() == Token::BangEq {
-            // Обработка логического Not, если он поддерживается
-            // Здесь для примера вызывается primary(), но если есть оператор '!', нужно его добавить
-            self.primary()
+        } else if *self.peek() == Token::Bang {
+            self.next();
+            Ok(Expr::Unary(UnOp::Not, Box::new(self.unary()?)))
         } else {
             self.primary()
         }
@@ -1109,7 +1109,15 @@ impl Compiler {
 
     fn expr(&mut self, expr: Expr, expected: Option<&Type>) -> Result<Type, Error> { match expr {
         Expr::Integer(n) => { let ty = expected.unwrap_or(&Type::I32); let val = int_value(n, ty)?; self.code.push(Op::Push(val)); Ok(ty.clone()) },
-        Expr::Float(n) => { let ty = expected.unwrap_or(&Type::F64); let val = float_value(n, ty); self.code.push(Op::Push(val)); Ok(ty.clone()) },
+        Expr::Float(n) => {
+            let ty = expected.unwrap_or(&Type::F64);
+            if !matches!(ty, Type::F16 | Type::F32 | Type::F64) {
+                return Err(Error::Type(format!("float literal cannot initialize {ty}")));
+            }
+            let val = float_value(n, ty);
+            self.code.push(Op::Push(val));
+            Ok(ty.clone())
+        },
         Expr::String(s) => { self.code.push(Op::MakeString(s)); Ok(Type::String) },
         Expr::Input => { let ty = expected.filter(|t| is_numeric(t)).cloned().ok_or_else(|| Error::Type("input needs an expected numeric type, e.g. let value: i32 = input".into()))?; self.code.push(Op::Input(ty.clone())); Ok(ty) },
         Expr::This => { let struct_name = self.current_method_struct.clone().ok_or_else(|| Error::Type("this is available only inside a struct method".into()))?; self.code.push(Op::LoadCurrentReceiver); Ok(Type::Struct(struct_name)) },
@@ -1491,26 +1499,31 @@ impl Vm {
         let mut current_receiver: Option<usize> = None;
 
         while pc < code.len() { match &code[pc] {
-            Op::AddI32 => unsafe {
-                let right = self.pop_unchecked();
-                let left = self.pop_unchecked();
-                let r = if let Value::I32(v) = right { v } else { std::hint::unreachable_unchecked() };
-                let l = if let Value::I32(v) = left { v } else { std::hint::unreachable_unchecked() };
-                self.push_unchecked(Value::I32(l + r));
+            Op::AddI32 => {
+                let right = self.pop()?;
+                let left = self.pop()?;
+                let (Value::I32(left), Value::I32(right)) = (left, right) else {
+                    return Err(Error::Runtime("VM i32 addition invariant broken".into()));
+                };
+                let result = left.checked_add(right)
+                    .ok_or_else(|| Error::Runtime("addition overflow".into()))?;
+                self.push(Value::I32(result));
             },
-            Op::AddF32 => unsafe {
-                let right = self.pop_unchecked();
-                let left = self.pop_unchecked();
-                let r = if let Value::F32(v) = right { v } else { std::hint::unreachable_unchecked() };
-                let l = if let Value::F32(v) = left { v } else { std::hint::unreachable_unchecked() };
-                self.push_unchecked(Value::F32(l + r));
+            Op::AddF32 => {
+                let right = self.pop()?;
+                let left = self.pop()?;
+                let (Value::F32(left), Value::F32(right)) = (left, right) else {
+                    return Err(Error::Runtime("VM f32 addition invariant broken".into()));
+                };
+                self.push(Value::F32(left + right));
             },
-            Op::AddF64 => unsafe {
-                let right = self.pop_unchecked();
-                let left = self.pop_unchecked();
-                let r = if let Value::F64(v) = right { v } else { std::hint::unreachable_unchecked() };
-                let l = if let Value::F64(v) = left { v } else { std::hint::unreachable_unchecked() };
-                self.push_unchecked(Value::F64(l + r));
+            Op::AddF64 => {
+                let right = self.pop()?;
+                let left = self.pop()?;
+                let (Value::F64(left), Value::F64(right)) = (left, right) else {
+                    return Err(Error::Runtime("VM f64 addition invariant broken".into()));
+                };
+                self.push(Value::F64(left + right));
             },
             Op::Push(v) => self.push(v.clone()),
             Op::MakeString(s) => { let reference = self.allocate(HeapObject::String(s.clone())); self.push(Value::String(reference)); self.collect_if_needed(); },
@@ -1614,7 +1627,15 @@ impl Vm {
             Op::Field(field) => { let object = self.pop()?; let Value::Struct(reference, _) = object else { return Err(Error::Runtime("VM struct invariant broken".into())); }; let value = match self.heap.borrow().get(reference)? { HeapObject::Struct { values, .. } => values.get(field.index).cloned().ok_or_else(|| Error::Runtime("invalid struct field index".into()))?, _ => return Err(Error::Runtime("struct heap invariant broken".into())) }; self.push(value); },
             Op::TableField(name) => { let object = self.pop()?; let Value::Table(reference, _) = object else { return Err(Error::Runtime("VM table invariant broken".into())); }; let value = match self.heap.borrow().get(reference)? { HeapObject::Table { entries, .. } => entries.get(&TableKey::Name(name.clone())).cloned().ok_or_else(|| Error::Runtime(format!("table has no key {name}")))?, _ => return Err(Error::Runtime("table heap invariant broken".into())) }; self.push(value); },
             Op::ModuleField(name) => { let Value::Module(id) = self.pop()? else { return Err(Error::Runtime("VM module invariant broken".into())); }; let value = { let instance = self.modules.get(&id).ok_or_else(|| Error::Runtime("loaded module is missing".into()))?; let ModuleExport::Value { slot, .. } = instance.artifact.exports.get(name).ok_or_else(|| Error::Runtime(format!("module has no exported value '{name}'")))? else { return Err(Error::Runtime(format!("'{name}' is not an exported module value"))); }; instance.vm.locals.get(*slot).cloned().ok_or_else(|| Error::Runtime("invalid module export slot".into()))? }; self.push(value); },
-            Op::Binary(op) => { let right = self.pop()?; let left = self.pop()?; self.push(evaluate_binary(left, right, op)?); },
+            Op::Binary(op) => {
+                let right = self.pop()?;
+                let left = self.pop()?;
+                let result = {
+                    let heap = self.heap.borrow();
+                    evaluate_binary(&heap, left, right, op)?
+                };
+                self.push(result);
+            },
             Op::Unary(op, ty) => { let val = self.pop()?; self.push(evaluate_unary(val, op, ty)?); },
             Op::Len => {
                 let value = self.pop()?;
@@ -1749,13 +1770,10 @@ impl Vm {
         self.stack_ptr -= 1;
         self.stack.get_unchecked(self.stack_ptr).clone()
     }
-
     fn pop(&mut self) -> Result<Value, Error> {
         if self.stack_ptr == 0 { return Err(Error::Runtime("stack underflow".into())); }
-        self.stack_ptr -= 1;
-        Ok(self.stack[self.stack_ptr].clone())
+        Ok(unsafe { self.pop_unchecked() })
     }
-
     fn emit(&mut self, s: String) {
         if self.interactive { println!("{s}"); }
         self.output.push(s);
@@ -1886,9 +1904,17 @@ fn evaluate_builtin2(name: &str, a: Value, b: Value, ty: &Type) -> Result<Value,
         _ => Err(Error::Runtime(format!("{} requires matching floats", name)))
     }
 }
-fn evaluate_binary(a: Value, b: Value, opcode: &BinaryOp) -> Result<Value, Error> {
-    if matches!(opcode, BinaryOp::Equal) { return Ok(Value::Bool(a == b)); }
-    if matches!(opcode, BinaryOp::NotEqual) { return Ok(Value::Bool(a != b)); }
+fn evaluate_binary(heap: &Heap, a: Value, b: Value, opcode: &BinaryOp) -> Result<Value, Error> {
+    if matches!(opcode, BinaryOp::Equal | BinaryOp::NotEqual) {
+        let equal = match (&a, &b) {
+            (Value::String(left), Value::String(right)) => match (heap.get(*left)?, heap.get(*right)?) {
+                (HeapObject::String(left), HeapObject::String(right)) => left == right,
+                _ => return Err(Error::Runtime("string heap invariant broken".into())),
+            },
+            _ => a == b,
+        };
+        return Ok(Value::Bool(if matches!(opcode, BinaryOp::Equal) { equal } else { !equal }));
+    }
     macro_rules! int_op {
         ($x:ident, $op:expr) => {
             if let (Value::$x(l), Value::$x(r)) = (a, b) {
@@ -2108,3 +2134,34 @@ c_scalar_helpers!(l0_push_f64, l0_to_f64, F64, f64);
 pub fn f32_to_f16(value: f32) -> u16 { let bits=value.to_bits(); let sign=((bits>>16)&0x8000) as u16; let exp=((bits>>23)&0xff) as i32-127+15; let mant=bits&0x7fffff; if exp<=0 { if exp < -10{return sign}; return sign|(((mant|0x800000)>>(14-exp)) as u16); } if exp>=31 { return sign|0x7c00|if mant==0{0}else{1}; } sign|((exp as u16)<<10)|((mant>>13) as u16) }
 pub fn f16_to_f32(bits: u16) -> f32 { let sign=((bits as u32)&0x8000)<<16; let exp=(bits>>10)&0x1f; let mant=(bits&0x03ff) as u32; let out=if exp==0 { if mant==0 {sign} else { let mut m=mant; let mut e=-14i32; while m&0x400==0 {m<<=1;e-=1;} sign|(((e+127) as u32)<<23)|((m&0x3ff)<<13) } } else if exp==31 {sign|0x7f800000|(mant<<13)} else {sign|(((exp as u32+112)<<23))|(mant<<13)}; f32::from_bits(out) }
 
+#[cfg(test)]
+mod immediate_regression_tests {
+    use super::*;
+
+    #[test]
+    fn float_literals_cannot_claim_non_float_types() {
+        assert!(matches!(execute("let value: i32 = 1.0"), Err(Error::Type(_))));
+        assert!(matches!(execute("let value: bool = 1.0"), Err(Error::Type(_))));
+    }
+
+    #[test]
+    fn specialized_i32_addition_reports_overflow() {
+        assert!(matches!(
+            execute("let value: i32 = 2147483647; print(value + 1)"),
+            Err(Error::Runtime(message)) if message == "addition overflow"
+        ));
+    }
+
+    #[test]
+    fn unary_not_is_lexed_parsed_and_evaluated() {
+        assert_eq!(execute("let no: bool = 1 == 0; print(!no)").unwrap(), vec!["true".to_owned()]);
+    }
+
+    #[test]
+    fn strings_compare_by_content() {
+        assert_eq!(
+            execute("let left: string = \"same\"; let right: string = \"same\"; print(left == right)").unwrap(),
+            vec!["true".to_owned()]
+        );
+    }
+}
