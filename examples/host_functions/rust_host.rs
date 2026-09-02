@@ -1,6 +1,7 @@
-use l0::{Error, Type, Value, Vm};
+use l0::{Error, Type, Value, Vm, Heap};
+use std::cell::RefCell;
 
-fn rust_multiply(arguments: &[Value]) -> Result<Value, Error> {
+fn rust_multiply(arguments: &[Value], _heap: &RefCell<Heap>) -> Result<Value, Error> {
     let [Value::I32(left), Value::I32(right)] = arguments else {
         return Err(Error::Runtime("rust_multiply expects two i32 values".into()));
     };

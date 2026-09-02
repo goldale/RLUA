@@ -111,7 +111,7 @@ impl Value {
 }
 
 #[derive(Clone, Debug)]
-enum HeapObject {
+pub enum HeapObject {
     Array { bytes: Vec<u8>, element: Type },
     Tensor { bytes: Vec<u8>, element: Type, shape: Vec<usize> },
     String(String),
@@ -120,15 +120,15 @@ enum HeapObject {
 }
 
 #[derive(Clone, Debug)]
-struct HeapSlot { marked: bool, object: HeapObject }
+pub struct HeapSlot { pub marked: bool, pub object: HeapObject }
 
 /// Non-moving mark-and-sweep storage for every reference value in the VM.
 #[derive(Debug)]
-struct Heap {
-    slots: Vec<Option<HeapSlot>>,
-    free: Vec<usize>,
-    allocations_since_collection: usize,
-    threshold: usize,
+pub struct Heap {
+    pub slots: Vec<Option<HeapSlot>>,
+    pub free: Vec<usize>,
+    pub allocations_since_collection: usize,
+    pub threshold: usize,
 }
 
 impl Default for Heap {
@@ -136,18 +136,18 @@ impl Default for Heap {
 }
 
 impl Heap {
-    fn allocate(&mut self, object: HeapObject) -> HeapRef {
+    pub fn allocate(&mut self, object: HeapObject) -> HeapRef {
         let index = self.free.pop().unwrap_or_else(|| { self.slots.push(None); self.slots.len() - 1 });
         self.slots[index] = Some(HeapSlot { marked: false, object });
         self.allocations_since_collection += 1;
         HeapRef(index)
     }
 
-    fn get(&self, reference: HeapRef) -> Result<&HeapObject, Error> {
+    pub fn get(&self, reference: HeapRef) -> Result<&HeapObject, Error> {
         self.slots.get(reference.0).and_then(Option::as_ref).map(|slot| &slot.object).ok_or_else(|| Error::Runtime("dangling heap reference".into()))
     }
 
-    fn get_mut(&mut self, reference: HeapRef) -> Result<&mut HeapObject, Error> {
+    pub fn get_mut(&mut self, reference: HeapRef) -> Result<&mut HeapObject, Error> {
         self.slots.get_mut(reference.0).and_then(Option::as_mut).map(|slot| &mut slot.object).ok_or_else(|| Error::Runtime("dangling heap reference".into()))
     }
 
@@ -204,14 +204,26 @@ fn scalar_size(ty: &Type) -> Result<usize, Error> { type_size(ty).ok_or_else(|| 
 
 fn encode_scalar(value: &Value, element: &Type, bytes: &mut Vec<u8>) -> Result<(), Error> {
     if &value.ty() != element { return Err(Error::Runtime("VM array type invariant broken".into())); }
-    match value {
-        Value::I8(v) => bytes.push(*v as u8), Value::U8(v) => bytes.push(*v), Value::Bool(v) => bytes.push(u8::from(*v)),
-        Value::I16(v) => bytes.extend_from_slice(&v.to_le_bytes()), Value::U16(v) | Value::F16(v) => bytes.extend_from_slice(&v.to_le_bytes()),
-        Value::I32(v) => bytes.extend_from_slice(&v.to_le_bytes()), Value::U32(v) => bytes.extend_from_slice(&v.to_le_bytes()),
-        Value::F32(v) => bytes.extend_from_slice(&v.to_le_bytes()),
-        Value::I64(v) => bytes.extend_from_slice(&v.to_le_bytes()), Value::U64(v) => bytes.extend_from_slice(&v.to_le_bytes()),
-        Value::F64(v) => bytes.extend_from_slice(&v.to_le_bytes()),
-        Value::Array(_, _) | Value::Tensor(_, _, _) | Value::Table(_, _) | Value::Struct(_, _) | Value::String(_) | Value::Module(_) => return Err(Error::Type("packed arrays can contain only scalar values".into())),
+    let size = scalar_size(element)?;
+    let start = bytes.len();
+    bytes.reserve(size);
+    unsafe {
+        bytes.set_len(start + size);
+        let ptr = bytes.as_mut_ptr().add(start);
+        match value {
+            Value::I8(v) => *ptr = *v as u8,
+            Value::U8(v) => *ptr = *v,
+            Value::Bool(v) => *ptr = u8::from(*v),
+            Value::I16(v) => std::ptr::write_unaligned(ptr as *mut i16, *v),
+            Value::U16(v) | Value::F16(v) => std::ptr::write_unaligned(ptr as *mut u16, *v),
+            Value::I32(v) => std::ptr::write_unaligned(ptr as *mut i32, *v),
+            Value::U32(v) => std::ptr::write_unaligned(ptr as *mut u32, *v),
+            Value::F32(v) => std::ptr::write_unaligned(ptr as *mut f32, *v),
+            Value::I64(v) => std::ptr::write_unaligned(ptr as *mut i64, *v),
+            Value::U64(v) => std::ptr::write_unaligned(ptr as *mut u64, *v),
+            Value::F64(v) => std::ptr::write_unaligned(ptr as *mut f64, *v),
+            _ => return Err(Error::Type("packed arrays can contain only scalar values".into())),
+        }
     }
     Ok(())
 }
@@ -225,15 +237,23 @@ fn decode_scalar(bytes: &[u8], index: usize, element: &Type) -> Result<Value, Er
 }
 
 fn decode_scalar_at(slice: &[u8], element: &Type) -> Result<Value, Error> {
-    let bytes2 = || <[u8; 2]>::try_from(slice).map_err(|_| Error::Runtime("invalid packed value".into()));
-    let bytes4 = || <[u8; 4]>::try_from(slice).map_err(|_| Error::Runtime("invalid packed value".into()));
-    let bytes8 = || <[u8; 8]>::try_from(slice).map_err(|_| Error::Runtime("invalid packed value".into()));
-    match element {
-        Type::I8 => Ok(Value::I8(slice[0] as i8)), Type::U8 => Ok(Value::U8(slice[0])), Type::Bool => match slice[0] { 0 => Ok(Value::Bool(false)), 1 => Ok(Value::Bool(true)), _ => Err(Error::Runtime("invalid packed bool".into())) },
-        Type::I16 => Ok(Value::I16(i16::from_le_bytes(bytes2()?))), Type::U16 => Ok(Value::U16(u16::from_le_bytes(bytes2()?))), Type::F16 => Ok(Value::F16(u16::from_le_bytes(bytes2()?))),
-        Type::I32 => Ok(Value::I32(i32::from_le_bytes(bytes4()?))), Type::U32 => Ok(Value::U32(u32::from_le_bytes(bytes4()?))), Type::F32 => Ok(Value::F32(f32::from_le_bytes(bytes4()?))),
-        Type::I64 => Ok(Value::I64(i64::from_le_bytes(bytes8()?))), Type::U64 => Ok(Value::U64(u64::from_le_bytes(bytes8()?))), Type::F64 => Ok(Value::F64(f64::from_le_bytes(bytes8()?))),
-        Type::Array(_) | Type::Tensor(_, _) | Type::Table(_) | Type::Struct(_) | Type::String | Type::Module(_) => Err(Error::Type("not a scalar type".into())),
+    unsafe {
+        let ptr = slice.as_ptr();
+        match element {
+            Type::I8 => Ok(Value::I8(*ptr as i8)),
+            Type::U8 => Ok(Value::U8(*ptr)),
+            Type::Bool => Ok(Value::Bool(*ptr != 0)),
+            Type::I16 => Ok(Value::I16(std::ptr::read_unaligned(ptr as *const i16))),
+            Type::U16 => Ok(Value::U16(std::ptr::read_unaligned(ptr as *const u16))),
+            Type::F16 => Ok(Value::F16(std::ptr::read_unaligned(ptr as *const u16))),
+            Type::I32 => Ok(Value::I32(std::ptr::read_unaligned(ptr as *const i32))),
+            Type::U32 => Ok(Value::U32(std::ptr::read_unaligned(ptr as *const u32))),
+            Type::F32 => Ok(Value::F32(std::ptr::read_unaligned(ptr as *const f32))),
+            Type::I64 => Ok(Value::I64(std::ptr::read_unaligned(ptr as *const i64))),
+            Type::U64 => Ok(Value::U64(std::ptr::read_unaligned(ptr as *const u64))),
+            Type::F64 => Ok(Value::F64(std::ptr::read_unaligned(ptr as *const f64))),
+            _ => Err(Error::Type("not a scalar type".into())),
+        }
     }
 }
 
@@ -704,10 +724,10 @@ enum Op {
     AddI32, AddF32, AddF64,
     Push(Value), MakeString(String), Input(Type), Require(ModuleArtifact), Load(usize), LoadCurrentReceiver,
     LoadCurrentField(StructField), Store(usize), StoreIndex(usize, Type), StoreTableIndex(usize, Type),
-    StoreTensorIndex(usize, Type, usize),
+    StoreTensorIndex(usize, Type, usize), StoreTensorIndexF32(usize, usize),
     StoreField(usize, StructField), StoreFieldIndex(usize, StructField, Type), StoreTableField(usize, Rc<str>, Type),
     StoreCurrentField(StructField), MakeArray(usize, Type), MakeTable(Vec<TableEntry>, Type), MakeStruct(StructLayout),
-    MakeTensor(TensorInit, Type, usize), Index, TensorIndex(Type, usize), TableIndex, Field(StructField), TableField(Rc<str>), ModuleField(String),
+    MakeTensor(TensorInit, Type, usize), Index, TensorIndex(Type, usize), TensorIndexF32(usize), TableIndex, Field(StructField), TableField(Rc<str>), ModuleField(String),
     Binary(BinaryOp), Unary(UnOp, Type), Len, ConcatString,
     Builtin1(String, Type), Builtin2(String, Type),
     CallExternal(String, usize),
@@ -902,7 +922,7 @@ impl Compiler {
                     self.compile_tensor_indices(indices)?;
                     let element = *inner; let found = self.expr(expr, Some(&element))?;
                     if found != element { return Err(Error::Type(format!("tensor item is {found}; expected {element}"))); }
-                    self.code.push(Op::StoreTensorIndex(slot, element, rank)); Ok(())
+                    if element == Type::F32 { self.code.push(Op::StoreTensorIndexF32(slot, rank)); } else { self.code.push(Op::StoreTensorIndex(slot, element, rank)); } Ok(())
                 },
                 _ => Err(Error::Type(format!("'{name}' is not indexable"))),
             }
@@ -1156,7 +1176,7 @@ impl Compiler {
             match ct {
                 Type::Array(element) => { if indices.len() != 1 { return Err(Error::Type("vector indexing requires exactly one index".into())); } self.compile_tensor_indices(indices)?; self.code.push(Op::Index); Ok(*element) },
                 Type::Table(element) => { if indices.len() != 1 { return Err(Error::Type("table indexing requires exactly one index".into())); } self.compile_tensor_indices(indices)?; self.code.push(Op::TableIndex); Ok(*element) },
-                Type::Tensor(element, rank) => { if indices.len() != rank { return Err(Error::Type(format!("tensor rank {rank} requires {rank} index(es)"))); } self.compile_tensor_indices(indices)?; self.code.push(Op::TensorIndex((*element).clone(), rank)); Ok(*element) },
+                Type::Tensor(element, rank) => { if indices.len() != rank { return Err(Error::Type(format!("tensor rank {rank} requires {rank} index(es)"))); } self.compile_tensor_indices(indices)?; if *element == Type::F32 { self.code.push(Op::TensorIndexF32(rank)); } else { self.code.push(Op::TensorIndex((*element).clone(), rank)); } Ok(*element) },
                 _ => Err(Error::Type(format!("cannot index {ct}"))),
             }
         },
@@ -1179,7 +1199,7 @@ fn is_integer(t: &Type) -> bool { matches!(t, Type::I8|Type::I16|Type::I32|Type:
 fn int_value(n: i128, ty: &Type) -> Result<Value, Error> { macro_rules! v { ($t:ident, $x:ident) => { n.try_into().map(Value::$t).map_err(|_| Error::Type(format!("{n} does not fit in {}", stringify!($x)))) }; } match ty { Type::I8=>v!(I8,i8),Type::I16=>v!(I16,i16),Type::I32=>v!(I32,i32),Type::I64=>v!(I64,i64),Type::U8=>v!(U8,u8),Type::U16=>v!(U16,u16),Type::U32=>v!(U32,u32),Type::U64=>v!(U64,u64), _=>Err(Error::Type(format!("integer literal cannot initialize {ty}"))) } }
 fn float_value(n: f64, ty: &Type) -> Value { match ty { Type::F16=>Value::F16(f32_to_f16(n as f32)),Type::F32=>Value::F32(n as f32),_=>Value::F64(n) } }
 
-pub type L0RustFunction = fn(&[Value]) -> Result<Value, Error>;
+pub type L0RustFunction = fn(&[Value], &RefCell<Heap>) -> Result<Value, Error>;
 
 #[derive(Clone)]
 enum ExternalFunction {
@@ -1263,7 +1283,7 @@ impl Vm {
         if self.gc_owner && self.heap.borrow().should_collect() { self.collect_garbage(); }
     }
 
-    fn allocate(&mut self, object: HeapObject) -> HeapRef { self.heap.borrow_mut().allocate(object) }
+    pub fn allocate(&mut self, object: HeapObject) -> HeapRef { self.heap.borrow_mut().allocate(object) }
 
     fn tensor_shape_from_value(&self, value: &Value) -> Result<Vec<usize>, Error> {
         let Value::Array(reference, element) = value else { return Err(Error::Runtime("tensor shape must be vector<u64>".into())); };
@@ -1359,7 +1379,7 @@ impl Vm {
             if value.ty() != *expected { return Err(Error::Runtime(format!("external function '{name}' received an invalid argument type"))); }
         }
         let result = match registered.function {
-            ExternalFunction::Rust(function) => function(&self.stack[base..self.stack_ptr])?,
+            ExternalFunction::Rust(function) => function(&self.stack[base..self.stack_ptr], &self.heap)?,
             ExternalFunction::C(function) => {
                 let state = self.callback_state.ok_or_else(|| Error::Runtime(format!("C function '{name}' requires execution through L0State")))?;
                 unsafe { (*state).ffi_call = Some(FfiCall { arguments: self.stack[base..self.stack_ptr].to_vec(), results: Vec::new() }); }
@@ -1435,6 +1455,20 @@ impl Vm {
                     _ => return Err(Error::Runtime("tensor heap invariant broken".into())),
                 }
             },
+            Op::StoreTensorIndexF32(slot, rank) => {
+                let value = self.pop()?;
+                let Value::F32(v) = value else { return Err(Error::Runtime("VM tensor type invariant broken".into())); };
+                let indices = self.pop_tensor_indices(*rank)?;
+                let Value::Tensor(reference, _, _) = self.locals.get(*slot).cloned().ok_or_else(|| Error::Runtime("invalid local slot".into()))? else { return Err(Error::Runtime("VM tensor slot invariant broken".into())); };
+                match self.heap.borrow_mut().get_mut(reference)? {
+                    HeapObject::Tensor { bytes, shape, .. } => {
+                        let offset = Self::tensor_offset(shape, &indices)?;
+                        let start = offset.checked_mul(4).ok_or_else(|| Error::Runtime("tensor offset is too large".into()))?;
+                        unsafe { std::ptr::write_unaligned(bytes.as_mut_ptr().add(start) as *mut f32, v); }
+                    },
+                    _ => return Err(Error::Runtime("tensor heap invariant broken".into())),
+                }
+            },
             Op::StoreField(slot, field) => { let new_value = self.pop()?; if &new_value.ty() != &field.ty { return Err(Error::Runtime("VM type invariant broken".into())); } let Value::Struct(reference, _) = self.locals.get(*slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? else { return Err(Error::Runtime("VM struct slot invariant broken".into())); }; match self.heap.borrow_mut().get_mut(*reference)? { HeapObject::Struct { values, .. } => { *values.get_mut(field.index).ok_or_else(|| Error::Runtime("invalid struct field index".into()))? = new_value; }, _ => return Err(Error::Runtime("struct heap invariant broken".into())), } },
             Op::StoreFieldIndex(slot, field, element) => { let value = self.pop()?; if &value.ty() != element { return Err(Error::Runtime("VM vector type invariant broken".into())); } let index = integer_to_usize(&self.pop()?)?; let Value::Struct(struct_reference, _) = self.locals.get(*slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? else { return Err(Error::Runtime("VM struct slot invariant broken".into())); }; let array_reference = match self.heap.borrow().get(*struct_reference)? { HeapObject::Struct { values, .. } => match values.get(field.index) { Some(Value::Array(reference, _)) => *reference, _ => return Err(Error::Runtime("VM struct vector field invariant broken".into())), }, _ => return Err(Error::Runtime("struct heap invariant broken".into())), }; let mut encoded = Vec::new(); encode_scalar(&value, element, &mut encoded)?; match self.heap.borrow_mut().get_mut(array_reference)? { HeapObject::Array { bytes, element: stored_element } if stored_element == element => { let start = index.checked_mul(encoded.len()).ok_or_else(|| Error::Runtime("array index too large".into()))?; let end = start.checked_add(encoded.len()).ok_or_else(|| Error::Runtime("array index too large".into()))?; if end > bytes.len() { return Err(Error::Runtime(format!("array index {index} is out of bounds (length {})", bytes.len() / encoded.len()))); } bytes[start..end].copy_from_slice(&encoded); }, _ => return Err(Error::Runtime("array heap invariant broken".into())), } },
             Op::StoreTableField(slot, name, element) => { let value = self.pop()?; if &value.ty() != element { return Err(Error::Runtime("VM table type invariant broken".into())); } let Value::Table(reference, _) = self.locals.get(*slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? else { return Err(Error::Runtime("VM table slot invariant broken".into())); }; match self.heap.borrow_mut().get_mut(*reference)? { HeapObject::Table { entries, element: stored_element } if stored_element == element => { entries.insert(TableKey::Name(name.clone()), value); }, _ => return Err(Error::Runtime("table heap invariant broken".into())), } },
@@ -1459,6 +1493,20 @@ impl Vm {
                 if stored_element.as_ref() != element || stored_rank != *rank { return Err(Error::Runtime("VM tensor type invariant broken".into())); }
                 let value = match self.heap.borrow().get(reference)? {
                     HeapObject::Tensor { bytes, element: stored_element, shape } if stored_element == element && shape.len() == *rank => decode_scalar(bytes, Self::tensor_offset(shape, &indices)?, element)?,
+                    _ => return Err(Error::Runtime("tensor heap invariant broken".into())),
+                };
+                self.push(value);
+            },
+            Op::TensorIndexF32(rank) => {
+                let indices = self.pop_tensor_indices(*rank)?;
+                let object = self.pop()?;
+                let Value::Tensor(reference, _, _) = object else { return Err(Error::Runtime("VM tensor invariant broken".into())); };
+                let value = match self.heap.borrow().get(reference)? {
+                    HeapObject::Tensor { bytes, shape, .. } => {
+                        let offset = Self::tensor_offset(shape, &indices)?;
+                        let start = offset.checked_mul(4).ok_or_else(|| Error::Runtime("tensor offset is too large".into()))?;
+                        unsafe { Value::F32(std::ptr::read_unaligned(bytes.as_ptr().add(start) as *const f32)) }
+                    },
                     _ => return Err(Error::Runtime("tensor heap invariant broken".into())),
                 };
                 self.push(value);
@@ -2144,12 +2192,10 @@ mod tests {
         let source = "let greeting: string = \"hello\"; print(greeting); printf(\"{} {}\", greeting, 7);";
         assert_eq!(execute(source).unwrap(), ["hello", "hello 7"]);
     }
-
-    fn rust_add(arguments: &[Value]) -> Result<Value, Error> {
+    fn rust_add(arguments: &[Value], _heap: &RefCell<Heap>) -> Result<Value, Error> {
         let [Value::I32(left), Value::I32(right)] = arguments else { return Err(Error::Runtime("unexpected host arguments".into())); };
         Ok(Value::I32(left + right))
     }
-
     #[test]
     fn registered_rust_function_is_callable_from_l0() {
         let mut vm = Vm::default();
