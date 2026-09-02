@@ -1,20 +1,7 @@
--- Четыре в ряд (Connect Four) - Версия 9x9
--- Интерактивная игра против компьютера
-
-let board: vector<i8> = [
-    0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0
-]
-
+-- Четыре в ряд (Connect Four) - Версия 9x9 (2D Тензор)
+let board: tensor<i8, 2> = zeros<i8>([9, 9])
 let active: bool = 1 == 1
-let turn: i8 = 1 -- 1 = Игрок (X), 2 = ИИ (O)
+let turn: i8 = 1 
 
 printf("--- Четыре в ряд 9x9 ---\n")
 printf("Вы играете за крестики (X), компьютер за нолики (O).\n")
@@ -25,44 +12,40 @@ while active do
     printf("\n 0 1 2 3 4 5 6 7 8\n")
     let r: i32 = 0
     while r < 9 do
-        putc(32) -- пробел
+        putc(32)
         let c: i32 = 0
         while c < 9 do
-            let val: i8 = board[r * 9 + c]
-            if val == 0 then putc(46) end -- '.'
-            if val == 1 then putc(88) end -- 'X'
-            if val == 2 then putc(79) end -- 'O'
+            let val: i8 = board[r, c]
+            if val == 0 then putc(46) end 
+            if val == 1 then putc(88) end 
+            if val == 2 then putc(79) end 
             putc(32)
             c = c + 1
         end
-        putc(10) -- перенос строки
+        putc(10) 
         r = r + 1
     end
     printf("-------------------\n")
 
-    -- 2. Проверка доски на наличие победителя (4 в ряд)
+    -- 2. Проверка доски на победителя
     let winner: i8 = 0
     let chk_r: i32 = 0
     while chk_r < 9 do
         let chk_c: i32 = 0
         while chk_c < 9 do
-            let p: i8 = board[chk_r * 9 + chk_c]
+            let p: i8 = board[chk_r, chk_c]
             if p != 0 then
-                -- Горизонталь
                 if chk_c <= 5 then
-                    if board[chk_r * 9 + chk_c + 1] == p && board[chk_r * 9 + chk_c + 2] == p && board[chk_r * 9 + chk_c + 3] == p then winner = p end
+                    if board[chk_r, chk_c + 1] == p && board[chk_r, chk_c + 2] == p && board[chk_r, chk_c + 3] == p then winner = p end
                 end
-                -- Вертикаль
                 if chk_r <= 5 then
-                    if board[(chk_r + 1) * 9 + chk_c] == p && board[(chk_r + 2) * 9 + chk_c] == p && board[(chk_r + 3) * 9 + chk_c] == p then winner = p end
+                    if board[chk_r + 1, chk_c] == p && board[chk_r + 2, chk_c] == p && board[chk_r + 3, chk_c] == p then winner = p end
                 end
-                -- Диагональ вправо-вниз
                 if chk_r <= 5 && chk_c <= 5 then
-                    if board[(chk_r + 1) * 9 + chk_c + 1] == p && board[(chk_r + 2) * 9 + chk_c + 2] == p && board[(chk_r + 3) * 9 + chk_c + 3] == p then winner = p end
+                    if board[chk_r + 1, chk_c + 1] == p && board[chk_r + 2, chk_c + 2] == p && board[chk_r + 3, chk_c + 3] == p then winner = p end
                 end
-                -- Диагональ вправо-вверх
                 if chk_r >= 3 && chk_c <= 5 then
-                    if board[(chk_r - 1) * 9 + chk_c + 1] == p && board[(chk_r - 2) * 9 + chk_c + 2] == p && board[(chk_r - 3) * 9 + chk_c + 3] == p then winner = p end
+                    if board[chk_r - 1, chk_c + 1] == p && board[chk_r - 2, chk_c + 2] == p && board[chk_r - 3, chk_c + 3] == p then winner = p end
                 end
             end
             chk_c = chk_c + 1
@@ -70,15 +53,17 @@ while active do
         chk_r = chk_r + 1
     end
 
-    -- Проверка на ничью (заполнена ли доска)
     let has_empty: bool = 1 == 0
-    let e: i32 = 0
-    while e < 81 do
-        if board[e] == 0 then has_empty = 1 == 1 end
-        e = e + 1
+    let er: i32 = 0
+    while er < 9 do
+        let ec: i32 = 0
+        while ec < 9 do
+            if board[er, ec] == 0 then has_empty = 1 == 1 end
+            ec = ec + 1
+        end
+        er = er + 1
     end
 
-    -- Оглашение результатов
     if winner != 0 then
         if winner == 1 then printf("★★★ ВЫ ПОБЕДИЛИ! ★★★\n") end
         if winner == 2 then printf("☠ КОМПЬЮТЕР ПОБЕДИЛ! ☠\n") end
@@ -93,80 +78,64 @@ while active do
     -- 3. Выполнение хода
     if active then
         if turn == 1 then
-            -- Ход Игрока
             printf("Ваш ход (0-8): ")
             let move: i32 = input
             
             if move >= 0 && move <= 8 then
-                -- Падение фишки вниз (начинаем с 8-й строки)
                 let drop_r: i32 = 8
                 let placed: bool = 1 == 0
                 while drop_r >= 0 && placed == (1 == 0) do
-                    if board[drop_r * 9 + move] == 0 then
-                        board[drop_r * 9 + move] = 1
+                    if board[drop_r, move] == 0 then
+                        board[drop_r, move] = 1
                         placed = 1 == 1
                         turn = 2
                     end
                     drop_r = drop_r - 1
                 end
-                
-                if placed == (1 == 0) then
-                    printf("Ошибка: эта колонка уже полная!\n")
-                end
+                if placed == (1 == 0) then printf("Ошибка: эта колонка уже полная!\n") end
             else
-                printf("Ошибка: неверный номер колонки! Введите от 0 до 8.\n")
+                printf("Ошибка: неверный номер колонки!\n")
             end
         else
-            -- Ход Компьютера (ИИ)
             printf("Ход компьютера...\n")
             let best_col: i32 = -1
-
-            -- Логика ИИ: 1. Победа ИИ (2) -> 2. Блокировка Игрока (1).
             let check_player: i8 = 2
+            
             while check_player >= 1 && best_col == -1 do
                 let cand_col: i32 = 0
                 while cand_col < 9 && best_col == -1 do
-                    
-                    -- Симуляция падения фишки для проверяемого игрока
                     let d_r: i32 = 8
                     let placed: bool = 1 == 0
                     while d_r >= 0 && placed == (1 == 0) do
-                        if board[d_r * 9 + cand_col] == 0 then
-                            board[d_r * 9 + cand_col] = check_player
+                        if board[d_r, cand_col] == 0 then
+                            board[d_r, cand_col] = check_player
                             placed = 1 == 1
-                            
-                            -- Проверка симулированной доски на победу
                             let w: i8 = 0
                             let cr: i32 = 0
                             while cr < 9 do
                                 let cc: i32 = 0
                                 while cc < 9 do
-                                    let p: i8 = board[cr * 9 + cc]
+                                    let p: i8 = board[cr, cc]
                                     if p == check_player then
                                         if cc <= 5 then
-                                            if board[cr * 9 + cc + 1] == p && board[cr * 9 + cc + 2] == p && board[cr * 9 + cc + 3] == p then w = p end
+                                            if board[cr, cc + 1] == p && board[cr, cc + 2] == p && board[cr, cc + 3] == p then w = p end
                                         end
                                         if cr <= 5 then
-                                            if board[(cr + 1) * 9 + cc] == p && board[(cr + 2) * 9 + cc] == p && board[(cr + 3) * 9 + cc] == p then w = p end
+                                            if board[cr + 1, cc] == p && board[cr + 2, cc] == p && board[cr + 3, cc] == p then w = p end
                                         end
                                         if cr <= 5 && cc <= 5 then
-                                            if board[(cr + 1) * 9 + cc + 1] == p && board[(cr + 2) * 9 + cc + 2] == p && board[(cr + 3) * 9 + cc + 3] == p then w = p end
+                                            if board[cr + 1, cc + 1] == p && board[cr + 2, cc + 2] == p && board[cr + 3, cc + 3] == p then w = p end
                                         end
                                         if cr >= 3 && cc <= 5 then
-                                            if board[(cr - 1) * 9 + cc + 1] == p && board[(cr - 2) * 9 + cc + 2] == p && board[(cr - 3) * 9 + cc + 3] == p then w = p end
+                                            if board[cr - 1, cc + 1] == p && board[cr - 2, cc + 2] == p && board[cr - 3, cc + 3] == p then w = p end
                                         end
                                     end
                                     cc = cc + 1
                                 end
                                 cr = cr + 1
                             end
-                            
-                            if w == check_player then
-                                best_col = cand_col
-                            end
-                            
-                            -- Отмена симулированного хода (убираем фишку)
-                            board[d_r * 9 + cand_col] = 0
+                            if w == check_player then best_col = cand_col end
+                            board[d_r, cand_col] = 0
                         end
                         d_r = d_r - 1
                     end
@@ -175,33 +144,29 @@ while active do
                 check_player = check_player - 1
             end
 
-            -- 3. Фоллбэк: берем центральную или ближайшую к ней колонку
-            -- Для 9 колонок центр это 4, приоритет расходится от центра к краям
             if best_col == -1 then
                 let prefs: vector<i32> = [4, 3, 5, 2, 6, 1, 7, 0, 8]
                 let p_idx: i32 = 0
                 while p_idx < 9 && best_col == -1 do
                     let c_pref: i32 = prefs[p_idx]
-                    if board[0 * 9 + c_pref] == 0 then
+                    if board[0, c_pref] == 0 then
                         best_col = c_pref
                     end
                     p_idx = p_idx + 1
                 end
             end
 
-            -- Применение финального хода ИИ
             if best_col != -1 then
                 let drop_r: i32 = 8
                 let placed: bool = 1 == 0
                 while drop_r >= 0 && placed == (1 == 0) do
-                    if board[drop_r * 9 + best_col] == 0 then
-                        board[drop_r * 9 + best_col] = 2
+                    if board[drop_r, best_col] == 0 then
+                        board[drop_r, best_col] = 2
                         placed = 1 == 1
                     end
                     drop_r = drop_r - 1
                 end
             end
-            
             turn = 1
         end
     end

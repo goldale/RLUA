@@ -1,8 +1,5 @@
--- Интерактивные Крестики-Нолики (OXO) на L0
--- Вы играете за X (1), компьютер за O (2).
--- Доска представляет собой массив из 9 элементов.
-
-let board: vector<i8> = [0, 0, 0, 0, 0, 0, 0, 0, 0]
+-- Интерактивные Крестики-Нолики (OXO) на L0 с использованием 2D-тензора
+let board: tensor<i8, 2> = zeros<i8>([3, 3])
 let active: bool = 1 == 1
 let turn: i8 = 1
 
@@ -14,30 +11,32 @@ while active do
     -- 1. Отрисовка доски
     let d: i32 = 0
     while d < 9 do
-        let cell: i8 = board[d]
+        let r: i32 = d / 3
+        let c: i32 = d % 3
+        let cell: i8 = board[r, c]
         if cell == 0 then printf("[{}] ", d) end
         if cell == 1 then printf(" X  ") end
         if cell == 2 then printf(" O  ") end
-        if d == 2 || d == 5 || d == 8 then printf("\n") end
+        if c == 2 then printf("\n") end
         d = d + 1
     end
     printf("\n")
 
-    -- 2. Проверка статуса игры (победа или ничья)
+    -- 2. Проверка статуса игры
     let winner: i8 = 0
-    if board[0] != 0 && board[0] == board[1] && board[1] == board[2] then winner = board[0] end
-    if board[3] != 0 && board[3] == board[4] && board[4] == board[5] then winner = board[3] end
-    if board[6] != 0 && board[6] == board[7] && board[7] == board[8] then winner = board[6] end
-    if board[0] != 0 && board[0] == board[3] && board[3] == board[6] then winner = board[0] end
-    if board[1] != 0 && board[1] == board[4] && board[4] == board[7] then winner = board[1] end
-    if board[2] != 0 && board[2] == board[5] && board[5] == board[8] then winner = board[2] end
-    if board[0] != 0 && board[0] == board[4] && board[4] == board[8] then winner = board[0] end
-    if board[2] != 0 && board[2] == board[4] && board[4] == board[6] then winner = board[2] end
+    if board[0, 0] != 0 && board[0, 0] == board[0, 1] && board[0, 1] == board[0, 2] then winner = board[0, 0] end
+    if board[1, 0] != 0 && board[1, 0] == board[1, 1] && board[1, 1] == board[1, 2] then winner = board[1, 0] end
+    if board[2, 0] != 0 && board[2, 0] == board[2, 1] && board[2, 1] == board[2, 2] then winner = board[2, 0] end
+    if board[0, 0] != 0 && board[0, 0] == board[1, 0] && board[1, 0] == board[2, 0] then winner = board[0, 0] end
+    if board[0, 1] != 0 && board[0, 1] == board[1, 1] && board[1, 1] == board[2, 1] then winner = board[0, 1] end
+    if board[0, 2] != 0 && board[0, 2] == board[1, 2] && board[1, 2] == board[2, 2] then winner = board[0, 2] end
+    if board[0, 0] != 0 && board[0, 0] == board[1, 1] && board[1, 1] == board[2, 2] then winner = board[0, 0] end
+    if board[0, 2] != 0 && board[0, 2] == board[1, 1] && board[1, 1] == board[2, 0] then winner = board[0, 2] end
 
     let has_empty: bool = 1 == 0
     let e: i32 = 0
     while e < 9 do
-        if board[e] == 0 then has_empty = 1 == 1 end
+        if board[e / 3, e % 3] == 0 then has_empty = 1 == 1 end
         e = e + 1
     end
 
@@ -55,13 +54,12 @@ while active do
     -- 3. Выполнение хода
     if active then
         if turn == 1 then
-            -- Ход человека
             printf("Ваш ход (0-8): ")
             let move: i32 = input
             
             if move >= 0 && move <= 8 then
-                if board[move] == 0 then
-                    board[move] = 1
+                if board[move / 3, move % 3] == 0 then
+                    board[move / 3, move % 3] = 1
                     turn = 2
                 else
                     printf("Ошибка: эта ячейка уже занята!\n\n")
@@ -70,71 +68,69 @@ while active do
                 printf("Ошибка: неверный номер ячейки!\n\n")
             end
         else
-            -- Ход компьютера (AI)
             printf("Ход компьютера...\n\n")
             let best_move: i32 = -1
             let i: i32 = 0
 
-            -- Шаг А: Может ли ИИ победить прямо сейчас?
+            -- А: Может ли ИИ победить прямо сейчас?
             while i < 9 do
-                if best_move == -1 && board[i] == 0 then
-                    board[i] = 2
+                let r: i32 = i / 3
+                let c: i32 = i % 3
+                if best_move == -1 && board[r, c] == 0 then
+                    board[r, c] = 2
                     let cand: i8 = 0
-                    if board[0] != 0 && board[0] == board[1] && board[1] == board[2] then cand = board[0] end
-                    if board[3] != 0 && board[3] == board[4] && board[4] == board[5] then cand = board[3] end
-                    if board[6] != 0 && board[6] == board[7] && board[7] == board[8] then cand = board[6] end
-                    if board[0] != 0 && board[0] == board[3] && board[3] == board[6] then cand = board[0] end
-                    if board[1] != 0 && board[1] == board[4] && board[4] == board[7] then cand = board[1] end
-                    if board[2] != 0 && board[2] == board[5] && board[5] == board[8] then cand = board[2] end
-                    if board[0] != 0 && board[0] == board[4] && board[4] == board[8] then cand = board[0] end
-                    if board[2] != 0 && board[2] == board[4] && board[4] == board[6] then cand = board[2] end
+                    if board[0, 0] != 0 && board[0, 0] == board[0, 1] && board[0, 1] == board[0, 2] then cand = board[0, 0] end
+                    if board[1, 0] != 0 && board[1, 0] == board[1, 1] && board[1, 1] == board[1, 2] then cand = board[1, 0] end
+                    if board[2, 0] != 0 && board[2, 0] == board[2, 1] && board[2, 1] == board[2, 2] then cand = board[2, 0] end
+                    if board[0, 0] != 0 && board[0, 0] == board[1, 0] && board[1, 0] == board[2, 0] then cand = board[0, 0] end
+                    if board[0, 1] != 0 && board[0, 1] == board[1, 1] && board[1, 1] == board[2, 1] then cand = board[0, 1] end
+                    if board[0, 2] != 0 && board[0, 2] == board[1, 2] && board[1, 2] == board[2, 2] then cand = board[0, 2] end
+                    if board[0, 0] != 0 && board[0, 0] == board[1, 1] && board[1, 1] == board[2, 2] then cand = board[0, 0] end
+                    if board[0, 2] != 0 && board[0, 2] == board[1, 1] && board[1, 1] == board[2, 0] then cand = board[0, 2] end
                     if cand == 2 then best_move = i end
-                    board[i] = 0 -- возвращаем как было
+                    board[r, c] = 0
                 end
                 i = i + 1
             end
 
-            -- Шаг Б: Нужно ли заблокировать победу человека?
+            -- Б: Блокировка игрока
             if best_move == -1 then
                 i = 0
                 while i < 9 do
-                    if best_move == -1 && board[i] == 0 then
-                        board[i] = 1
+                    let r: i32 = i / 3
+                    let c: i32 = i % 3
+                    if best_move == -1 && board[r, c] == 0 then
+                        board[r, c] = 1
                         let cand: i8 = 0
-                        if board[0] != 0 && board[0] == board[1] && board[1] == board[2] then cand = board[0] end
-                        if board[3] != 0 && board[3] == board[4] && board[4] == board[5] then cand = board[3] end
-                        if board[6] != 0 && board[6] == board[7] && board[7] == board[8] then cand = board[6] end
-                        if board[0] != 0 && board[0] == board[3] && board[3] == board[6] then cand = board[0] end
-                        if board[1] != 0 && board[1] == board[4] && board[4] == board[7] then cand = board[1] end
-                        if board[2] != 0 && board[2] == board[5] && board[5] == board[8] then cand = board[2] end
-                        if board[0] != 0 && board[0] == board[4] && board[4] == board[8] then cand = board[0] end
-                        if board[2] != 0 && board[2] == board[4] && board[4] == board[6] then cand = board[2] end
+                        if board[0, 0] != 0 && board[0, 0] == board[0, 1] && board[0, 1] == board[0, 2] then cand = board[0, 0] end
+                        if board[1, 0] != 0 && board[1, 0] == board[1, 1] && board[1, 1] == board[1, 2] then cand = board[1, 0] end
+                        if board[2, 0] != 0 && board[2, 0] == board[2, 1] && board[2, 1] == board[2, 2] then cand = board[2, 0] end
+                        if board[0, 0] != 0 && board[0, 0] == board[1, 0] && board[1, 0] == board[2, 0] then cand = board[0, 0] end
+                        if board[0, 1] != 0 && board[0, 1] == board[1, 1] && board[1, 1] == board[2, 1] then cand = board[0, 1] end
+                        if board[0, 2] != 0 && board[0, 2] == board[1, 2] && board[1, 2] == board[2, 2] then cand = board[0, 2] end
+                        if board[0, 0] != 0 && board[0, 0] == board[1, 1] && board[1, 1] == board[2, 2] then cand = board[0, 0] end
+                        if board[0, 2] != 0 && board[0, 2] == board[1, 1] && board[1, 1] == board[2, 0] then cand = board[0, 2] end
                         if cand == 1 then best_move = i end
-                        board[i] = 0
+                        board[r, c] = 0
                     end
                     i = i + 1
                 end
             end
 
-            -- Шаг В: Занять центр, если он свободен
-            if best_move == -1 && board[4] == 0 then
-                best_move = 4
-            end
+            -- В: Занять центр
+            if best_move == -1 && board[1, 1] == 0 then best_move = 4 end
 
-            -- Шаг Г: Просто занять первую свободную ячейку
+            -- Г: Любая ячейка
             if best_move == -1 then
                 i = 0
                 while i < 9 do
-                    if best_move == -1 && board[i] == 0 then
-                        best_move = i
-                    end
+                    if best_move == -1 && board[i / 3, i % 3] == 0 then best_move = i end
                     i = i + 1
                 end
             end
 
-            -- Применяем ход ИИ
             if best_move != -1 then
-                board[best_move] = 2
+                board[best_move / 3, best_move % 3] = 2
                 turn = 1
             end
         end

@@ -1,44 +1,14 @@
--- Interactive Gomoku 21x21 vs Computer (AI plays O)
--- Coordinates: 0-20 (0-9, then 10=A, 11=B, 12=C ... 20=K)
-
--- Таблица для координат (48-57 = '0'-'9', 65-75 = 'A'-'K')
+-- Interactive Gomoku 21x21 vs Computer (AI plays O) - 2D Tensor
 let labels: vector<i32> = [48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75]
-
-let board: vector<i8> = [
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
-]
-
+let board: tensor<i8, 2> = zeros<i8>([21, 21])
 let active: bool = 1 == 1
 let player: i8 = 1
 
--- Память ИИ (центр поля по умолчанию)
 let last_r: i32 = 10
 let last_c: i32 = 10
 
 while active do
     putc(10)
-    
-    -- Вывод шапки колонок
     putc(32) putc(32)
     let ch: i32 = 0
     while ch < 21 do
@@ -48,23 +18,17 @@ while active do
     end
     putc(10)
     
-    -- Отрисовка доски
-    let print_idx: i32 = 0
     let r_p: i32 = 0
-    
     while r_p < 21 do
         putc(labels[r_p])
         putc(32)
-        
         let c_p: i32 = 0
         while c_p < 21 do
-            let val: i8 = board[print_idx]
-            if val == 0 then putc(46) end -- '.'
-            if val == 1 then putc(88) end -- 'X'
-            if val == 2 then putc(79) end -- 'O'
-            
+            let val: i8 = board[r_p, c_p]
+            if val == 0 then putc(46) end
+            if val == 1 then putc(88) end
+            if val == 2 then putc(79) end
             putc(32)
-            print_idx = print_idx + 1
             c_p = c_p + 1
         end
         putc(10)
@@ -73,49 +37,37 @@ while active do
     putc(10)
     
     if player == 1 then
-        -- ХОД ЧЕЛОВЕКА
-        putc(80) putc(49) putc(32) putc(82) putc(58) putc(32) -- "P1 R: "
+        putc(80) putc(49) putc(32) putc(82) putc(58) putc(32)
         let row: i32 = input
-        
-        putc(67) putc(58) putc(32) -- "C: "
+        putc(67) putc(58) putc(32)
         let col: i32 = input
         
-        -- Проверка валидности с помощью новых операторов || и <, >
         if row < 0 || row > 20 || col < 0 || col > 20 then
-            putc(33) putc(33) putc(10) -- "!!" (Ошибка ввода)
+            putc(33) putc(33) putc(10)
         else
-            -- Прямое умножение!
-            let idx: i32 = row * 21 + col
-            
-            if board[idx] == 0 then
-                board[idx] = 1
+            if board[row, col] == 0 then
+                board[row, col] = 1
                 last_r = row
                 last_c = col
                 player = 2
             else
-                putc(88) putc(88) putc(10) -- "XX" (Клетка занята)
+                putc(88) putc(88) putc(10)
             end
         end
     else
-        -- ХОД КОМПЬЮТЕРА (AI)
-        putc(65) putc(73) putc(46) putc(46) putc(10) -- "AI.."
-        
+        putc(65) putc(73) putc(46) putc(46) putc(10)
         let placed: bool = 1 == 0
         let dr: vector<i32> = [0, 0, 1, -1, 1, 1, -1, -1, 0, 0, 2, -2, 2, 2, -2, -2]
         let dc: vector<i32> = [1, -1, 0, 0, 1, -1, 1, -1, 2, -2, 0, 0, 2, -2, 2, -2]
-        
         let off_idx: i32 = 0
         
         while off_idx < 16 do
             if placed == (1 == 0) then
                 let cand_r: i32 = last_r + dr[off_idx]
                 let cand_c: i32 = last_c + dc[off_idx]
-                
-                -- Безопасные границы через && и <=, >=
                 if cand_r >= 0 && cand_r <= 20 && cand_c >= 0 && cand_c <= 20 then
-                    let cand_idx: i32 = cand_r * 21 + cand_c
-                    if board[cand_idx] == 0 then
-                        board[cand_idx] = 2
+                    if board[cand_r, cand_c] == 0 then
+                        board[cand_r, cand_c] = 2
                         last_r = cand_r
                         last_c = cand_c
                         placed = 1 == 1
@@ -125,20 +77,21 @@ while active do
             off_idx = off_idx + 1
         end
         
-        -- Fallback: если все вокруг занято, ищем первую пустую клетку
+        -- Fallback
         if placed == (1 == 0) then
-            let f: i32 = 0
-            while f < 441 do
-                if placed == (1 == 0) then
-                    if board[f] == 0 then
-                        board[f] = 2
+            let f_r: i32 = 0
+            while f_r < 21 do
+                let f_c: i32 = 0
+                while f_c < 21 do
+                    if placed == (1 == 0) && board[f_r, f_c] == 0 then
+                        board[f_r, f_c] = 2
                         placed = 1 == 1
                     end
+                    f_c = f_c + 1
                 end
-                f = f + 1
+                f_r = f_r + 1
             end
         end
-        
         player = 1
     end
 end
