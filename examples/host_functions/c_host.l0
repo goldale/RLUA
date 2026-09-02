@@ -1,0 +1,3 @@
+-- c_add is registered by examples/host_functions/c_host.c.
+let total: i32 = c_add(20, 22)
+print(total)
