@@ -227,18 +227,15 @@ fn encode_scalar(value: &Value, element: &Type, bytes: &mut Vec<u8>) -> Result<(
     }
     Ok(())
 }
-
 fn decode_scalar(bytes: &[u8], index: usize, element: &Type) -> Result<Value, Error> {
     let size = scalar_size(element)?;
-    let start = index.checked_mul(size).ok_or_else(|| Error::Runtime("array index too large".into()))?;
-    let end = start.checked_add(size).ok_or_else(|| Error::Runtime("array index too large".into()))?;
-    let slice = bytes.get(start..end).ok_or_else(|| Error::Runtime(format!("array index {index} is out of bounds (length {})", bytes.len() / size)))?;
-    decode_scalar_at(slice, element)
-}
+    let offset = index.checked_mul(size).ok_or_else(|| Error::Runtime("array index too large".into()))?;
+    if offset + size > bytes.len() {
+        return Err(Error::Runtime(format!("array index {} is out of bounds", index)));
+    }
 
-fn decode_scalar_at(slice: &[u8], element: &Type) -> Result<Value, Error> {
+    let ptr = unsafe { bytes.as_ptr().add(offset) };
     unsafe {
-        let ptr = slice.as_ptr();
         match element {
             Type::I8 => Ok(Value::I8(*ptr as i8)),
             Type::U8 => Ok(Value::U8(*ptr)),
@@ -257,6 +254,33 @@ fn decode_scalar_at(slice: &[u8], element: &Type) -> Result<Value, Error> {
     }
 }
 
+fn write_scalar(bytes: &mut [u8], index: usize, value: &Value, element: &Type) -> Result<(), Error> {
+    let size = scalar_size(element)?;
+    let offset = index.checked_mul(size).ok_or_else(|| Error::Runtime("array index too large".into()))?;
+    if offset + size > bytes.len() {
+        return Err(Error::Runtime(format!("array index {} is out of bounds", index)));
+    }
+
+    let ptr = unsafe { bytes.as_mut_ptr().add(offset) };
+    unsafe {
+        match value {
+            Value::I8(v) => *ptr = *v as u8,
+            Value::U8(v) => *ptr = *v,
+            Value::Bool(v) => *ptr = u8::from(*v),
+            Value::I16(v) => std::ptr::write_unaligned(ptr as *mut i16, *v),
+            Value::U16(v) => std::ptr::write_unaligned(ptr as *mut u16, *v),
+            Value::F16(v) => std::ptr::write_unaligned(ptr as *mut u16, *v),
+            Value::I32(v) => std::ptr::write_unaligned(ptr as *mut i32, *v),
+            Value::U32(v) => std::ptr::write_unaligned(ptr as *mut u32, *v),
+            Value::F32(v) => std::ptr::write_unaligned(ptr as *mut f32, *v),
+            Value::I64(v) => std::ptr::write_unaligned(ptr as *mut i64, *v),
+            Value::U64(v) => std::ptr::write_unaligned(ptr as *mut u64, *v),
+            Value::F64(v) => std::ptr::write_unaligned(ptr as *mut f64, *v),
+            _ => return Err(Error::Type("not a scalar type".into())),
+        }
+    }
+    Ok(())
+}
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -387,13 +411,13 @@ fn lex(source: &str) -> Result<Vec<Token>, Error> {
 #[derive(Clone, Debug)]
 enum TableLiteralKey { Index(Expr), Name(String) }
 #[derive(Clone, Debug)]
-struct StructMethod { name: String, body: Option<Vec<Statement>> }
+struct StructMethod { name: String, args: Vec<(String, Type)>, body: Option<Vec<Statement>> }
 #[derive(Clone, Debug)]
 enum MethodReceiver { Name(String), This }
 #[derive(Clone, Debug)]
 enum Statement {
     Struct { name: String, fields: Vec<(String, Type)>, methods: Vec<StructMethod> },
-    MethodDefinition { struct_name: String, method: String, body: Vec<Statement> },
+    MethodDefinition { struct_name: String, method: String, args: Vec<(String, Type)>, body: Vec<Statement> },
     ExportLet { name: String, ty: Type, expr: Expr },
     ExportStruct { name: String, fields: Vec<(String, Type)>, methods: Vec<StructMethod> },
     ExportFunction { name: String, body: Vec<Statement> },
@@ -432,7 +456,33 @@ impl Parser {
         let mut fields = Vec::new(); let mut methods = Vec::new();
         while *self.peek() != Token::RBrace { match self.next() {
             Token::Ident(field) => { self.need(Token::Colon)?; let ty = self.ty()?; fields.push((field, ty)); if matches!(self.peek(), Token::Semi | Token::Comma) { self.next(); } },
-            Token::Function => { let method = match self.next() { Token::Ident(method) => method, token => return Err(Error::Parse(format!("expected method name, got {token:?}"))) }; self.need(Token::LParen)?; self.need(Token::RParen)?; let body = if matches!(self.peek(), Token::RBrace | Token::Semi) { None } else { let body = self.block()?; self.need(Token::End)?; Some(body) }; methods.push(StructMethod { name: method, body }); if *self.peek() == Token::Semi { self.next(); } },
+            Token::Function => {
+                let method = match self.next() { Token::Ident(method) => method, token => return Err(Error::Parse(format!("expected method name, got {token:?}"))) };
+                self.need(Token::LParen)?;
+                let mut args = Vec::new();
+                if *self.peek() != Token::RParen {
+                    loop {
+                        let arg_name = match self.next() { Token::Ident(n) => n, t => return Err(Error::Parse(format!("expected argument name, got {t:?}"))) };
+                        self.need(Token::Colon)?;
+                        let arg_ty = self.ty()?;
+                        args.push((arg_name, arg_ty));
+                        if *self.peek() != Token::Comma { break; }
+                        self.next();
+                    }
+                }
+                self.need(Token::RParen)?;
+                let body = if *self.peek() == Token::End {
+                    self.next();
+                    None
+                } else if *self.peek() == Token::RBrace {
+                    None
+                } else {
+                    let body = self.block()?;
+                    self.need(Token::End)?;
+                    Some(body)
+                };
+                methods.push(StructMethod { name: method, args, body });
+            },
             token => return Err(Error::Parse(format!("expected field or method, got {token:?}"))),
         } }
         self.need(Token::RBrace)?; Ok((name, fields, methods))
@@ -449,7 +499,27 @@ impl Parser {
             Token::Function => { let name = match self.next() { Token::Ident(name) => name, token => return Err(Error::Parse(format!("expected exported function name, got {token:?}"))) }; self.need(Token::LParen)?; self.need(Token::RParen)?; let body = self.block()?; self.need(Token::End)?; Ok(Statement::ExportFunction { name, body }) },
             token => Err(Error::Parse(format!("expected let, struct, or function after export, got {token:?}"))),
         },
-        Token::Function => { let struct_name = match self.next() { Token::Ident(name) => name, token => return Err(Error::Parse(format!("expected struct name, got {token:?}"))) }; self.need(Token::DoubleColon)?; let method = match self.next() { Token::Ident(method) => method, token => return Err(Error::Parse(format!("expected method name, got {token:?}"))) }; self.need(Token::LParen)?; self.need(Token::RParen)?; let body = self.block()?; self.need(Token::End)?; Ok(Statement::MethodDefinition { struct_name, method, body }) },
+        Token::Function => {
+            let struct_name = match self.next() { Token::Ident(name) => name, token => return Err(Error::Parse(format!("expected struct name, got {token:?}"))) };
+            self.need(Token::DoubleColon)?;
+            let method = match self.next() { Token::Ident(method) => method, token => return Err(Error::Parse(format!("expected method name, got {token:?}"))) };
+            self.need(Token::LParen)?;
+            let mut args = Vec::new();
+            if *self.peek() != Token::RParen {
+                loop {
+                    let arg_name = match self.next() { Token::Ident(name) => name, token => return Err(Error::Parse(format!("expected argument name, got {token:?}"))) };
+                    self.need(Token::Colon)?;
+                    let arg_ty = self.ty()?;
+                    args.push((arg_name, arg_ty));
+                    if *self.peek() != Token::Comma { break; }
+                    self.next();
+                }
+            }
+            self.need(Token::RParen)?;
+            let body = self.block()?;
+            self.need(Token::End)?;
+            Ok(Statement::MethodDefinition { struct_name, method, args, body })
+        },
         Token::Let => { let (name, ty, expr) = self.let_declaration()?; Ok(Statement::Let { name, ty, expr }) },
         Token::Print => { let parenthesized = *self.peek() == Token::LParen; if parenthesized { self.next(); } let expr = self.expr()?; if parenthesized { self.need(Token::RParen)?; } Ok(Statement::Print(expr)) },
         Token::Printf => {
@@ -731,7 +801,8 @@ enum Op {
     Binary(BinaryOp), Unary(UnOp, Type), Len, ConcatString,
     Builtin1(String, Type), Builtin2(String, Type),
     CallExternal(String, usize),
-    JumpIfFalse(usize), Jump(usize), CallMethod(usize, usize), CallCurrentMethod(usize), CallModule(usize, String),
+    JumpIfFalse(usize), Jump(usize), JumpIfFalseKeep(usize), JumpIfTrueKeep(usize),
+    CallMethod(usize, usize), CallCurrentMethod(usize), CallModule(usize, String),
     Return, Print, Printf(usize), Putc
 }
 
@@ -819,7 +890,6 @@ impl Compiler {
         for (name, export) in module.exports { if let ModuleExport::Struct(mut layout) = export { let alias = format!("{binding}.{name}"); if self.structs.contains_key(&alias) { return Err(Error::Type(format!("imported struct '{alias}' conflicts with an existing struct"))); } layout.name = alias.clone(); self.structs.insert(alias, layout); } }
         Ok(())
     }
-
     fn compile_module_function(&mut self, name: String, body: Vec<Statement>) -> Result<(), Error> {
         if self.exports.contains_key(&name) { return Err(Error::Type(format!("module already exports '{name}'"))); }
         let skip_body = self.code.len(); self.code.push(Op::Jump(usize::MAX)); let entry = self.code.len();
@@ -827,8 +897,7 @@ impl Compiler {
         self.code.push(Op::Return); let after_body = self.code.len(); self.code[skip_body] = Op::Jump(after_body);
         self.exports.insert(name, ModuleExport::Function { entry }); Ok(())
     }
-
-    fn compile_method_body(&mut self, struct_name: &str, method_name: &str, body: Vec<Statement>) -> Result<(), Error> {
+    fn compile_method_body(&mut self, struct_name: &str, method_name: &str, args: Vec<(String, Type)>, body: Vec<Statement>) -> Result<(), Error> {
         let key = (struct_name.to_owned(), method_name.to_owned());
         match self.methods.get(&key) {
             Some(None) => {},
@@ -843,6 +912,13 @@ impl Compiler {
         let method_fields = layout.fields.iter().cloned().map(|field| (field.name.clone(), field)).collect();
         let previous_fields = self.current_method_fields.replace(method_fields);
         let previous_struct = self.current_method_struct.replace(struct_name.to_owned());
+        // Read the arguments and bind them to local variable slots
+        for (arg_name, arg_ty) in args.into_iter().rev() {
+            let slot = self.next_slot;
+            self.next_slot += 1;
+            self.names.insert(arg_name, (slot, arg_ty));
+            self.code.push(Op::Store(slot));
+        }
         for statement in body { self.statement(statement)?; }
         self.current_method_fields = previous_fields;
         self.current_method_struct = previous_struct;
@@ -851,10 +927,35 @@ impl Compiler {
         self.code[skip_body] = Op::Jump(after_body);
         Ok(())
     }
-
     fn statement(&mut self, stmt: Statement) -> Result<(), Error> { match stmt {
-        Statement::Struct { name, fields, methods } => { if self.structs.contains_key(&name) { return Err(Error::Type(format!("struct '{name}' is already declared"))); } let mut layout_fields = Vec::with_capacity(fields.len()); for (field_name, field_ty) in fields { if layout_fields.iter().any(|field: &StructField| field.name == field_name) { return Err(Error::Type(format!("struct '{name}' declares field '{field_name}' more than once"))); } let index = layout_fields.len(); layout_fields.push(StructField { name: field_name, ty: field_ty, index }); } if layout_fields.is_empty() { return Err(Error::Type(format!("struct '{name}' must contain at least one field"))); } self.structs.insert(name.clone(), StructLayout { name: name.clone(), fields: layout_fields }); for method in &methods { let key = (name.clone(), method.name.clone()); if self.methods.contains_key(&key) { return Err(Error::Type(format!("struct '{name}' already declares method '{}'", method.name))); } self.methods.insert(key, None); } for method in methods { if let Some(body) = method.body { self.compile_method_body(&name, &method.name, body)?; } } Ok(()) },
-        Statement::MethodDefinition { struct_name, method, body } => { self.compile_method_body(&struct_name, &method, body) },
+        Statement::Struct { name, fields, methods } => {
+            if self.structs.contains_key(&name) {
+                return Err(Error::Type(format!("struct '{name}' is already defined")));
+            }
+            let mut layout_fields = Vec::with_capacity(fields.len());
+            for (index, (field_name, ty)) in fields.into_iter().enumerate() {
+                if layout_fields.iter().any(|field: &StructField| field.name == field_name) {
+                    return Err(Error::Type(format!("struct '{name}' defines field '{field_name}' more than once")));
+                }
+                layout_fields.push(StructField { name: field_name, ty, index });
+            }
+            self.structs.insert(name.clone(), StructLayout { name: name.clone(), fields: layout_fields });
+            for method in &methods {
+                let key = (name.clone(), method.name.clone());
+                if self.methods.insert(key, None).is_some() {
+                    return Err(Error::Type(format!("struct '{name}' defines method '{}' more than once", method.name)));
+                }
+            }
+            for method in methods {
+                if let Some(body) = method.body {
+                    self.compile_method_body(&name, &method.name, method.args, body)?;
+                }
+            }
+            Ok(())
+        },
+        Statement::MethodDefinition { struct_name, method, args, body } => { 
+            self.compile_method_body(&struct_name, &method, args, body) 
+        },
         Statement::ExportLet { name, ty, expr } => { self.statement(Statement::Let { name: name.clone(), ty, expr })?; let (slot, ty) = self.names.get(&name).cloned().ok_or_else(|| Error::Runtime("missing exported local".into()))?; if self.exports.insert(name.clone(), ModuleExport::Value { slot, ty }).is_some() { return Err(Error::Type(format!("module already exports '{name}'"))); } Ok(()) },
         Statement::ExportStruct { name, fields, methods } => { self.statement(Statement::Struct { name: name.clone(), fields, methods })?; let layout = self.structs.get(&name).cloned().ok_or_else(|| Error::Runtime("missing exported struct".into()))?; if self.exports.insert(name.clone(), ModuleExport::Struct(layout)).is_some() { return Err(Error::Type(format!("module already exports '{name}'"))); } Ok(()) },
         Statement::ExportFunction { name, body } => self.compile_module_function(name, body),
@@ -1108,34 +1209,24 @@ impl Compiler {
         },
         Expr::Binary(left, op, right) => {
             if matches!(op, BinOp::And | BinOp::Or) {
-                let left_ty = self.expr(*left, Some(&Type::Bool))?;
-                if left_ty != Type::Bool { return Err(Error::Type("logical operators require bool".into())); }
-                let branch = self.code.len();
-                self.code.push(Op::JumpIfFalse(usize::MAX));
-                match op {
-                    BinOp::And => {
-                        let right_ty = self.expr(*right, Some(&Type::Bool))?;
-                        if right_ty != Type::Bool { return Err(Error::Type("logical operators require bool".into())); }
-                        let end_jump = self.code.len();
-                        self.code.push(Op::Jump(usize::MAX));
-                        let false_branch = self.code.len();
-                        self.code.push(Op::Push(Value::Bool(false)));
-                        let end = self.code.len();
-                        self.code[branch] = Op::JumpIfFalse(false_branch);
-                        self.code[end_jump] = Op::Jump(end);
-                    },
-                    BinOp::Or => {
-                        self.code.push(Op::Push(Value::Bool(true)));
-                        let end_jump = self.code.len();
-                        self.code.push(Op::Jump(usize::MAX));
-                        let right_branch = self.code.len();
-                        let right_ty = self.expr(*right, Some(&Type::Bool))?;
-                        if right_ty != Type::Bool { return Err(Error::Type("logical operators require bool".into())); }
-                        let end = self.code.len();
-                        self.code[branch] = Op::JumpIfFalse(right_branch);
-                        self.code[end_jump] = Op::Jump(end);
-                    },
-                    _ => unreachable!(),
+                let lt = self.expr(*left, Some(&Type::Bool))?;
+                if lt != Type::Bool { return Err(Error::Type("logical operators require bool".into())); }
+
+                let jump_idx = self.code.len();
+                if op == BinOp::And { // <-- Removed *
+                    self.code.push(Op::JumpIfFalseKeep(usize::MAX));
+                } else {
+                    self.code.push(Op::JumpIfTrueKeep(usize::MAX));
+                }
+
+                let rt = self.expr(*right, Some(&Type::Bool))?;
+                if rt != Type::Bool { return Err(Error::Type("logical operators require bool".into())); }
+
+                let end_idx = self.code.len();
+                if op == BinOp::And { // <-- Removed *
+                    self.code[jump_idx] = Op::JumpIfFalseKeep(end_idx);
+                } else {
+                    self.code[jump_idx] = Op::JumpIfTrueKeep(end_idx);
                 }
                 return Ok(Type::Bool);
             }
@@ -1436,7 +1527,18 @@ impl Vm {
                 if *slot >= self.locals.len() { self.locals.resize(*slot + 1, Value::Bool(false)); }
                 self.locals[*slot] = v;
             },
-            Op::StoreIndex(slot, element) => { let value = self.pop()?; if &value.ty() != element { return Err(Error::Runtime("VM type invariant broken".into())); } let index = integer_to_usize(&self.pop()?)?; let Value::Array(reference, _) = self.locals.get(*slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? else { return Err(Error::Runtime("VM array slot invariant broken".into())); }; let mut encoded = Vec::new(); encode_scalar(&value, element, &mut encoded)?; match self.heap.borrow_mut().get_mut(*reference)? { HeapObject::Array { bytes, element: stored_element } if stored_element == element => { let start = index.checked_mul(encoded.len()).ok_or_else(|| Error::Runtime("array index too large".into()))?; let end = start.checked_add(encoded.len()).ok_or_else(|| Error::Runtime("array index too large".into()))?; if end > bytes.len() { return Err(Error::Runtime(format!("array index {index} is out of bounds (length {})", bytes.len() / encoded.len()))); } bytes[start..end].copy_from_slice(&encoded); }, _ => return Err(Error::Runtime("array heap invariant broken".into())), } },
+            Op::StoreIndex(slot, element) => {
+                let value = self.pop()?;
+                if &value.ty() != element { return Err(Error::Runtime("VM type invariant broken".into())); }
+                let index = integer_to_usize(&self.pop()?)?;
+                let Value::Array(reference, _) = self.locals.get(*slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? else { return Err(Error::Runtime("VM array slot invariant broken".into())); };
+                match self.heap.borrow_mut().get_mut(*reference)? {
+                    HeapObject::Array { bytes, element: stored_element } if stored_element == element => {
+                        write_scalar(bytes, index, &value, element)?;
+                    },
+                    _ => return Err(Error::Runtime("array heap invariant broken".into())),
+                }
+            },
             Op::StoreTableIndex(slot, element) => { let value = self.pop()?; if &value.ty() != element { return Err(Error::Runtime("VM table type invariant broken".into())); } let key = table_key_from_value(&self.pop()?)?; let Value::Table(reference, _) = self.locals.get(*slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? else { return Err(Error::Runtime("VM table slot invariant broken".into())); }; match self.heap.borrow_mut().get_mut(*reference)? { HeapObject::Table { entries, element: stored_element } if stored_element == element => { entries.insert(key, value); }, _ => return Err(Error::Runtime("table heap invariant broken".into())), } },
             Op::StoreTensorIndex(slot, element, rank) => {
                 let value = self.pop()?;
@@ -1444,27 +1546,27 @@ impl Vm {
                 let indices = self.pop_tensor_indices(*rank)?;
                 let Value::Tensor(reference, stored_element, stored_rank) = self.locals.get(*slot).cloned().ok_or_else(|| Error::Runtime("invalid local slot".into()))? else { return Err(Error::Runtime("VM tensor slot invariant broken".into())); };
                 if stored_element.as_ref() != element || stored_rank != *rank { return Err(Error::Runtime("VM tensor slot type invariant broken".into())); }
-                let mut encoded = Vec::new(); encode_scalar(&value, element, &mut encoded)?;
                 match self.heap.borrow_mut().get_mut(reference)? {
                     HeapObject::Tensor { bytes, element: stored_element, shape } if stored_element == element && shape.len() == *rank => {
                         let offset = Self::tensor_offset(shape, &indices)?;
-                        let start = offset.checked_mul(encoded.len()).ok_or_else(|| Error::Runtime("tensor offset is too large".into()))?;
-                        let end = start.checked_add(encoded.len()).ok_or_else(|| Error::Runtime("tensor offset is too large".into()))?;
-                        bytes.get_mut(start..end).ok_or_else(|| Error::Runtime("tensor storage invariant broken".into()))?.copy_from_slice(&encoded);
+                        write_scalar(bytes, offset, &value, element)?;
                     },
                     _ => return Err(Error::Runtime("tensor heap invariant broken".into())),
                 }
             },
             Op::StoreTensorIndexF32(slot, rank) => {
                 let value = self.pop()?;
-                let Value::F32(v) = value else { return Err(Error::Runtime("VM tensor type invariant broken".into())); };
+                if value.ty() != Type::F32 { return Err(Error::Runtime("VM tensor type invariant broken".into())); }
                 let indices = self.pop_tensor_indices(*rank)?;
                 let Value::Tensor(reference, _, _) = self.locals.get(*slot).cloned().ok_or_else(|| Error::Runtime("invalid local slot".into()))? else { return Err(Error::Runtime("VM tensor slot invariant broken".into())); };
                 match self.heap.borrow_mut().get_mut(reference)? {
                     HeapObject::Tensor { bytes, shape, .. } => {
                         let offset = Self::tensor_offset(shape, &indices)?;
                         let start = offset.checked_mul(4).ok_or_else(|| Error::Runtime("tensor offset is too large".into()))?;
-                        unsafe { std::ptr::write_unaligned(bytes.as_mut_ptr().add(start) as *mut f32, v); }
+                        if start + 4 > bytes.len() { return Err(Error::Runtime("tensor offset out of bounds".into())); }
+                        if let Value::F32(v) = value {
+                            unsafe { std::ptr::write_unaligned(bytes.as_mut_ptr().add(start) as *mut f32, v); }
+                        }
                     },
                     _ => return Err(Error::Runtime("tensor heap invariant broken".into())),
                 }
@@ -1550,6 +1652,28 @@ impl Vm {
             Op::CallExternal(name, argument_count) => self.call_external(name, *argument_count)?,
             Op::JumpIfFalse(target) => { match self.pop()? { Value::Bool(false) => { pc = *target; continue; }, Value::Bool(true) => {}, _ => return Err(Error::Runtime("VM condition invariant broken".into())), } },
             Op::Jump(target) => { pc = *target; continue; },
+            Op::JumpIfFalseKeep(target) => {
+                if self.stack_ptr == 0 { return Err(Error::Runtime("stack underflow".into())); }
+                let val = &self.stack[self.stack_ptr - 1];
+                if let Value::Bool(false) = val {
+                    pc = *target; continue;
+                } else if let Value::Bool(true) = val {
+                    self.pop()?;
+                } else {
+                    return Err(Error::Runtime("VM condition invariant broken".into()));
+                }
+            },
+            Op::JumpIfTrueKeep(target) => {
+                if self.stack_ptr == 0 { return Err(Error::Runtime("stack underflow".into())); }
+                let val = &self.stack[self.stack_ptr - 1];
+                if let Value::Bool(true) = val {
+                    pc = *target; continue;
+                } else if let Value::Bool(false) = val {
+                    self.pop()?;
+                } else {
+                    return Err(Error::Runtime("VM condition invariant broken".into()));
+                }
+            },
             Op::CallMethod(receiver, target) => { call_stack.push((pc + 1, current_receiver)); current_receiver = Some(*receiver); pc = *target; continue; },
             Op::CallCurrentMethod(target) => { let receiver = current_receiver.ok_or_else(|| Error::Runtime("this is available only inside a method".into()))?; call_stack.push((pc + 1, current_receiver)); current_receiver = Some(receiver); pc = *target; continue; },
             Op::CallModule(slot, name) => { self.call_module_function(*slot, name)?; },
