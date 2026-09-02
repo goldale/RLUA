@@ -4,7 +4,18 @@ This document specifies the implemented core and the approved implementation ord
 
 ## Values and structures
 
-Scalar types are `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f16`, `f32`, `f64`, and `bool`. `vector<T>` is a homogeneous, zero-indexed packed vector of scalar `T` values. `table<T>` maps integer or named keys to values of one declared type `T`.
+Scalar types are `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f16`, `f32`, `f64`, and `bool`. `vector<T>` is a homogeneous, zero-indexed packed vector of scalar `T` values. `tensor<T, N>` is an opaque, CPU-backed, row-major tensor with scalar element type `T` and a statically checked rank `N`. `table<T>` maps integer or named keys to values of one declared type `T`.
+
+Tensors are allocated by the built-in factories and are indexed with exactly `N` integer indices:
+
+```l0
+let weights: tensor<f32, 2> = zeros<f32>([128, 256])
+let bias: tensor<f32, 1> = random<f32>([256])
+weights[0, 5] = 0.99
+let value: f32 = weights[0, 5]
+```
+
+`zeros<T>` accepts every scalar element type; `random<T>` currently accepts `f16`, `f32`, and `f64` and generates values in `[0, 1)`. Shapes are `vector<u64>` values, so the factory verifies their length against `N` at runtime. Tensors are storage and transfer handles only: L0 deliberately defines no tensor arithmetic, broadcasting, matrix multiplication, or autograd. Those operations belong to registered Rust or C backends in a subsequent FFI layer.
 
 `struct` is the sole object-oriented mechanism. Its zero-argument member functions may access fields by name; a field hides an outer name of the same spelling. `this` is the whole current instance and permits calls to another member function: `this.advance()`.
 
@@ -65,6 +76,6 @@ The C ABI provides the same path for `i32` functions: call `l0_register_i32_func
 
 1. **Current stage:** typed vector fields in structures and cached filesystem modules with explicit exports.
 2. **Current runtime layer — garbage collector:** vectors, tables, structures, and strings are heap objects addressed by stable `HeapRef` handles, so copying a `Value` preserves object identity instead of copying its payload. Loaded module VMs are long-lived roots. The non-moving mark-and-sweep arena traces the operand stack, local slots, and those module roots; collection runs automatically after an allocation threshold and can also be requested explicitly through `Vm::collect_garbage()`. This makes cycles collectible without reference counting.
-3. **Later stage:** extend the C callback helpers beyond `i32`, add richer module interfaces, cross-module struct method dispatch, parameter and return-value design, and standard libraries.
+3. **Later stage:** add a tensor FFI registration and backend interface for CPU vector processors and GPU devices, then extend the C callback helpers beyond `i32`, add richer module interfaces, cross-module struct method dispatch, parameter and return-value design, and standard libraries.
 
 The GC stage must preserve the observable semantics above and collect cyclic tables and structures only when they become unreachable from all roots.
