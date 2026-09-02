@@ -31,8 +31,14 @@ typedef enum {
 uint32_t l0_abi_version(void);
 L0State *l0_new_state(void);
 void l0_free_state(L0State *state);
-/*
- * Register a scalar host function under an L0 identifier. arg_types must point
+
+/ * Returns a pointer to the last error message, or NULL if there was no error.
+ * The returned pointer is valid until the next operation on this state.
+ * The caller must not free the returned pointer.
+ */
+const char *l0_last_error(const L0State *state);
+
+/* Register a scalar host function under an L0 identifier. arg_types must point
  * to argument_count IDs when argument_count is nonzero. Returns 1 on success.
  */
 int l0_register_c_function(L0State *state, const char *name,
