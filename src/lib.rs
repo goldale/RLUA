@@ -11,6 +11,8 @@ use std::os::raw::c_int;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use half::f16;
+
 pub const ABI_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -184,28 +186,38 @@ impl Heap {
         }
     }
 
-    fn mark_value(&mut self, value: &Value) {
-        let Some(reference) = Self::heap_ref(value) else { return };
+    fn mark_reference(&mut self, root: HeapRef) {
         // Heap graphs can be arbitrarily deep. Mark iteratively so a valid
         // script cannot exhaust the host thread stack during collection. The
-        // worklist contains only compact HeapRef values, not cloned Values.
-        let mut work = vec![reference];
+        // worklist contains only compact HeapRef values. In particular, we do
+        // not clone a table's or struct's values into a temporary vector.
+        let mut work = vec![root];
         while let Some(reference) = work.pop() {
-            let children = {
+            let newly_marked = {
                 let Some(slot) = self.slots.get_mut(reference.0).and_then(Option::as_mut) else { continue };
-                if slot.marked { continue; }
-                slot.marked = true;
-                match &slot.object {
-                    HeapObject::Table { entries, .. } => entries.values().filter_map(Self::heap_ref).collect::<Vec<_>>(),
-                    HeapObject::Struct { values, .. } => values.iter().filter_map(Self::heap_ref).collect::<Vec<_>>(),
-                    HeapObject::Array { .. } | HeapObject::Tensor { .. } | HeapObject::String(_) => Vec::new(),
+                if slot.marked { false } else {
+                    slot.marked = true;
+                    true
                 }
             };
-            work.extend(children);
+            if !newly_marked { continue; }
+
+            // The mutable borrow used to mark the slot has ended. Extending
+            // the worklist directly keeps traversal allocation-free except
+            // for the worklist's own amortized growth.
+            match &self.slots[reference.0].as_ref().expect("marked slot must exist").object {
+                HeapObject::Table { entries, .. } => {
+                    work.extend(entries.values().filter_map(Self::heap_ref));
+                }
+                HeapObject::Struct { values, .. } => {
+                    work.extend(values.iter().filter_map(Self::heap_ref));
+                }
+                HeapObject::Array { .. } | HeapObject::Tensor { .. } | HeapObject::String(_) => {}
+            }
         }
     }
-    fn collect(&mut self, roots: impl IntoIterator<Item = Value>) -> usize {
-        for root in roots { self.mark_value(&root); }
+    fn collect(&mut self, roots: impl IntoIterator<Item = HeapRef>) -> usize {
+        for root in roots { self.mark_reference(root); }
         let mut reclaimed = 0;
         for (index, slot) in self.slots.iter_mut().enumerate() {
             let Some(live) = slot.as_mut() else { continue };
@@ -1501,10 +1513,10 @@ impl Vm {
         Ok(self.run(&code)?.to_vec())
     }
 
-    fn roots(&self) -> Vec<Value> {
+    fn roots(&self) -> Vec<HeapRef> {
         let mut roots = Vec::with_capacity(self.stack_ptr + self.locals.len());
-        roots.extend(self.stack[..self.stack_ptr].iter().cloned());
-        roots.extend(self.locals.iter().cloned());
+        roots.extend(self.stack[..self.stack_ptr].iter().filter_map(Heap::heap_ref));
+        roots.extend(self.locals.iter().filter_map(Heap::heap_ref));
         for module in self.modules.values() { roots.extend(module.vm.roots()); }
         roots
     }
@@ -1903,7 +1915,9 @@ impl Vm {
                 ModuleExport::Function { entry } => *entry,
                 _ => return Err(Error::Runtime(format!("'{name}' is not an exported module function"))),
             };
-            let code = instance.artifact.code.clone();
+            // Module bytecode is immutable and shared. This is an O(1)
+            // reference-count increment, not a bytecode-buffer copy.
+            let code = Rc::clone(&instance.artifact.code);
             instance.vm.run_from(&code, entry, true)?;
             std::mem::take(&mut instance.vm.output)
         };
@@ -2314,9 +2328,12 @@ c_scalar_helpers!(l0_push_f64, l0_to_f64, F64, f64);
         }
     }
 }
-// IEEE binary16 conversion, dependency-free so the language's f16 type is portable.
-pub fn f32_to_f16(value: f32) -> u16 { let bits=value.to_bits(); let sign=((bits>>16)&0x8000) as u16; let exp=((bits>>23)&0xff) as i32-127+15; let mant=bits&0x7fffff; if exp<=0 { if exp < -10{return sign}; return sign|(((mant|0x800000)>>(14-exp)) as u16); } if exp>=31 { return sign|0x7c00|if mant==0{0}else{1}; } sign|((exp as u16)<<10)|((mant>>13) as u16) }
-pub fn f16_to_f32(bits: u16) -> f32 { let sign=((bits as u32)&0x8000)<<16; let exp=(bits>>10)&0x1f; let mant=(bits&0x03ff) as u32; let out=if exp==0 { if mant==0 {sign} else { let mut m=mant; let mut e=-14i32; while m&0x400==0 {m<<=1;e-=1;} sign|(((e+127) as u32)<<23)|((m&0x3ff)<<13) } } else if exp==31 {sign|0x7f800000|(mant<<13)} else {sign|(((exp as u32+112)<<23))|(mant<<13)}; f32::from_bits(out) }
+/// Converts an `f32` to IEEE-754 binary16 bits using the `half` crate's
+/// correctly rounded implementation.
+pub fn f32_to_f16(value: f32) -> u16 { f16::from_f32(value).to_bits() }
+
+/// Converts IEEE-754 binary16 bits to `f32` using the `half` crate.
+pub fn f16_to_f32(bits: u16) -> f32 { f16::from_bits(bits).to_f32() }
 
 #[cfg(test)]
 mod immediate_regression_tests {
@@ -2387,6 +2404,23 @@ mod immediate_regression_tests {
         assert!(heap.allocated_bytes > 0);
         assert_eq!(heap.collect(Vec::new()), 1);
         assert_eq!(heap.allocated_bytes, 0);
+    }
+    #[test]
+    fn garbage_collection_traverses_references_without_cloning_values() {
+        let mut heap = Heap::default();
+        let child = heap.allocate(HeapObject::String("reachable".into()));
+        let parent = heap.allocate(HeapObject::Table {
+            entries: HashMap::from([(TableKey::Name(Rc::from("child")), Value::String(child))]),
+            element: Type::String,
+        });
+
+        assert_eq!(heap.collect([parent]), 0);
+        assert!(matches!(heap.get(child), Ok(HeapObject::String(text)) if text == "reachable"));
+    }
+    #[test]
+    fn f16_conversion_uses_standard_binary16_encoding() {
+        assert_eq!(f32_to_f16(1.0), 0x3c00);
+        assert_eq!(f16_to_f32(0xc000), -2.0);
     }
     #[test]
     fn builtins_are_resolved_during_compilation() {
