@@ -1434,10 +1434,14 @@ impl Vm {
                 let left = self.pop()?;
                 let Value::String(left_ref) = left else { return Err(Error::Runtime("VM string invariant broken".into())); };
                 let Value::String(right_ref) = right else { return Err(Error::Runtime("VM string invariant broken".into())); };
-                let heap = self.heap.borrow();
-                let (left, right) = match (heap.get(left_ref)?, heap.get(right_ref)?) {
-                    (HeapObject::String(left), HeapObject::String(right)) => (left.clone(), right.clone()),
-                    _ => return Err(Error::Runtime("string heap invariant broken".into())),
+                
+                // Ограничиваем область видимости .borrow() с помощью блока
+                let (left, right) = {
+                    let heap = self.heap.borrow();
+                    match (heap.get(left_ref)?, heap.get(right_ref)?) {
+                        (HeapObject::String(l), HeapObject::String(r)) => (l.clone(), r.clone()),
+                        _ => return Err(Error::Runtime("string heap invariant broken".into())),
+                    }
                 };
                 let reference = self.allocate(HeapObject::String(format!("{left}{right}")));
                 self.stack.push(Value::String(reference));
@@ -1641,14 +1645,13 @@ fn evaluate_builtin2(name: &str, a: Value, b: Value, ty: &Type) -> Result<Value,
         _ => Err(Error::Runtime(format!("{} requires matching floats", name)))
     }
 }
-
 fn evaluate_binary(a: Value, b: Value, opcode: &BinaryOp) -> Result<Value, Error> {
     if matches!(opcode, BinaryOp::Equal) { return Ok(Value::Bool(a == b)); }
     if matches!(opcode, BinaryOp::NotEqual) { return Ok(Value::Bool(a != b)); }
     macro_rules! int_op {
-        ($x:ident) => {
+        ($x:ident, $op:expr) => {
             if let (Value::$x(l), Value::$x(r)) = (a, b) {
-                match op {
+                match $op {
                     BinOp::Add => return l.checked_add(r).map(Value::$x).ok_or_else(|| Error::Runtime("addition overflow".into())),
                     BinOp::Sub => return l.checked_sub(r).map(Value::$x).ok_or_else(|| Error::Runtime("subtraction overflow".into())),
                     BinOp::Mul => return l.checked_mul(r).map(Value::$x).ok_or_else(|| Error::Runtime("multiplication overflow".into())),
@@ -1669,11 +1672,11 @@ fn evaluate_binary(a: Value, b: Value, opcode: &BinaryOp) -> Result<Value, Error
         }
     }
     macro_rules! float_op {
-        ($x:ident, $l:ident, $r:ident, $typecast:ty) => {
+        ($x:ident, $typecast:ty, $op:expr) => {
             if let (Value::$x(l_raw), Value::$x(r_raw)) = (a, b) {
                 let l = l_raw as $typecast;
                 let r = r_raw as $typecast;
-                match op {
+                match $op {
                     BinOp::Add => return Ok(Value::$x((l + r) as _)),
                     BinOp::Sub => return Ok(Value::$x((l - r) as _)),
                     BinOp::Mul => return Ok(Value::$x((l * r) as _)),
@@ -1688,14 +1691,13 @@ fn evaluate_binary(a: Value, b: Value, opcode: &BinaryOp) -> Result<Value, Error
             }
         }
     }
-
     match opcode {
-        BinaryOp::I8(op) => { int_op!(I8); }, BinaryOp::I16(op) => { int_op!(I16); },
-        BinaryOp::I32(op) => { int_op!(I32); }, BinaryOp::I64(op) => { int_op!(I64); },
-        BinaryOp::U8(op) => { int_op!(U8); }, BinaryOp::U16(op) => { int_op!(U16); },
-        BinaryOp::U32(op) => { int_op!(U32); }, BinaryOp::U64(op) => { int_op!(U64); },
-        BinaryOp::F32(op) => { float_op!(F32, l, r, f32); },
-        BinaryOp::F64(op) => { float_op!(F64, l, r, f64); },
+        BinaryOp::I8(op) => { int_op!(I8, op); }, BinaryOp::I16(op) => { int_op!(I16, op); },
+        BinaryOp::I32(op) => { int_op!(I32, op); }, BinaryOp::I64(op) => { int_op!(I64, op); },
+        BinaryOp::U8(op) => { int_op!(U8, op); }, BinaryOp::U16(op) => { int_op!(U16, op); },
+        BinaryOp::U32(op) => { int_op!(U32, op); }, BinaryOp::U64(op) => { int_op!(U64, op); },
+        BinaryOp::F32(op) => { float_op!(F32, f32, op); },
+        BinaryOp::F64(op) => { float_op!(F64, f64, op); },
         BinaryOp::F16(op) => {
             if let (Value::F16(l_raw), Value::F16(r_raw)) = (a, b) {
                 let l = f16_to_f32(l_raw);
