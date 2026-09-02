@@ -399,13 +399,6 @@ fn lex(source: &str) -> Result<LexedTokens, Error> {
         match chars[i] {
             c if c.is_whitespace() => i += 1,
             '-' if chars.get(i + 1) == Some(&'-') => { while i < chars.len() && chars[i] != '\n' { i += 1; } }
-            '-' if chars.get(i + 1).is_some_and(|c| c.is_ascii_digit()) => {
-                let start = i; let mut dot = false; i += 2;
-                while i < chars.len() && (chars[i].is_ascii_digit() || (!dot && chars[i] == '.')) { if chars[i] == '.' { dot = true; } i += 1; }
-                let raw: String = chars[start..i].iter().collect();
-                result.push(if dot { Token::Float(raw.parse().map_err(|_| Error::Lex(raw.clone()))?) }
-                            else { Token::Integer(raw.parse().map_err(|_| Error::Lex(raw.clone()))?) });
-            }
             ':' if chars.get(i + 1) == Some(&':') => { result.push(Token::DoubleColon); i += 2; }, ':' => { result.push(Token::Colon); i += 1; },
             '=' if chars.get(i + 1) == Some(&'=') => { result.push(Token::EqualEqual); i += 2; }, '=' => { result.push(Token::Equal); i += 1; },
             '!' if chars.get(i + 1) == Some(&'=') => { result.push(Token::BangEq); i += 2; },
