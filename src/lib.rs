@@ -135,13 +135,16 @@ pub enum HeapObject {
 }
 
 #[derive(Clone, Debug)]
-pub struct HeapSlot { pub marked: bool, pub object: HeapObject }
+pub enum HeapSlot {
+    Free { next_free: Option<usize> },
+    Occupied { marked: bool, object: HeapObject },
+}
 
 /// Non-moving mark-and-sweep storage for every reference value in the VM.
 #[derive(Debug)]
 pub struct Heap {
-    pub slots: Vec<Option<HeapSlot>>,
-    pub free: Vec<usize>,
+    pub slots: Vec<HeapSlot>,
+    pub free_head: Option<usize>,
     /// Estimated bytes owned by live heap objects. This is deliberately based
     /// on payload capacity rather than object count, since one tensor can be
     /// substantially larger than many small objects.
@@ -153,7 +156,7 @@ impl Default for Heap {
     fn default() -> Self {
         Self {
             slots: Vec::new(),
-            free: Vec::new(),
+            free_head: None,
             allocated_bytes: 0,
             threshold_bytes: 64 * 1024,
         }
@@ -179,17 +182,30 @@ impl Heap {
 
     pub fn allocate(&mut self, object: HeapObject) -> HeapRef {
         self.allocated_bytes = self.allocated_bytes.saturating_add(Self::object_size(&object));
-        let index = self.free.pop().unwrap_or_else(|| { self.slots.push(None); self.slots.len() - 1 });
-        self.slots[index] = Some(HeapSlot { marked: false, object });
+        if let Some(index) = self.free_head {
+            if let HeapSlot::Free { next_free } = self.slots[index] {
+                self.free_head = next_free;
+                self.slots[index] = HeapSlot::Occupied { marked: false, object };
+                return HeapRef(index);
+            }
+        }
+        let index = self.slots.len();
+        self.slots.push(HeapSlot::Occupied { marked: false, object });
         HeapRef(index)
     }
 
     pub fn get(&self, reference: HeapRef) -> Result<&HeapObject, Error> {
-        self.slots.get(reference.0).and_then(Option::as_ref).map(|slot| &slot.object).ok_or_else(|| Error::Runtime("dangling heap reference".into()))
+        match self.slots.get(reference.0) {
+            Some(HeapSlot::Occupied { object, .. }) => Ok(object),
+            _ => Err(Error::Runtime("dangling heap reference".into())),
+        }
     }
 
     pub fn get_mut(&mut self, reference: HeapRef) -> Result<&mut HeapObject, Error> {
-        self.slots.get_mut(reference.0).and_then(Option::as_mut).map(|slot| &mut slot.object).ok_or_else(|| Error::Runtime("dangling heap reference".into()))
+        match self.slots.get_mut(reference.0) {
+            Some(HeapSlot::Occupied { object, .. }) => Ok(object),
+            _ => Err(Error::Runtime("dangling heap reference".into())),
+        }
     }
 
     fn heap_ref(value: &Value) -> Option<HeapRef> {
@@ -207,41 +223,57 @@ impl Heap {
         // not clone a table's or struct's values into a temporary vector.
         let mut work = vec![root];
         while let Some(reference) = work.pop() {
-            let newly_marked = {
-                let Some(slot) = self.slots.get_mut(reference.0).and_then(Option::as_mut) else { continue };
-                if slot.marked { false } else {
-                    slot.marked = true;
-                    true
+            let newly_marked = match self.slots.get_mut(reference.0) {
+                Some(HeapSlot::Occupied { marked, .. }) => {
+                    if *marked { false } else { *marked = true; true }
                 }
+                _ => false,
             };
             if !newly_marked { continue; }
 
             // The mutable borrow used to mark the slot has ended. Extending
             // the worklist directly keeps traversal allocation-free except
             // for the worklist's own amortized growth.
-            match &self.slots[reference.0].as_ref().expect("marked slot must exist").object {
-                HeapObject::Table { entries, .. } => {
-                    work.extend(entries.values().filter_map(Self::heap_ref));
-                }
-                HeapObject::Struct { values, .. } => {
-                    work.extend(values.iter().filter_map(Self::heap_ref));
-                }
-                HeapObject::Array { .. } | HeapObject::Tensor { .. } | HeapObject::String(_) | HeapObject::TableKeys(_) => {}
+            match &self.slots[reference.0] {
+                HeapSlot::Occupied { object, .. } => match object {
+                    HeapObject::Table { entries, .. } => {
+                        work.extend(entries.values().filter_map(Self::heap_ref));
+                    }
+                    HeapObject::Struct { values, .. } => {
+                        work.extend(values.iter().filter_map(Self::heap_ref));
+                    }
+                    HeapObject::Array { .. } | HeapObject::Tensor { .. } | HeapObject::String(_) | HeapObject::TableKeys(_) => {}
+                },
+                _ => {}
             }
         }
     }
     fn collect(&mut self, roots: impl IntoIterator<Item = HeapRef>) -> usize {
         for root in roots { self.mark_reference(root); }
         let mut reclaimed = 0;
-        for (index, slot) in self.slots.iter_mut().enumerate() {
-            let Some(live) = slot.as_mut() else { continue };
-            if live.marked {
-                live.marked = false;
-            } else {
-                self.allocated_bytes = self.allocated_bytes.saturating_sub(Self::object_size(&live.object));
-                *slot = None;
-                self.free.push(index);
-                reclaimed += 1;
+
+        for slot in self.slots.iter_mut() {
+            if let HeapSlot::Occupied { marked, object } = slot {
+                if *marked {
+                    *marked = false;
+                } else {
+                    self.allocated_bytes = self.allocated_bytes.saturating_sub(Self::object_size(object));
+                    *slot = HeapSlot::Free { next_free: None };
+                    reclaimed += 1;
+                }
+            }
+        }
+
+        while let Some(HeapSlot::Free { .. }) = self.slots.last() {
+            self.slots.pop();
+        }
+        self.slots.shrink_to_fit();
+
+        self.free_head = None;
+        for index in (0..self.slots.len()).rev() {
+            if let HeapSlot::Free { next_free } = &mut self.slots[index] {
+                *next_free = self.free_head;
+                self.free_head = Some(index);
             }
         }
         self.threshold_bytes = self.allocated_bytes.saturating_mul(2).max(64 * 1024);
@@ -363,7 +395,6 @@ pub enum UnOp { Neg, Not }
 #[derive(Clone, Debug, PartialEq)]
 enum Token {
     Let, Print, Printf, Putc, Input, This, Function, Export, Require, If, Then, Else, ElseIf, While, For, Do, Break, Continue, Struct, Table, End,
-    Let, Print, Printf, Putc, Input, This, Function, Export, Require, If, Then, Else, ElseIf, While, For, Do, Break, Continue, Struct, Table, End,
     As, Ident(StringId), Integer(i128), Float(f64), StringLit(StringId), Colon, DoubleColon,
     Equal, EqualEqual, Bang, BangEq, Plus, Minus, Star, Slash, Percent,
     Ampersand, Pipe, Caret, Shl, Shr, AndAnd, OrOr,
@@ -458,7 +489,6 @@ fn lex(source: &str) -> Result<LexedTokens, Error> {
                     "function" => Token::Function, "export" => Token::Export, "require" => Token::Require,
                     "if" => Token::If, "then" => Token::Then, "else" => Token::Else, "elseif" => Token::ElseIf,
                     "while" => Token::While, "for" => Token::For, "do" => Token::Do,
-                    "break" => Token::Break, "continue" => Token::Continue, "struct" => Token::Struct,
                     "break" => Token::Break, "continue" => Token::Continue, "struct" => Token::Struct,
                     "table" => Token::Table, "end" => Token::End, "as" => Token::As, _ => Token::Ident(strings.intern(&word))
                 });
@@ -948,13 +978,15 @@ enum Opcode {
     TableKeysIndex, TableRemove, Field, TableField, ModuleField, Binary, Unary, Len,
     ConcatString, Builtin1, Builtin2, CallExternal, JumpIfFalse, Jump, JumpIfFalseKeep,
     JumpIfTrueKeep, CallMethod, CallCurrentMethod, CallModule, Return, Print, Printf, Putc,
+    // Appended to preserve the numeric representation of existing opcodes.
+    Cast,
 }
 
 impl Opcode {
     fn from_word(word: u32) -> Result<Self, Error> {
         // Opcodes are emitted only by this compiler.  Keep malformed external
         // bytecode diagnosable rather than treating it as undefined behaviour.
-        if word > Self::Putc as u32 { return Err(Error::Runtime("invalid bytecode opcode".into())); }
+        if word > Self::Cast as u32 { return Err(Error::Runtime("invalid bytecode opcode".into())); }
         Ok(unsafe { std::mem::transmute(word) })
     }
 }
@@ -966,7 +998,7 @@ enum DecodedOp<'a> {
     StoreField(usize, &'a StructField), StoreFieldIndex(usize, &'a StructField, &'a Type), StoreTableField(usize, &'a str, &'a Type),
     StoreCurrentField(&'a StructField), MakeArray(usize, &'a Type), MakeTable(&'a [TableEntry], &'a Type), MakeStruct(&'a StructLayout),
     MakeTensor(TensorInit, &'a Type, usize), Index, TensorIndex(&'a Type, usize), TensorIndexF32(usize), TableIndex, TableKeys, TableKeysIndex, TableRemove, Field(&'a StructField), TableField(&'a str), ModuleField(&'a str),
-    Binary(&'a BinaryOp), Unary(&'a UnOp, &'a Type), Len, ConcatString,
+    Binary(&'a BinaryOp), Unary(&'a UnOp, &'a Type), Len, ConcatString, Cast(&'a Type),
     Builtin1(BuiltinFn, &'a Type), Builtin2(BuiltinFn, &'a Type), CallExternal(&'a str, usize),
     JumpIfFalse(usize), Jump(usize), JumpIfFalseKeep(usize), JumpIfTrueKeep(usize),
     CallMethod(usize, usize), CallCurrentMethod(usize), CallModule(usize, &'a str),
@@ -1003,7 +1035,7 @@ impl FlatBytecode {
             IrOp::Index => out.op(Opcode::Index), IrOp::TensorIndex(a,b) => { out.op(Opcode::TensorIndex); let x=out.constant(Constant::Type(a)); out.word(x as usize); out.word(b); }, IrOp::TensorIndexF32(v) => { out.op(Opcode::TensorIndexF32); out.word(v); },
             IrOp::TableIndex => out.op(Opcode::TableIndex), IrOp::TableKeys => out.op(Opcode::TableKeys), IrOp::TableKeysIndex => out.op(Opcode::TableKeysIndex), IrOp::TableRemove => out.op(Opcode::TableRemove),
             IrOp::Field(v) => { out.op(Opcode::Field); let x=out.constant(Constant::Field(v)); out.word(x as usize); }, IrOp::TableField(v) => { out.op(Opcode::TableField); let x=out.constant(Constant::String(v)); out.word(x as usize); }, IrOp::ModuleField(v) => { out.op(Opcode::ModuleField); let x=out.constant(Constant::String(v)); out.word(x as usize); },
-            IrOp::Binary(v) => { out.op(Opcode::Binary); let x=out.constant(Constant::Binary(v)); out.word(x as usize); }, IrOp::Unary(a,b) => { out.op(Opcode::Unary); let x=out.constant(Constant::Unary(a)); out.word(x as usize); let x=out.constant(Constant::Type(b)); out.word(x as usize); }, IrOp::Len => out.op(Opcode::Len), IrOp::ConcatString => out.op(Opcode::ConcatString),
+            IrOp::Binary(v) => { out.op(Opcode::Binary); let x=out.constant(Constant::Binary(v)); out.word(x as usize); }, IrOp::Unary(a,b) => { out.op(Opcode::Unary); let x=out.constant(Constant::Unary(a)); out.word(x as usize); let x=out.constant(Constant::Type(b)); out.word(x as usize); }, IrOp::Len => out.op(Opcode::Len), IrOp::ConcatString => out.op(Opcode::ConcatString), IrOp::Cast(v) => { out.op(Opcode::Cast); let x=out.constant(Constant::Type(v)); out.word(x as usize); },
             IrOp::Builtin1(a,b) => { out.op(Opcode::Builtin1); let x=out.constant(Constant::Builtin(a)); out.word(x as usize); let x=out.constant(Constant::Type(b)); out.word(x as usize); }, IrOp::Builtin2(a,b) => { out.op(Opcode::Builtin2); let x=out.constant(Constant::Builtin(a)); out.word(x as usize); let x=out.constant(Constant::Type(b)); out.word(x as usize); },
             IrOp::CallExternal(a,b) => { out.op(Opcode::CallExternal); let x=out.constant(Constant::String(a)); out.word(x as usize); out.word(b); },
             IrOp::JumpIfFalse(v) => { out.op(Opcode::JumpIfFalse); out.word(v * 4); }, IrOp::Jump(v) => { out.op(Opcode::Jump); out.word(v * 4); }, IrOp::JumpIfFalseKeep(v) => { out.op(Opcode::JumpIfFalseKeep); out.word(v * 4); }, IrOp::JumpIfTrueKeep(v) => { out.op(Opcode::JumpIfTrueKeep); out.word(v * 4); },
@@ -1034,7 +1066,7 @@ impl FlatBytecode {
             Opcode::StoreField=>{let a=word(&mut pc)?;c!(Constant::Field(v));DecodedOp::StoreField(a,v)}, Opcode::StoreFieldIndex=>{let a=word(&mut pc)?;c!(Constant::Field(b));c!(Constant::Type(c));DecodedOp::StoreFieldIndex(a,b,c)}, Opcode::StoreTableField=>{let a=word(&mut pc)?;c!(Constant::String(b));c!(Constant::Type(c));DecodedOp::StoreTableField(a,b,c)}, Opcode::StoreCurrentField=>{c!(Constant::Field(v));DecodedOp::StoreCurrentField(v)},
             Opcode::MakeArray=>{let a=word(&mut pc)?;c!(Constant::Type(b));DecodedOp::MakeArray(a,b)}, Opcode::MakeTable=>{c!(Constant::Entries(a));c!(Constant::Type(b));DecodedOp::MakeTable(a,b)}, Opcode::MakeStruct=>{c!(Constant::Layout(v));DecodedOp::MakeStruct(v)}, Opcode::MakeTensor=>{c!(Constant::TensorInit(a));c!(Constant::Type(b));let c=word(&mut pc)?;DecodedOp::MakeTensor(*a,b,c)},
             Opcode::Index=>DecodedOp::Index, Opcode::TensorIndex=>{c!(Constant::Type(a));let b=word(&mut pc)?;DecodedOp::TensorIndex(a,b)}, Opcode::TensorIndexF32=>DecodedOp::TensorIndexF32(word(&mut pc)?), Opcode::TableIndex=>DecodedOp::TableIndex, Opcode::TableKeys=>DecodedOp::TableKeys, Opcode::TableKeysIndex=>DecodedOp::TableKeysIndex, Opcode::TableRemove=>DecodedOp::TableRemove, Opcode::Field=>{c!(Constant::Field(v));DecodedOp::Field(v)}, Opcode::TableField=>{c!(Constant::String(v));DecodedOp::TableField(v)}, Opcode::ModuleField=>{c!(Constant::String(v));DecodedOp::ModuleField(v)},
-            Opcode::Binary=>{c!(Constant::Binary(v));DecodedOp::Binary(v)}, Opcode::Unary=>{c!(Constant::Unary(a));c!(Constant::Type(b));DecodedOp::Unary(a,b)}, Opcode::Len=>DecodedOp::Len, Opcode::ConcatString=>DecodedOp::ConcatString, Opcode::Builtin1=>{c!(Constant::Builtin(a));c!(Constant::Type(b));DecodedOp::Builtin1(*a,b)}, Opcode::Builtin2=>{c!(Constant::Builtin(a));c!(Constant::Type(b));DecodedOp::Builtin2(*a,b)}, Opcode::CallExternal=>{c!(Constant::String(a));let b=word(&mut pc)?;DecodedOp::CallExternal(a,b)},
+            Opcode::Binary=>{c!(Constant::Binary(v));DecodedOp::Binary(v)}, Opcode::Unary=>{c!(Constant::Unary(a));c!(Constant::Type(b));DecodedOp::Unary(a,b)}, Opcode::Len=>DecodedOp::Len, Opcode::ConcatString=>DecodedOp::ConcatString, Opcode::Cast=>{c!(Constant::Type(v));DecodedOp::Cast(v)}, Opcode::Builtin1=>{c!(Constant::Builtin(a));c!(Constant::Type(b));DecodedOp::Builtin1(*a,b)}, Opcode::Builtin2=>{c!(Constant::Builtin(a));c!(Constant::Type(b));DecodedOp::Builtin2(*a,b)}, Opcode::CallExternal=>{c!(Constant::String(a));let b=word(&mut pc)?;DecodedOp::CallExternal(a,b)},
             Opcode::JumpIfFalse=>DecodedOp::JumpIfFalse(word(&mut pc)?), Opcode::Jump=>DecodedOp::Jump(word(&mut pc)?), Opcode::JumpIfFalseKeep=>DecodedOp::JumpIfFalseKeep(word(&mut pc)?), Opcode::JumpIfTrueKeep=>DecodedOp::JumpIfTrueKeep(word(&mut pc)?), Opcode::CallMethod=>DecodedOp::CallMethod(word(&mut pc)?,word(&mut pc)?), Opcode::CallCurrentMethod=>DecodedOp::CallCurrentMethod(word(&mut pc)?), Opcode::CallModule=>{let a=word(&mut pc)?;c!(Constant::String(b));DecodedOp::CallModule(a,b)}, Opcode::Return=>DecodedOp::Return, Opcode::Print=>DecodedOp::Print, Opcode::Printf=>DecodedOp::Printf(word(&mut pc)?), Opcode::Putc=>DecodedOp::Putc,
         }; Ok((decoded,instruction_start + 4))
     }
@@ -1048,7 +1080,7 @@ impl FlatBytecode {
             DecodedOp::StoreField(a,b) => IrOp::StoreField(a,Rc::new(b.clone())), DecodedOp::StoreFieldIndex(a,b,c) => IrOp::StoreFieldIndex(a,Rc::new(b.clone()),Rc::new(c.clone())), DecodedOp::StoreTableField(a,b,c) => IrOp::StoreTableField(a,Rc::from(b),Rc::new(c.clone())), DecodedOp::StoreCurrentField(v) => IrOp::StoreCurrentField(Rc::new(v.clone())),
             DecodedOp::MakeArray(a,b) => IrOp::MakeArray(a,Rc::new(b.clone())), DecodedOp::MakeTable(a,b) => IrOp::MakeTable(Rc::from(a),Rc::new(b.clone())), DecodedOp::MakeStruct(v) => IrOp::MakeStruct(Rc::new(v.clone())), DecodedOp::MakeTensor(a,b,c) => IrOp::MakeTensor(a,Rc::new(b.clone()),c),
             DecodedOp::Index => IrOp::Index, DecodedOp::TensorIndex(a,b) => IrOp::TensorIndex(Rc::new(a.clone()),b), DecodedOp::TensorIndexF32(v) => IrOp::TensorIndexF32(v), DecodedOp::TableIndex => IrOp::TableIndex, DecodedOp::TableKeys => IrOp::TableKeys, DecodedOp::TableKeysIndex => IrOp::TableKeysIndex, DecodedOp::TableRemove => IrOp::TableRemove, DecodedOp::Field(v) => IrOp::Field(Rc::new(v.clone())), DecodedOp::TableField(v) => IrOp::TableField(Rc::from(v)), DecodedOp::ModuleField(v) => IrOp::ModuleField(Rc::from(v)),
-            DecodedOp::Binary(v) => IrOp::Binary(v.clone()), DecodedOp::Unary(a,b) => IrOp::Unary(a.clone(),Rc::new(b.clone())), DecodedOp::Len => IrOp::Len, DecodedOp::ConcatString => IrOp::ConcatString, DecodedOp::Builtin1(a,b) => IrOp::Builtin1(a,Rc::new(b.clone())), DecodedOp::Builtin2(a,b) => IrOp::Builtin2(a,Rc::new(b.clone())), DecodedOp::CallExternal(a,b) => IrOp::CallExternal(Rc::from(a),b),
+            DecodedOp::Binary(v) => IrOp::Binary(v.clone()), DecodedOp::Unary(a,b) => IrOp::Unary(a.clone(),Rc::new(b.clone())), DecodedOp::Len => IrOp::Len, DecodedOp::ConcatString => IrOp::ConcatString, DecodedOp::Cast(v) => IrOp::Cast(Rc::new(v.clone())), DecodedOp::Builtin1(a,b) => IrOp::Builtin1(a,Rc::new(b.clone())), DecodedOp::Builtin2(a,b) => IrOp::Builtin2(a,Rc::new(b.clone())), DecodedOp::CallExternal(a,b) => IrOp::CallExternal(Rc::from(a),b),
             DecodedOp::JumpIfFalse(v) => IrOp::JumpIfFalse(v), DecodedOp::Jump(v) => IrOp::Jump(v), DecodedOp::JumpIfFalseKeep(v) => IrOp::JumpIfFalseKeep(v), DecodedOp::JumpIfTrueKeep(v) => IrOp::JumpIfTrueKeep(v), DecodedOp::CallMethod(a,b) => IrOp::CallMethod(a,b), DecodedOp::CallCurrentMethod(v) => IrOp::CallCurrentMethod(v), DecodedOp::CallModule(a,b) => IrOp::CallModule(a,Rc::from(b)), DecodedOp::Return => IrOp::Return, DecodedOp::Print => IrOp::Print, DecodedOp::Printf(v) => IrOp::Printf(v), DecodedOp::Putc => IrOp::Putc,
         }; Ok((op, next_pc))
     }
@@ -2841,6 +2873,8 @@ mod immediate_regression_tests {
         let Value::String(reference) = vm.locals[2] else { panic!("joined local is not a string") };
         let HeapObject::String(joined) = vm.heap_ref().get(reference).unwrap() else { panic!("joined value is not a heap string") };
         assert_eq!(joined.capacity(), joined.len());
+    }
+    #[test]
     fn numeric_casts_work_correctly() {
         let source = "let a: i8 = 10; let b: i32 = a as i32; print(b)";
         assert_eq!(execute(source).unwrap(), vec!["10".to_owned()]);
@@ -2912,5 +2946,27 @@ mod immediate_regression_tests {
             execute("let i: i32 = 42; let b: bool = i as bool"),
             Err(Error::Located { source, .. }) if matches!(*source, Error::Type(ref msg) if msg.contains("cannot cast i32 to bool"))
         ));
+    }
+    #[test]
+    fn garbage_collection_allocates_and_frees_99999_chunks() {
+        let mut heap = Heap::default();
+        let mut refs = Vec::new();
+        for i in 0..99999 {
+            refs.push(heap.allocate(HeapObject::String(format!("chunk {i}"))));
+        }
+        assert_eq!(heap.slots.len(), 99999);
+        let roots = vec![refs[0], refs[99998]];
+        let reclaimed = heap.collect(roots);
+        assert_eq!(reclaimed, 99997);
+        assert_eq!(heap.slots.len(), 99999);
+        assert!(heap.free_head.is_some());
+        let reused_ref = heap.allocate(HeapObject::String("reused".into()));
+        assert!(reused_ref.0 > 0 && reused_ref.0 < 99998);
+        assert_eq!(heap.slots.len(), 99999);
+        let reclaimed_final = heap.collect(Vec::new());
+        assert_eq!(reclaimed_final, 3);
+        assert_eq!(heap.slots.len(), 0);
+        assert_eq!(heap.free_head, None);
+        assert_eq!(heap.allocated_bytes, 0);
     }
 }
