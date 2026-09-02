@@ -162,60 +162,102 @@ while active do
         end
 
     else
-        -- ХОД КОМПЬЮТЕРА (ИИ)
+    -- ХОД КОМПЬЮТЕРА (ИИ)
         printf("\nКомпьютер думает...\n")
 
-        let placed: bool = 1 == 0
-        let cz_ai: i32 = -1
+        let best_z: i32 = -1
+        let best_y: i32 = -1
+        let best_x: i32 = -1
+        let best_score: i32 = -1
 
-        -- Ищем свободную ячейку в кубе 3х3х3 вокруг последнего хода игрока
-        while cz_ai <= 1 && placed == (1 == 0) do
-            let cy_ai: i32 = -1
-            while cy_ai <= 1 && placed == (1 == 0) do
-                let cx_ai: i32 = -1
-                while cx_ai <= 1 && placed == (1 == 0) do
-                    -- Логика ИИ также замкнута для поиска соседних клеток
-                    let cand_z: i32 = (last_z + cz_ai + 7) % 7
-                    let cand_y: i32 = (last_y + cy_ai + 7) % 7
-                    let cand_x: i32 = (last_x + cx_ai + 7) % 7
-
+        -- ИИ анализирует все клетки на 3D-доске
+        let cand_z: i32 = 0
+        while cand_z < 7 do
+            let cand_y: i32 = 0
+            while cand_y < 7 do
+                let cand_x: i32 = 0
+                while cand_x < 7 do
                     if board[cand_z, cand_y, cand_x] == 0 then
-                        board[cand_z, cand_y, cand_x] = 2
-                        placed = 1 == 1
-                        last_z = cand_z
-                        last_y = cand_y
-                        last_x = cand_x
-                    end
-                    cx_ai = cx_ai + 1
-                end
-                cy_ai = cy_ai + 1
-            end
-            cz_ai = cz_ai + 1
-        end
+                        let score: i32 = 0
+                        let dir: i32 = 0
+                        
+                        while dir < 13 do
+                            -- Симуляция постановки камня ИИ
+                            let c_ai: i32 = 1
+                            let step: i32 = 1
+                            let stop: bool = 1 == 0
+                            while step <= 4 && stop == (1 == 0) do
+                                let cz: i32 = (cand_z + dz[dir] * step + 35) % 7
+                                let cy: i32 = (cand_y + dy[dir] * step + 35) % 7
+                                let cx: i32 = (cand_x + dx[dir] * step + 35) % 7
+                                if board[cz, cy, cx] == 2 then c_ai = c_ai + 1 else stop = 1 == 1 end
+                                step = step + 1
+                            end
+                            step = 1
+                            stop = 1 == 0
+                            while step <= 4 && stop == (1 == 0) do
+                                let cz: i32 = (cand_z - dz[dir] * step + 35) % 7
+                                let cy: i32 = (cand_y - dy[dir] * step + 35) % 7
+                                let cx: i32 = (cand_x - dx[dir] * step + 35) % 7
+                                if board[cz, cy, cx] == 2 then c_ai = c_ai + 1 else stop = 1 == 1 end
+                                step = step + 1
+                            end
 
-        -- Fallback: если всё занято, берем первую пустую ячейку на всей доске
-        if placed == (1 == 0) then
-            let fz: i32 = 0
-            while fz <= 6 && placed == (1 == 0) do
-                let fy: i32 = 0
-                while fy <= 6 && placed == (1 == 0) do
-                    let fx: i32 = 0
-                    while fx <= 6 && placed == (1 == 0) do
-                        if board[fz, fy, fx] == 0 then
-                            board[fz, fy, fx] = 2
-                            placed = 1 == 1
-                            last_z = fz
-                            last_y = fy
-                            last_x = fx
+                            -- Симуляция постановки камня игрока
+                            let c_pl: i32 = 1
+                            step = 1
+                            stop = 1 == 0
+                            while step <= 4 && stop == (1 == 0) do
+                                let cz: i32 = (cand_z + dz[dir] * step + 35) % 7
+                                let cy: i32 = (cand_y + dy[dir] * step + 35) % 7
+                                let cx: i32 = (cand_x + dx[dir] * step + 35) % 7
+                                if board[cz, cy, cx] == 1 then c_pl = c_pl + 1 else stop = 1 == 1 end
+                                step = step + 1
+                            end
+                            step = 1
+                            stop = 1 == 0
+                            while step <= 4 && stop == (1 == 0) do
+                                let cz: i32 = (cand_z - dz[dir] * step + 35) % 7
+                                let cy: i32 = (cand_y - dy[dir] * step + 35) % 7
+                                let cx: i32 = (cand_x - dx[dir] * step + 35) % 7
+                                if board[cz, cy, cx] == 1 then c_pl = c_pl + 1 else stop = 1 == 1 end
+                                step = step + 1
+                            end
+
+                            -- Расчёт веса позиции для 3D
+                            if c_ai >= 5 then score = score + 100000 end
+                            if c_ai == 4 then score = score + 1000 end
+                            if c_ai == 3 then score = score + 100 end
+                            if c_ai == 2 then score = score + 10 end
+
+                            if c_pl >= 5 then score = score + 80000 end
+                            if c_pl == 4 then score = score + 800 end
+                            if c_pl == 3 then score = score + 80 end
+                            if c_pl == 2 then score = score + 8 end
+
+                            dir = dir + 1
                         end
-                        fx = fx + 1
+
+                        if score > best_score then
+                            best_score = score
+                            best_z = cand_z
+                            best_y = cand_y
+                            best_x = cand_x
+                        end
                     end
-                    fy = fy + 1
+                    cand_x = cand_x + 1
                 end
-                fz = fz + 1
+                cand_y = cand_y + 1
             end
+            cand_z = cand_z + 1
         end
 
+        if best_z != -1 then
+            board[best_z, best_y, best_x] = 2
+            last_z = best_z
+            last_y = best_y
+            last_x = best_x
+        end
         printf("Компьютер поставил O на координаты: Z={}, Y={}, X={}\n", last_z, last_y, last_x)
 
         -- Проверка на победу (Компьютер)
