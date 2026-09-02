@@ -3,6 +3,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::ffi::CStr;
 use std::fs;
 use std::fmt;
 use std::io::{self, Write};
@@ -10,7 +11,7 @@ use std::os::raw::c_int;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Type {
@@ -619,6 +620,9 @@ enum ModuleExport { Value { slot: usize, ty: Type }, Function { entry: usize }, 
 struct ModuleArtifact { id: String, code: Vec<Op>, exports: HashMap<String, ModuleExport> }
 
 #[derive(Clone, Debug)]
+struct HostSignature { arguments: Vec<Type>, result: Type }
+
+#[derive(Clone, Debug)]
 enum Op { 
     Push(Value), MakeString(String), Input(Type), Require(ModuleArtifact), Load(usize), LoadCurrentReceiver, 
     LoadCurrentField(StructField), Store(usize), StoreIndex(usize, Type), StoreTableIndex(usize, Type), 
@@ -627,6 +631,7 @@ enum Op {
     Index, TableIndex, Field(StructField), TableField(String), ModuleField(String), 
     Binary(BinOp, Type), Unary(UnOp, Type),
     Builtin1(String, Type), Builtin2(String, Type),
+    CallExternal(String, usize),
     JumpIfFalse(usize), Jump(usize), CallMethod(usize, usize), CallCurrentMethod(usize), CallModule(usize, String), 
     Return, Print, Printf(usize), Putc 
 }
@@ -636,13 +641,14 @@ struct Compiler {
     methods: HashMap<(String, String), Option<usize>>, pending_method_calls: Vec<(usize, String, String)>, 
     current_method_fields: Option<HashMap<String, StructField>>, current_method_struct: Option<String>, 
     module_root: Option<PathBuf>, module_artifacts: HashMap<String, ModuleArtifact>, 
-    exports: HashMap<String, ModuleExport>, code: Vec<Op> 
+    exports: HashMap<String, ModuleExport>, extern_functions: HashMap<String, HostSignature>, code: Vec<Op>
 }
 
-impl Default for Compiler { fn default() -> Self { Self { names: HashMap::new(), structs: HashMap::new(), methods: HashMap::new(), pending_method_calls: Vec::new(), current_method_fields: None, current_method_struct: None, module_root: None, module_artifacts: HashMap::new(), exports: HashMap::new(), code: Vec::new() } } }
+impl Default for Compiler { fn default() -> Self { Self { names: HashMap::new(), structs: HashMap::new(), methods: HashMap::new(), pending_method_calls: Vec::new(), current_method_fields: None, current_method_struct: None, module_root: None, module_artifacts: HashMap::new(), exports: HashMap::new(), extern_functions: HashMap::new(), code: Vec::new() } } }
 
 impl Compiler {
     fn with_module_root(module_root: PathBuf) -> Self { Self { module_root: Some(module_root), ..Self::default() } }
+    fn with_extern_functions(extern_functions: HashMap<String, HostSignature>) -> Self { Self { extern_functions, ..Self::default() } }
     
     fn compile(mut self, program: Vec<Statement>) -> Result<Vec<Op>, Error> { self.compile_program(program)?; Ok(self.code) }
     
@@ -672,7 +678,9 @@ impl Compiler {
         if let Some(module) = self.module_artifacts.get(&id) { return Ok(module.clone()); }
         let source = fs::read_to_string(&canonical).map_err(|error| Error::Runtime(format!("cannot read module '{requested}': {error}")))?;
         let program = Parser::new(lex(&source)?).program()?;
-        let module = Compiler::with_module_root(root.to_path_buf()).compile_module(id.clone(), program)?;
+        let mut module_compiler = Compiler::with_module_root(root.to_path_buf());
+        module_compiler.extern_functions = self.extern_functions.clone();
+        let module = module_compiler.compile_module(id.clone(), program)?;
         self.module_artifacts.insert(id, module.clone());
         Ok(module)
     }
@@ -819,7 +827,16 @@ impl Compiler {
                     self.code.push(Op::Builtin2(name, t1.clone()));
                     Ok(t1)
                 },
-                _ => Err(Error::Type(format!("unknown function '{}'", name)))
+                _ => {
+                    let signature = self.extern_functions.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown function '{name}'")))?;
+                    if args.len() != signature.arguments.len() { return Err(Error::Type(format!("{name} expects {} argument(s)", signature.arguments.len()))); }
+                    for (argument, expected_type) in args.into_iter().zip(signature.arguments.iter()) {
+                        let found = self.expr(argument, Some(expected_type))?;
+                        if found != *expected_type { return Err(Error::Type(format!("{name} argument is {found}; expected {expected_type}"))); }
+                    }
+                    self.code.push(Op::CallExternal(name, signature.arguments.len()));
+                    Ok(signature.result)
+                }
             }
         },
         Expr::Unary(op, inner) => {
@@ -870,6 +887,19 @@ fn is_integer(t: &Type) -> bool { matches!(t, Type::I8|Type::I16|Type::I32|Type:
 fn int_value(n: i128, ty: &Type) -> Result<Value, Error> { macro_rules! v { ($t:ident, $x:ident) => { n.try_into().map(Value::$t).map_err(|_| Error::Type(format!("{n} does not fit in {}", stringify!($x)))) }; } match ty { Type::I8=>v!(I8,i8),Type::I16=>v!(I16,i16),Type::I32=>v!(I32,i32),Type::I64=>v!(I64,i64),Type::U8=>v!(U8,u8),Type::U16=>v!(U16,u16),Type::U32=>v!(U32,u32),Type::U64=>v!(U64,u64), _=>Err(Error::Type(format!("integer literal cannot initialize {ty}"))) } }
 fn float_value(n: f64, ty: &Type) -> Value { match ty { Type::F16=>Value::F16(f32_to_f16(n as f32)),Type::F32=>Value::F32(n as f32),_=>Value::F64(n) } }
 
+pub type L0RustFunction = fn(&[Value]) -> Result<Value, Error>;
+
+#[derive(Clone)]
+enum ExternalFunction {
+    Rust(L0RustFunction),
+    C(L0CFunction),
+}
+
+#[derive(Clone)]
+struct RegisteredExternal { signature: HostSignature, function: ExternalFunction }
+
+struct FfiCall { arguments: Vec<Value>, results: Vec<Value> }
+
 struct ModuleInstance { artifact: ModuleArtifact, vm: Vm }
 pub struct Vm {
     stack: Vec<Value>,
@@ -878,18 +908,48 @@ pub struct Vm {
     interactive: bool,
     input: VecDeque<String>,
     modules: HashMap<String, ModuleInstance>,
+    extern_functions: HashMap<String, RegisteredExternal>,
     heap: Rc<RefCell<Heap>>,
     gc_owner: bool,
+    callback_state: Option<*mut L0State>,
 }
 
 impl Default for Vm {
     fn default() -> Self {
-        Self { stack: Vec::new(), locals: Vec::new(), output: Vec::new(), interactive: false, input: VecDeque::new(), modules: HashMap::new(), heap: Rc::new(RefCell::new(Heap::default())), gc_owner: true }
+        Self { stack: Vec::new(), locals: Vec::new(), output: Vec::new(), interactive: false, input: VecDeque::new(), modules: HashMap::new(), extern_functions: HashMap::new(), heap: Rc::new(RefCell::new(Heap::default())), gc_owner: true, callback_state: None }
     }
 }
 
 impl Vm {
-    fn with_shared_heap(heap: Rc<RefCell<Heap>>) -> Self { Self { heap, gc_owner: false, ..Self::default() } }
+    fn with_shared_heap(heap: Rc<RefCell<Heap>>, extern_functions: HashMap<String, RegisteredExternal>, callback_state: Option<*mut L0State>) -> Self { Self { heap, extern_functions, gc_owner: false, callback_state, ..Self::default() } }
+
+    pub fn register_rust_function(&mut self, name: impl Into<String>, arguments: Vec<Type>, result: Type, function: L0RustFunction) -> Result<(), Error> {
+        self.register_external(name.into(), HostSignature { arguments, result }, ExternalFunction::Rust(function))
+    }
+
+    /// Register a C ABI callback that takes `i32` arguments and returns one `i32`.
+    /// The callback reads arguments through `l0_to_i32` and pushes its result with
+    /// `l0_push_i32`; zero means success and any non-zero status aborts the call.
+    pub fn register_c_i32_function(&mut self, name: impl Into<String>, argument_count: usize, function: L0CFunction) -> Result<(), Error> {
+        self.register_external(name.into(), HostSignature { arguments: vec![Type::I32; argument_count], result: Type::I32 }, ExternalFunction::C(function))
+    }
+
+    fn register_external(&mut self, name: String, signature: HostSignature, function: ExternalFunction) -> Result<(), Error> {
+        if name.is_empty() { return Err(Error::Type("external function name cannot be empty".into())); }
+        if self.extern_functions.insert(name.clone(), RegisteredExternal { signature, function }).is_some() { return Err(Error::Type(format!("external function '{name}' is already registered"))); }
+        Ok(())
+    }
+
+    fn external_signatures(&self) -> HashMap<String, HostSignature> {
+        self.extern_functions.iter().map(|(name, registered)| (name.clone(), registered.signature.clone())).collect()
+    }
+
+    pub fn execute(&mut self, source: &str) -> Result<Vec<String>, Error> {
+        let program = Parser::new(lex(source)?).program()?;
+        let code = Compiler::with_extern_functions(self.external_signatures()).compile(program)?;
+        self.output.clear();
+        Ok(self.run(&code)?.to_vec())
+    }
 
     fn roots(&self) -> Vec<Value> {
         let mut roots = Vec::with_capacity(self.stack.len() + self.locals.len());
@@ -934,6 +994,31 @@ impl Vm {
         }
     }
 
+    fn call_external(&mut self, name: &str, argument_count: usize) -> Result<(), Error> {
+        let registered = self.extern_functions.get(name).cloned().ok_or_else(|| Error::Runtime(format!("external function '{name}' is not registered")))?;
+        if registered.signature.arguments.len() != argument_count || self.stack.len() < argument_count { return Err(Error::Runtime("external call stack invariant broken".into())); }
+        let base = self.stack.len() - argument_count;
+        for (value, expected) in self.stack[base..].iter().zip(registered.signature.arguments.iter()) {
+            if value.ty() != *expected { return Err(Error::Runtime(format!("external function '{name}' received an invalid argument type"))); }
+        }
+        let result = match registered.function {
+            ExternalFunction::Rust(function) => function(&self.stack[base..])?,
+            ExternalFunction::C(function) => {
+                let state = self.callback_state.ok_or_else(|| Error::Runtime(format!("C function '{name}' requires execution through L0State")))?;
+                unsafe { (*state).ffi_call = Some(FfiCall { arguments: self.stack[base..].to_vec(), results: Vec::new() }); }
+                let status = unsafe { function(state) };
+                let ffi_call = unsafe { (*state).ffi_call.take().ok_or_else(|| Error::Runtime("missing C call context".into()))? };
+                if status != 0 { self.stack.truncate(base); return Err(Error::Runtime(format!("C function '{name}' failed with status {status}"))); }
+                if ffi_call.results.len() != 1 { self.stack.truncate(base); return Err(Error::Runtime(format!("C function '{name}' must push exactly one result"))); }
+                ffi_call.results.into_iter().next().expect("checked external result")
+            },
+        };
+        if result.ty() != registered.signature.result { return Err(Error::Runtime(format!("external function '{name}' returned {}; expected {}", result.ty(), registered.signature.result))); }
+        self.stack.truncate(base);
+        self.stack.push(result);
+        Ok(())
+    }
+
     fn run(&mut self, code: &[Op]) -> Result<&[String], Error> { self.run_from(code, 0, false) }
     
     fn run_from(&mut self, code: &[Op], mut pc: usize, terminal_return: bool) -> Result<&[String], Error> { 
@@ -971,6 +1056,7 @@ impl Vm {
             Op::Unary(op, ty) => { let val = self.pop()?; self.stack.push(evaluate_unary(val, op, ty)?); },
             Op::Builtin1(name, _ty) => { let arg = self.pop()?; self.stack.push(evaluate_builtin1(name, arg)?); },
             Op::Builtin2(name, ty) => { let arg2 = self.pop()?; let arg1 = self.pop()?; self.stack.push(evaluate_builtin2(name, arg1, arg2, ty)?); },
+            Op::CallExternal(name, argument_count) => self.call_external(name, *argument_count)?,
             Op::JumpIfFalse(target) => { match self.pop()? { Value::Bool(false) => { pc = *target; continue; }, Value::Bool(true) => {}, _ => return Err(Error::Runtime("VM condition invariant broken".into())), } },
             Op::Jump(target) => { pc = *target; continue; },
             Op::CallMethod(receiver, target) => { call_stack.push((pc + 1, current_receiver)); current_receiver = Some(*receiver); pc = *target; continue; },
@@ -1010,7 +1096,7 @@ impl Vm {
     fn load_module(&mut self, artifact: ModuleArtifact) -> Result<(), Error> {
         let id = artifact.id.clone();
         if !self.modules.contains_key(&id) {
-            let mut vm = Vm::with_shared_heap(self.heap.clone());
+            let mut vm = Vm::with_shared_heap(self.heap.clone(), self.extern_functions.clone(), self.callback_state);
             vm.run(&artifact.code)?;
             let output = std::mem::take(&mut vm.output);
             self.modules.insert(id.clone(), ModuleInstance { artifact, vm });
@@ -1285,19 +1371,38 @@ pub fn execute_file(path: impl AsRef<Path>) -> Result<Vec<String>, Error> { let 
 pub fn execute_interactive_file(path: impl AsRef<Path>) -> Result<(), Error> { let path = fs::canonicalize(path.as_ref()).map_err(|error| Error::Runtime(format!("cannot open source file: {error}")))?; let root = path.parent().ok_or_else(|| Error::Runtime("source file has no parent directory".into()))?.to_path_buf(); let source = fs::read_to_string(&path).map_err(|error| Error::Runtime(format!("cannot read source file: {error}")))?; let program = Parser::new(lex(&source)?).program()?; let code = Compiler::with_module_root(root).compile(program)?; let mut vm = Vm { interactive: true, ..Vm::default() }; vm.run(&code)?; Ok(()) }
 
 /// Opaque C ABI state. Only this crate may access its interior.
-#[repr(C)] pub struct L0State { vm: Vm }
+#[repr(C)] pub struct L0State { vm: Vm, ffi_call: Option<FfiCall> }
 pub type L0CFunction = unsafe extern "C" fn(*mut L0State) -> c_int;
 #[no_mangle] pub extern "C" fn l0_abi_version() -> u32 { ABI_VERSION }
-#[no_mangle] pub extern "C" fn l0_new_state() -> *mut L0State { Box::into_raw(Box::new(L0State { vm: Vm::default() })) }
+#[no_mangle] pub extern "C" fn l0_new_state() -> *mut L0State { Box::into_raw(Box::new(L0State { vm: Vm::default(), ffi_call: None })) }
 /// # Safety
 /// `state` must have been returned by `l0_new_state` and not freed already.
 #[no_mangle] pub unsafe extern "C" fn l0_free_state(state: *mut L0State) { if !state.is_null() { drop(Box::from_raw(state)); } }
 /// # Safety
+/// `state` must be valid and `name` must be a NUL-terminated UTF-8 string.
+#[no_mangle] pub unsafe extern "C" fn l0_register_i32_function(state: *mut L0State, name: *const std::os::raw::c_char, function: L0CFunction, argument_count: usize) -> c_int {
+    let Some(state) = state.as_mut() else { return 0 };
+    if name.is_null() { return 0; }
+    let Ok(name) = CStr::from_ptr(name).to_str() else { return 0; };
+    match state.vm.register_c_i32_function(name, argument_count, function) { Ok(()) => 1, Err(_) => 0 }
+}
+/// # Safety
+/// `state` must be valid and `source` must be a NUL-terminated UTF-8 L0 unit.
+#[no_mangle] pub unsafe extern "C" fn l0_execute(state: *mut L0State, source: *const std::os::raw::c_char) -> c_int {
+    let Some(state_ref) = state.as_mut() else { return 0 };
+    if source.is_null() { return 0; }
+    let Ok(source) = CStr::from_ptr(source).to_str() else { return 0; };
+    let previous_state = state_ref.vm.callback_state.replace(state);
+    let result = state_ref.vm.execute(source);
+    state_ref.vm.callback_state = previous_state;
+    if result.is_ok() { 1 } else { 0 }
+}
+/// # Safety
 /// `state` must be a valid L0 state.
-#[no_mangle] pub unsafe extern "C" fn l0_push_i32(state: *mut L0State, value: i32) { if let Some(s) = state.as_mut() { s.vm.stack.push(Value::I32(value)); } }
+#[no_mangle] pub unsafe extern "C" fn l0_push_i32(state: *mut L0State, value: i32) { if let Some(s) = state.as_mut() { if let Some(call) = s.ffi_call.as_mut() { call.results.push(Value::I32(value)); } else { s.vm.stack.push(Value::I32(value)); } } }
 /// # Safety
 /// `state` must be valid. Returns 1 on success and 0 if the top value is not i32.
-#[no_mangle] pub unsafe extern "C" fn l0_to_i32(state: *mut L0State, index: usize, out: *mut i32) -> c_int { let Some(s)=state.as_ref() else{return 0}; let Some(Value::I32(v))=s.vm.stack.get(index) else{return 0}; if out.is_null(){return 0}; *out=*v; 1 }
+#[no_mangle] pub unsafe extern "C" fn l0_to_i32(state: *mut L0State, index: usize, out: *mut i32) -> c_int { let Some(s)=state.as_ref() else{return 0}; let value=if let Some(call)=s.ffi_call.as_ref(){call.arguments.get(index)}else{s.vm.stack.get(index)}; let Some(Value::I32(v))=value else{return 0}; if out.is_null(){return 0}; *out=*v; 1 }
 
 // IEEE binary16 conversion, dependency-free so the language's f16 type is portable.
 pub fn f32_to_f16(value: f32) -> u16 { let bits=value.to_bits(); let sign=((bits>>16)&0x8000) as u16; let exp=((bits>>23)&0xff) as i32-127+15; let mant=bits&0x7fffff; if exp<=0 { if exp < -10{return sign}; return sign|(((mant|0x800000)>>(14-exp)) as u16); } if exp>=31 { return sign|0x7c00|if mant==0{0}else{1}; } sign|((exp as u16)<<10)|((mant>>13) as u16) }
@@ -1468,6 +1573,35 @@ mod tests {
     fn heap_strings_keep_print_and_printf_semantics() {
         let source = "let greeting: string = \"hello\"; print(greeting); printf(\"{} {}\", greeting, 7);";
         assert_eq!(execute(source).unwrap(), ["hello", "hello 7"]);
+    }
+
+    fn rust_add(arguments: &[Value]) -> Result<Value, Error> {
+        let [Value::I32(left), Value::I32(right)] = arguments else { return Err(Error::Runtime("unexpected host arguments".into())); };
+        Ok(Value::I32(left + right))
+    }
+
+    #[test]
+    fn registered_rust_function_is_callable_from_l0() {
+        let mut vm = Vm::default();
+        vm.register_rust_function("host_add", vec![Type::I32, Type::I32], Type::I32, rust_add).unwrap();
+        assert_eq!(vm.execute("let total: i32 = host_add(20, 22); print(total);").unwrap(), ["42"]);
+    }
+
+    unsafe extern "C" fn c_add(state: *mut L0State) -> c_int {
+        let mut left = 0;
+        let mut right = 0;
+        if l0_to_i32(state, 0, &mut left) == 0 || l0_to_i32(state, 1, &mut right) == 0 { return 1; }
+        l0_push_i32(state, left + right);
+        0
+    }
+
+    #[test]
+    fn registered_c_function_is_callable_from_l0() {
+        let mut state = L0State { vm: Vm::default(), ffi_call: None };
+        assert_eq!(state.vm.register_c_i32_function("c_add", 2, c_add), Ok(()));
+        let source = b"let total: i32 = c_add(10, 32); print(total);\0";
+        assert_eq!(unsafe { l0_execute(&mut state, source.as_ptr().cast()) }, 1);
+        assert_eq!(state.vm.output, ["42"]);
     }
 
     #[test]
