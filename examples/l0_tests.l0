@@ -1,0 +1,196 @@
+-- examples/l0_tests.l0
+-- Набор тестов виртуальной машины L0, перенесенных из src/lib.rs
+
+printf("=== RUN   typed_stack_vm_and_zero_index\n")
+let a: i8 = 7
+let b: i8 = 5
+let v: vector<i32> = [10, 20, 30]
+print(a + b)
+print(v[0])
+print(v[2])
+
+printf("\n=== RUN   inline_struct_methods_can_read_and_update_their_fields\n")
+struct Board1 {
+    size: i8;
+    function show_board()
+        print(size)
+        size = size + 1
+        print(size)
+    end
+}
+let board1: Board1 = Board1 { size = 3 }
+board1.show_board()
+print(board1.size)
+
+printf("\n=== RUN   declared_methods_can_be_defined_outside_the_struct\n")
+let size_global: i8 = 9
+struct Board2 {
+    size: i8;
+    function show_board()
+}
+function Board2::show_board()
+    print(size)
+    size = size + 1
+end
+let board2: Board2 = Board2 { size = 3 }
+board2.show_board()
+print(board2.size)
+print(size_global)
+
+printf("\n=== RUN   method_fields_hide_same_named_outer_variables\n")
+let size_outer: i8 = 9
+struct Board3 {
+    size: i8;
+    function show_board()
+        print(size)
+    end
+}
+let board3: Board3 = Board3 { size = 3 }
+board3.show_board()
+print(size_outer)
+
+printf("\n=== RUN   this_calls_methods_on_the_current_instance\n")
+struct Board4 {
+    size: i8;
+    function play()
+        this.increment()
+        this.increment()
+        print(this.size)
+    end
+    function increment()
+        size = size + 1
+    end
+}
+let board4: Board4 = Board4 { size = 3 }
+board4.play()
+print(board4.size)
+
+printf("\n=== RUN   parenthesized_expressions_work\n")
+let a_paren: i32 = 2
+print((a_paren + 2))
+
+printf("\n=== RUN   logical_operators_short_circuit_their_right_hand_side\n")
+let yes: bool = 1 == 1
+let no: bool = 1 == 0
+print(yes || [1][9] == 1)
+print(no && [1][9] == 1)
+
+printf("\n=== RUN   range_for_break_and_continue_work\n")
+let total: i32 = 0
+for i = 0, 5 do
+    if i == 2 then continue end
+    total = total + i
+    if i == 4 then break end
+end
+print(total)
+
+printf("\n=== RUN   len_string_concatenation_and_inferred_arrays_work\n")
+let values: vector<i32> = [1, 2, 3]
+let message: string = "value=" + "3"
+print(len(values))
+print([4, 5][1])
+print(message)
+
+printf("\n=== RUN   vector_syntax_and_mutation_work\n")
+let a_vec: vector<u16> = [1, 258]
+a_vec[0] = 513
+let b_vec: vector<f32> = [1.5, 2.5]
+print(a_vec[0])
+print(a_vec[1])
+print(b_vec[1])
+
+printf("\n=== RUN   cpu_tensors_support_typed_factories_and_multidimensional_indexing\n")
+let weights: tensor<f32, 2> = zeros<f32>([2, 3])
+weights[0, 2] = 0.99
+let alias: tensor<f32, 2> = weights
+alias[1, 0] = 2.5
+print(weights[0, 2])
+print(weights[1, 0])
+print(weights)
+
+printf("\n=== RUN   cpu_tensor_random_factory_and_shape_validation_work\n")
+let rand_values: tensor<f64, 1> = random<f64>([4])
+print(rand_values[0] >= 0.0 && rand_values[0] < 1.0)
+
+printf("\n=== RUN   tables_support_numeric_and_named_keys_with_one_value_type\n")
+let t_board: table<i8> = table { [0] = 1, [4] = 2, winner = 0 }
+t_board[8] = 1
+t_board.winner = 1
+print(t_board[0])
+print(t_board[4])
+print(t_board[8])
+print(t_board.winner)
+
+printf("\n=== RUN   structs_support_scalar_and_vector_fields\n")
+let ready: bool = 1 == 1
+struct Sample {
+    signed: i16;
+    unsigned: u32;
+    half: f16;
+    full: f64;
+    ready: bool;
+}
+let item: Sample = Sample { full = 2.5, unsigned = 70000, signed = -3, ready = ready, half = 1.5 }
+item.signed = -9
+print(item.signed)
+print(item.unsigned)
+print(item.half)
+print(item.full)
+print(item.ready)
+
+printf("\n=== RUN   structs_can_hold_and_replace_vectors\n")
+struct Board5 {
+    cells: vector<i8>;
+    score: i8;
+    function show()
+        print(cells[1])
+        print(this.cells[2])
+    end
+}
+let board5: Board5 = Board5 { score = 1, cells = [3, 4, 5] }
+board5.show()
+board5.cells[0] = 8
+board5.cells = [9, 10, 11]
+print(board5.cells[0])
+
+printf("\n=== RUN   complex_values_are_shared_by_heap_reference\n")
+struct Counter { value: i32; }
+let first: Counter = Counter { value = 1 }
+let second: Counter = first
+second.value = 9
+print(first.value)
+
+printf("\n=== RUN   vectors_are_shared_by_heap_reference\n")
+let first_vec: vector<i32> = [1, 2]
+let second_vec: vector<i32> = first_vec
+second_vec[0] = 9
+print(first_vec[0])
+
+printf("\n=== RUN   heap_strings_keep_print_and_printf_semantics\n")
+let greeting2: string = "hello"
+print(greeting2)
+printf("{} {}\n", greeting2, 7)
+
+printf("\n--- Успешные тесты завершены ---\n\n")
+
+-- =========================================================================
+-- ТЕСТЫ, КОТОРЫЕ НЕВОЗМОЖНО ВЫПОЛНИТЬ В ОБЩЕМ ФАЙЛЕ ИЛИ БЕЗ ХОСТА
+-- =========================================================================
+
+-- 1. Ожидаемые ошибки (VM падает при их выполнении):
+-- print(this) 
+-- this.run()
+-- struct BadBoard { size: i8; function show_board(x) end }
+-- let t: table<i8> = table { score = 1 }; t.score = 300
+-- let x_ovf: u8 = 300
+
+-- 2. Интерактивный ввод (требует stdin, повиснет в скрипте):
+-- let move: i8 = input; let weight: f32 = input; print(move); print(weight);
+
+-- 3. Вызовы Host (Rust/C) API (требуют регистрации через `register_rust_function`):
+-- let total1: i32 = host_add(20, 22); print(total1);
+-- let total2: i32 = c_add(10, 32); print(total2);
+-- let d: f32 = calc_dist(100.5, 1 == 1); print(d);
+
+-- 4. Внешние модули:
+-- let game: module = require("game"); game.init();
