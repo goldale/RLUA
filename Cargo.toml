@@ -11,6 +11,10 @@ crate-type = ["rlib", "cdylib"]
 name = "l0"
 path = "src/main.rs"
 
+[[example]]
+name = "rust_host"
+path = "examples/host_functions/rust_host.rs"
+
 [profile.release]
 lto = true
 codegen-units = 1
