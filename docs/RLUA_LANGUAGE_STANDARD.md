@@ -53,10 +53,18 @@ let board: game.Board = game.Board { cells = [0, 0, 0] }
 
 The first module slice exports a structure's data layout. Cross-module member method dispatch for exported structures is reserved for the next object-model revision; declare behaviour as an exported module procedure in the meantime.
 
+## Host functions
+
+The host can register a function before compiling a source unit. Its argument and result types become part of compilation, so a call from L0 is checked just like a built-in function and compiled to an external-call opcode.
+
+Rust hosts use `Vm::register_rust_function(name, argument_types, result_type, callback)` and then `vm.execute(source)`. The callback receives the typed L0 values and returns one typed value.
+
+The C ABI provides the same path for `i32` functions: call `l0_register_i32_function`, then `l0_execute`. During the callback, `l0_to_i32(state, 0, ...)` and subsequent indices read the call arguments; the callback must push exactly one `i32` result with `l0_push_i32` and return zero. A non-zero return status aborts the L0 call.
+
 ## Runtime roadmap
 
 1. **Current stage:** typed vector fields in structures and cached filesystem modules with explicit exports.
 2. **Current runtime layer — garbage collector:** vectors, tables, structures, and strings are heap objects addressed by stable `HeapRef` handles, so copying a `Value` preserves object identity instead of copying its payload. Loaded module VMs are long-lived roots. The non-moving mark-and-sweep arena traces the operand stack, local slots, and those module roots; collection runs automatically after an allocation threshold and can also be requested explicitly through `Vm::collect_garbage()`. This makes cycles collectible without reference counting.
-3. **Later stage:** strings, richer module interfaces, cross-module struct method dispatch, parameter and return-value design, and standard libraries.
+3. **Later stage:** extend the C callback helpers beyond `i32`, add richer module interfaces, cross-module struct method dispatch, parameter and return-value design, and standard libraries.
 
 The GC stage must preserve the observable semantics above and collect cyclic tables and structures only when they become unreachable from all roots.
