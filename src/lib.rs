@@ -127,19 +127,44 @@ pub struct HeapSlot { pub marked: bool, pub object: HeapObject }
 pub struct Heap {
     pub slots: Vec<Option<HeapSlot>>,
     pub free: Vec<usize>,
-    pub allocations_since_collection: usize,
-    pub threshold: usize,
+    /// Estimated bytes owned by live heap objects. This is deliberately based
+    /// on payload capacity rather than object count, since one tensor can be
+    /// substantially larger than many small objects.
+    pub allocated_bytes: usize,
+    pub threshold_bytes: usize,
 }
 
 impl Default for Heap {
-    fn default() -> Self { Self { slots: Vec::new(), free: Vec::new(), allocations_since_collection: 0, threshold: 64 } }
+    fn default() -> Self {
+        Self {
+            slots: Vec::new(),
+            free: Vec::new(),
+            allocated_bytes: 0,
+            threshold_bytes: 64 * 1024,
+        }
+    }
 }
 
 impl Heap {
+    fn object_size(object: &HeapObject) -> usize {
+        use std::mem::size_of;
+
+        size_of::<HeapSlot>() + match object {
+            HeapObject::Array { bytes, .. } | HeapObject::Tensor { bytes, .. } => bytes.capacity(),
+            HeapObject::String(text) => text.capacity(),
+            HeapObject::Table { entries, .. } => entries.capacity() * size_of::<(TableKey, Value)>(),
+            HeapObject::Struct { values, layout } => {
+                values.capacity() * size_of::<Value>()
+                    + layout.fields.capacity() * size_of::<StructField>()
+                    + layout.name.capacity()
+            },
+        }
+    }
+
     pub fn allocate(&mut self, object: HeapObject) -> HeapRef {
+        self.allocated_bytes = self.allocated_bytes.saturating_add(Self::object_size(&object));
         let index = self.free.pop().unwrap_or_else(|| { self.slots.push(None); self.slots.len() - 1 });
         self.slots[index] = Some(HeapSlot { marked: false, object });
-        self.allocations_since_collection += 1;
         HeapRef(index)
     }
 
@@ -151,24 +176,32 @@ impl Heap {
         self.slots.get_mut(reference.0).and_then(Option::as_mut).map(|slot| &mut slot.object).ok_or_else(|| Error::Runtime("dangling heap reference".into()))
     }
 
+    fn heap_ref(value: &Value) -> Option<HeapRef> {
+        match value {
+            Value::Array(reference, _) | Value::Tensor(reference, _, _) | Value::String(reference)
+            | Value::Table(reference, _) | Value::Struct(reference, _) => Some(*reference),
+            _ => None,
+        }
+    }
+
     fn mark_value(&mut self, value: &Value) {
+        let Some(reference) = Self::heap_ref(value) else { return };
         // Heap graphs can be arbitrarily deep. Mark iteratively so a valid
-        // script cannot exhaust the host thread stack during collection.
-        let mut work = vec![value.clone()];
-        while let Some(value) = work.pop() {
-            let reference = match value {
-                Value::Array(r, _) | Value::Tensor(r, _, _) | Value::String(r)
-                | Value::Table(r, _) | Value::Struct(r, _) => r,
-                _ => continue,
+        // script cannot exhaust the host thread stack during collection. The
+        // worklist contains only compact HeapRef values, not cloned Values.
+        let mut work = vec![reference];
+        while let Some(reference) = work.pop() {
+            let children = {
+                let Some(slot) = self.slots.get_mut(reference.0).and_then(Option::as_mut) else { continue };
+                if slot.marked { continue; }
+                slot.marked = true;
+                match &slot.object {
+                    HeapObject::Table { entries, .. } => entries.values().filter_map(Self::heap_ref).collect::<Vec<_>>(),
+                    HeapObject::Struct { values, .. } => values.iter().filter_map(Self::heap_ref).collect::<Vec<_>>(),
+                    HeapObject::Array { .. } | HeapObject::Tensor { .. } | HeapObject::String(_) => Vec::new(),
+                }
             };
-            let Some(slot) = self.slots.get_mut(reference.0).and_then(Option::as_mut) else { continue };
-            if slot.marked { continue; }
-            slot.marked = true;
-            match &slot.object {
-                HeapObject::Table { entries, .. } => work.extend(entries.values().cloned()),
-                HeapObject::Struct { values, .. } => work.extend(values.iter().cloned()),
-                HeapObject::Array { .. } | HeapObject::Tensor { .. } | HeapObject::String(_) => {}
-            }
+            work.extend(children);
         }
     }
     fn collect(&mut self, roots: impl IntoIterator<Item = Value>) -> usize {
@@ -176,13 +209,19 @@ impl Heap {
         let mut reclaimed = 0;
         for (index, slot) in self.slots.iter_mut().enumerate() {
             let Some(live) = slot.as_mut() else { continue };
-            if live.marked { live.marked = false; } else { *slot = None; self.free.push(index); reclaimed += 1; }
+            if live.marked {
+                live.marked = false;
+            } else {
+                self.allocated_bytes = self.allocated_bytes.saturating_sub(Self::object_size(&live.object));
+                *slot = None;
+                self.free.push(index);
+                reclaimed += 1;
+            }
         }
-        self.allocations_since_collection = 0;
-        self.threshold = (self.slots.len().max(64) * 2).max(64);
+        self.threshold_bytes = self.allocated_bytes.saturating_mul(2).max(64 * 1024);
         reclaimed
     }
-    fn should_collect(&self) -> bool { self.allocations_since_collection >= self.threshold }
+    fn should_collect(&self) -> bool { self.allocated_bytes >= self.threshold_bytes }
 }
 
 fn table_key_display(key: &TableKey) -> String { match key { TableKey::Index(index) => format!("[{index}]"), TableKey::Name(name) => name.to_string() } }
@@ -755,7 +794,7 @@ enum BinaryOp {
 }
 
 #[derive(Clone, Debug)]
-struct ModuleArtifact { id: String, code: Vec<Op>, exports: HashMap<String, ModuleExport> }
+struct ModuleArtifact { id: String, code: Rc<[Op]>, exports: HashMap<String, ModuleExport> }
 
 #[derive(Clone, Debug)]
 struct HostSignature { arguments: Vec<Type>, result: Type }
@@ -770,11 +809,40 @@ enum Op {
     StoreCurrentField(StructField), MakeArray(usize, Type), MakeTable(Vec<TableEntry>, Type), MakeStruct(StructLayout),
     MakeTensor(TensorInit, Type, usize), Index, TensorIndex(Type, usize), TensorIndexF32(usize), TableIndex, Field(StructField), TableField(Rc<str>), ModuleField(String),
     Binary(BinaryOp), Unary(UnOp, Type), Len, ConcatString,
-    Builtin1(String, Type), Builtin2(String, Type),
+    Builtin1(BuiltinFn, Type), Builtin2(BuiltinFn, Type),
     CallExternal(String, usize),
     JumpIfFalse(usize), Jump(usize), JumpIfFalseKeep(usize), JumpIfTrueKeep(usize),
     CallMethod(usize, usize), CallCurrentMethod(usize), CallModule(usize, String),
     Return, Print, Printf(usize), Putc
+}
+
+/// Built-ins are resolved during compilation. Keeping their identity in the
+/// opcode avoids retaining and repeatedly comparing function-name strings in
+/// the VM's hot loop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BuiltinFn {
+    Sqrt, Sin, Cos, Tan, Asin, Acos, Atan, Floor, Ceil, Round, Abs,
+    Pow, Min, Max, Atan2,
+}
+
+impl BuiltinFn {
+    fn unary(name: &str) -> Option<Self> {
+        Some(match name {
+            "sqrt" => Self::Sqrt, "sin" => Self::Sin, "cos" => Self::Cos,
+            "tan" => Self::Tan, "asin" => Self::Asin, "acos" => Self::Acos,
+            "atan" => Self::Atan, "floor" => Self::Floor, "ceil" => Self::Ceil,
+            "round" => Self::Round, "abs" => Self::Abs,
+            _ => return None,
+        })
+    }
+
+    fn binary(name: &str) -> Option<Self> {
+        Some(match name {
+            "pow" => Self::Pow, "min" => Self::Min, "max" => Self::Max,
+            "atan2" => Self::Atan2,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -835,7 +903,7 @@ impl Compiler {
 
     fn compile(mut self, program: Vec<Statement>) -> Result<Vec<Op>, Error> { self.compile_program(program)?; Ok(self.code) }
 
-    fn compile_module(mut self, id: String, program: Vec<Statement>) -> Result<ModuleArtifact, Error> { self.compile_program(program)?; Ok(ModuleArtifact { id, code: self.code, exports: self.exports }) }
+    fn compile_module(mut self, id: String, program: Vec<Statement>) -> Result<ModuleArtifact, Error> { self.compile_program(program)?; Ok(ModuleArtifact { id, code: self.code.into(), exports: self.exports }) }
 
     fn compile_program(&mut self, program: Vec<Statement>) -> Result<(), Error> {
         for s in program { self.statement(s)?; }
@@ -1169,7 +1237,7 @@ impl Compiler {
                     let arg = args.remove(0);
                     let ty = self.expr(arg, expected)?;
                     if !matches!(ty, Type::F16 | Type::F32 | Type::F64) { return Err(Error::Type(format!("{} requires a float argument, got {}", name, ty))); }
-                    self.code.push(Op::Builtin1(name, ty.clone()));
+                    self.code.push(Op::Builtin1(BuiltinFn::unary(&name).expect("known unary built-in"), ty.clone()));
                     Ok(ty)
                 },
                 "abs" => {
@@ -1177,7 +1245,7 @@ impl Compiler {
                     let arg = args.remove(0);
                     let ty = self.expr(arg, expected)?;
                     if !is_numeric(&ty) { return Err(Error::Type("abs requires a numeric argument".into())); }
-                    self.code.push(Op::Builtin1(name, ty.clone()));
+                    self.code.push(Op::Builtin1(BuiltinFn::unary(&name).expect("known unary built-in"), ty.clone()));
                     Ok(ty)
                 },
                 "pow" | "min" | "max" | "atan2" => {
@@ -1188,7 +1256,7 @@ impl Compiler {
                     let t2 = self.expr(arg2, Some(&t1))?;
                     if !types_compatible(&t1, &t2) { return Err(Error::Type(format!("{} arguments must have same type", name))); }
                     if name == "atan2" && !matches!(t1, Type::F16 | Type::F32 | Type::F64) { return Err(Error::Type("atan2 requires float arguments".into())); }
-                    self.code.push(Op::Builtin2(name, t1.clone()));
+                    self.code.push(Op::Builtin2(BuiltinFn::binary(&name).expect("known binary built-in"), t1.clone()));
                     Ok(t1)
                 },
                 _ => {
@@ -1292,7 +1360,19 @@ fn types_compatible(expected: &Type, found: &Type) -> bool { expected == found |
 fn is_numeric(t: &Type) -> bool { !matches!(t, Type::Bool|Type::String|Type::Array(_)|Type::Tensor(_, _)|Type::Table(_)|Type::Struct(_)|Type::Module(_)) }
 fn is_integer(t: &Type) -> bool { matches!(t, Type::I8|Type::I16|Type::I32|Type::I64|Type::U8|Type::U16|Type::U32|Type::U64) }
 
-fn int_value(n: i128, ty: &Type) -> Result<Value, Error> { macro_rules! v { ($t:ident, $x:ident) => { n.try_into().map(Value::$t).map_err(|_| Error::Type(format!("{n} does not fit in {}", stringify!($x)))) }; } match ty { Type::I8=>v!(I8,i8),Type::I16=>v!(I16,i16),Type::I32=>v!(I32,i32),Type::I64=>v!(I64,i64),Type::U8=>v!(U8,u8),Type::U16=>v!(U16,u16),Type::U32=>v!(U32,u32),Type::U64=>v!(U64,u64), _=>Err(Error::Type(format!("integer literal cannot initialize {ty}"))) } }
+fn int_value(n: i128, ty: &Type) -> Result<Value, Error> {
+    match ty {
+        Type::I8 => i8::try_from(n).map(Value::I8).map_err(|_| Error::Type(format!("{n} does not fit in i8"))),
+        Type::I16 => i16::try_from(n).map(Value::I16).map_err(|_| Error::Type(format!("{n} does not fit in i16"))),
+        Type::I32 => i32::try_from(n).map(Value::I32).map_err(|_| Error::Type(format!("{n} does not fit in i32"))),
+        Type::I64 => i64::try_from(n).map(Value::I64).map_err(|_| Error::Type(format!("{n} does not fit in i64"))),
+        Type::U8 => u8::try_from(n).map(Value::U8).map_err(|_| Error::Type(format!("{n} does not fit in u8"))),
+        Type::U16 => u16::try_from(n).map(Value::U16).map_err(|_| Error::Type(format!("{n} does not fit in u16"))),
+        Type::U32 => u32::try_from(n).map(Value::U32).map_err(|_| Error::Type(format!("{n} does not fit in u32"))),
+        Type::U64 => u64::try_from(n).map(Value::U64).map_err(|_| Error::Type(format!("{n} does not fit in u64"))),
+        _ => Err(Error::Type(format!("integer literal cannot initialize {ty}"))),
+    }
+}
 fn float_value(n: f64, ty: &Type) -> Value { match ty { Type::F16=>Value::F16(f32_to_f16(n as f32)),Type::F32=>Value::F32(n as f32),_=>Value::F64(n) } }
 
 pub type L0RustFunction = fn(&[Value], &RefCell<Heap>) -> Result<Value, Error>;
@@ -1361,6 +1441,30 @@ impl Vm {
         Ok(self.run(&code)?.to_vec())
     }
 
+    /// Queue one line for the next `input` expression. This makes input-driven
+    /// programs deterministic in tests and embedding applications.
+    pub fn push_input(&mut self, data: String) {
+        self.input.push_back(data);
+    }
+
+    /// Execute a source file while retaining this VM's registered host
+    /// functions. Relative `require` paths are resolved from the source file.
+    pub fn execute_file(&mut self, path: impl AsRef<Path>) -> Result<Vec<String>, Error> {
+        let path = fs::canonicalize(path.as_ref())
+            .map_err(|error| Error::Runtime(format!("cannot open source file: {error}")))?;
+        let root = path.parent()
+            .ok_or_else(|| Error::Runtime("source file has no parent directory".into()))?
+            .to_path_buf();
+        let source = fs::read_to_string(&path)
+            .map_err(|error| Error::Runtime(format!("cannot read source file: {error}")))?;
+        let program = Parser::new(lex(&source)?).program()?;
+        let mut compiler = Compiler::with_module_root(root);
+        compiler.extern_functions = self.external_signatures();
+        let code = compiler.compile(program)?;
+        self.output.clear();
+        Ok(self.run(&code)?.to_vec())
+    }
+
     fn roots(&self) -> Vec<Value> {
         let mut roots = Vec::with_capacity(self.stack_ptr + self.locals.len());
         roots.extend(self.stack[..self.stack_ptr].iter().cloned());
@@ -1419,21 +1523,20 @@ impl Vm {
     fn make_tensor_bytes(&mut self, init: TensorInit, element: &Type, shape: &[usize]) -> Result<Vec<u8>, Error> {
         let element_size = scalar_size(element)?;
         let count = shape.iter().try_fold(1usize, |count, dimension| count.checked_mul(*dimension)).ok_or_else(|| Error::Runtime("tensor is too large".into()))?;
-        let mut bytes = Vec::with_capacity(count.checked_mul(element_size).ok_or_else(|| Error::Runtime("tensor is too large".into()))?);
+        let total_bytes = count.checked_mul(element_size).ok_or_else(|| Error::Runtime("tensor is too large".into()))?;
+        if matches!(init, TensorInit::Zeros) {
+            return Ok(vec![0; total_bytes]);
+        }
+        let mut bytes = Vec::with_capacity(total_bytes);
         for _ in 0..count {
             let value = match init {
-                TensorInit::Zeros => match element {
-                    Type::I8 => Value::I8(0), Type::I16 => Value::I16(0), Type::I32 => Value::I32(0), Type::I64 => Value::I64(0),
-                    Type::U8 => Value::U8(0), Type::U16 => Value::U16(0), Type::U32 => Value::U32(0), Type::U64 => Value::U64(0),
-                    Type::F16 => Value::F16(0), Type::F32 => Value::F32(0.0), Type::F64 => Value::F64(0.0), Type::Bool => Value::Bool(false),
-                    _ => return Err(Error::Runtime("tensor element invariant broken".into())),
-                },
                 TensorInit::Random => match element {
                     Type::F16 => Value::F16(f32_to_f16(self.next_random_unit() as f32)),
                     Type::F32 => Value::F32(self.next_random_unit() as f32),
                     Type::F64 => Value::F64(self.next_random_unit()),
                     _ => return Err(Error::Runtime("random tensor element invariant broken".into())),
                 },
+                TensorInit::Zeros => unreachable!("zero tensors return before scalar encoding"),
             };
             encode_scalar(&value, element, &mut bytes)?;
         }
@@ -1680,8 +1783,8 @@ impl Vm {
                 self.push(Value::String(reference));
                 self.collect_if_needed();
             },
-            Op::Builtin1(name, _ty) => { let arg = self.pop()?; self.push(evaluate_builtin1(name, arg)?); },
-            Op::Builtin2(name, ty) => { let arg2 = self.pop()?; let arg1 = self.pop()?; self.push(evaluate_builtin2(name, arg1, arg2, ty)?); },
+            Op::Builtin1(name, _ty) => { let arg = self.pop()?; self.push(evaluate_builtin1(*name, arg)?); },
+            Op::Builtin2(name, ty) => { let arg2 = self.pop()?; let arg1 = self.pop()?; self.push(evaluate_builtin2(*name, arg1, arg2, ty)?); },
             Op::CallExternal(name, argument_count) => self.call_external(name, *argument_count)?,
             Op::JumpIfFalse(target) => { match self.pop()? { Value::Bool(false) => { pc = *target; continue; }, Value::Bool(true) => {}, _ => return Err(Error::Runtime("VM condition invariant broken".into())), } },
             Op::Jump(target) => { pc = *target; continue; },
@@ -1735,7 +1838,10 @@ impl Vm {
             },
             Op::Putc => {
                 let value = self.pop()?;
-                let c = match integer_to_usize(&value) { Ok(v) => v as u8 as char, _ => '?' };
+                let c = u32::try_from(integer_to_usize(&value)?)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .unwrap_or('?');
                 if self.interactive { print!("{c}"); let _ = std::io::stdout().flush(); }
             },
         } pc += 1; } Ok(&self.output)
@@ -1818,8 +1924,8 @@ impl Vm {
 
 fn integer_to_usize(v: &Value) -> Result<usize, Error> { match v { Value::I8(x) if *x>=0 => Ok(*x as usize),Value::I16(x) if *x>=0 => Ok(*x as usize),Value::I32(x) if *x>=0 => Ok(*x as usize),Value::I64(x) if *x>=0 => Ok(*x as usize),Value::U8(x)=>Ok(*x as usize),Value::U16(x)=>Ok(*x as usize),Value::U32(x)=>Ok(*x as usize),Value::U64(x)=>usize::try_from(*x).map_err(|_|Error::Runtime("array index too large".into())),_=>Err(Error::Runtime("array index must be non-negative integer".into())) } }
 
-fn evaluate_builtin1(name: &str, arg: Value) -> Result<Value, Error> {
-    if name == "abs" {
+fn evaluate_builtin1(builtin: BuiltinFn, arg: Value) -> Result<Value, Error> {
+    if builtin == BuiltinFn::Abs {
         match arg {
             Value::I8(v) => return v.checked_abs().map(Value::I8).ok_or_else(|| Error::Runtime("abs overflow".into())),
             Value::I16(v) => return v.checked_abs().map(Value::I16).ok_or_else(|| Error::Runtime("abs overflow".into())),
@@ -1836,12 +1942,12 @@ fn evaluate_builtin1(name: &str, arg: Value) -> Result<Value, Error> {
         ($v:ident, $typecast:ty, $variant:ident, $is_f16:expr) => {
             {
                 let val = if $is_f16 { f16_to_f32(*$v as u16) as $typecast } else { *$v as $typecast };
-                let res = match name {
-                    "sqrt" => val.sqrt(), "sin" => val.sin(), "cos" => val.cos(),
-                    "tan" => val.tan(), "asin" => val.asin(), "acos" => val.acos(),
-                    "atan" => val.atan(), "floor" => val.floor(), "ceil" => val.ceil(),
-                    "round" => val.round(),
-                    _ => return Err(Error::Runtime(format!("unknown function {}", name))),
+                let res = match builtin {
+                    BuiltinFn::Sqrt => val.sqrt(), BuiltinFn::Sin => val.sin(), BuiltinFn::Cos => val.cos(),
+                    BuiltinFn::Tan => val.tan(), BuiltinFn::Asin => val.asin(), BuiltinFn::Acos => val.acos(),
+                    BuiltinFn::Atan => val.atan(), BuiltinFn::Floor => val.floor(), BuiltinFn::Ceil => val.ceil(),
+                    BuiltinFn::Round => val.round(),
+                    _ => return Err(Error::Runtime("invalid unary built-in".into())),
                 };
                 if $is_f16 { Ok(Value::F16(f32_to_f16(res as f32))) } else { Ok(Value::$variant(res as _)) }
             }
@@ -1851,15 +1957,15 @@ fn evaluate_builtin1(name: &str, arg: Value) -> Result<Value, Error> {
         Value::F32(v) => float_math1!(v, f32, F32, false),
         Value::F64(v) => float_math1!(v, f64, F64, false),
         Value::F16(v) => float_math1!(v, f32, F16, true),
-        _ => Err(Error::Runtime(format!("{} requires a float", name)))
+        _ => Err(Error::Runtime("built-in requires a float".into()))
     }
 }
 
-fn evaluate_builtin2(name: &str, a: Value, b: Value, ty: &Type) -> Result<Value, Error> {
-    if name == "min" || name == "max" {
+fn evaluate_builtin2(builtin: BuiltinFn, a: Value, b: Value, ty: &Type) -> Result<Value, Error> {
+    if matches!(builtin, BuiltinFn::Min | BuiltinFn::Max) {
         macro_rules! min_max {
             ($x:ident, $l:ident, $r:ident) => {
-                if name == "min" { Ok(Value::$x(if $l < $r { *$l } else { *$r })) }
+                if builtin == BuiltinFn::Min { Ok(Value::$x(if $l < $r { *$l } else { *$r })) }
                 else { Ok(Value::$x(if $l > $r { *$l } else { *$r })) }
             }
         }
@@ -1876,13 +1982,13 @@ fn evaluate_builtin2(name: &str, a: Value, b: Value, ty: &Type) -> Result<Value,
             (Value::F64(l), Value::F64(r)) => return min_max!(F64, l, r),
             (Value::F16(l_raw), Value::F16(r_raw)) => {
                 let l = f16_to_f32(*l_raw); let r = f16_to_f32(*r_raw);
-                if name == "min" { return Ok(Value::F16(f32_to_f16(if l < r { l } else { r }))); }
+                if builtin == BuiltinFn::Min { return Ok(Value::F16(f32_to_f16(if l < r { l } else { r }))); }
                 else { return Ok(Value::F16(f32_to_f16(if l > r { l } else { r }))); }
             },
             _ => return Err(Error::Runtime("invalid type for min/max".into()))
         }
     }
-    if name == "pow" && is_integer(ty) {
+    if builtin == BuiltinFn::Pow && is_integer(ty) {
         macro_rules! int_pow {
             ($x:ident) => {
                 if let (Value::$x(l), Value::$x(r)) = (&a, &b) {
@@ -1904,9 +2010,9 @@ fn evaluate_builtin2(name: &str, a: Value, b: Value, ty: &Type) -> Result<Value,
             {
                 let l = if $is_f16 { f16_to_f32(*$l as u16) as $typecast } else { *$l as $typecast };
                 let r = if $is_f16 { f16_to_f32(*$r as u16) as $typecast } else { *$r as $typecast };
-                let res = match name {
-                    "pow" => l.powf(r), "atan2" => l.atan2(r),
-                    _ => return Err(Error::Runtime(format!("unknown function {}", name))),
+                let res = match builtin {
+                    BuiltinFn::Pow => l.powf(r), BuiltinFn::Atan2 => l.atan2(r),
+                    _ => return Err(Error::Runtime("invalid binary built-in".into())),
                 };
                 if $is_f16 { Ok(Value::F16(f32_to_f16(res as f32))) } else { Ok(Value::$variant(res as _)) }
             }
@@ -1916,7 +2022,7 @@ fn evaluate_builtin2(name: &str, a: Value, b: Value, ty: &Type) -> Result<Value,
         (Value::F32(l), Value::F32(r)) => float_math2!(l, r, f32, F32, false),
         (Value::F64(l), Value::F64(r)) => float_math2!(l, r, f64, F64, false),
         (Value::F16(l), Value::F16(r)) => float_math2!(l, r, f32, F16, true),
-        _ => Err(Error::Runtime(format!("{} requires matching floats", name)))
+        _ => Err(Error::Runtime("built-in requires matching floats".into()))
     }
 }
 fn evaluate_binary(heap: &Heap, a: Value, b: Value, opcode: &BinaryOp) -> Result<Value, Error> {
@@ -2030,7 +2136,7 @@ pub fn execute(source: &str) -> Result<Vec<String>, Error> { let program = Parse
 /// Compile and execute a source unit with output flushed as it is produced.
 pub fn execute_interactive(source: &str) -> Result<(), Error> { let program = Parser::new(lex(source)?).program()?; let code = Compiler::default().compile(program)?; let mut vm = Vm { interactive: true, ..Vm::default() }; vm.run(&code)?; Ok(()) }
 /// Compile and execute an L0 file, allowing `require` to load relative modules below the directory containing that file.
-pub fn execute_file(path: impl AsRef<Path>) -> Result<Vec<String>, Error> { let path = fs::canonicalize(path.as_ref()).map_err(|error| Error::Runtime(format!("cannot open source file: {error}")))?; let root = path.parent().ok_or_else(|| Error::Runtime("source file has no parent directory".into()))?.to_path_buf(); let source = fs::read_to_string(&path).map_err(|error| Error::Runtime(format!("cannot read source file: {error}")))?; let program = Parser::new(lex(&source)?).program()?; let code = Compiler::with_module_root(root).compile(program)?; let mut vm = Vm::default(); Ok(vm.run(&code)?.to_vec()) }
+pub fn execute_file(path: impl AsRef<Path>) -> Result<Vec<String>, Error> { Vm::default().execute_file(path) }
 /// File-based interactive execution. Unlike `execute_interactive`, this mode supports `require` and treats the source file's directory as module root.
 pub fn execute_interactive_file(path: impl AsRef<Path>) -> Result<(), Error> { let path = fs::canonicalize(path.as_ref()).map_err(|error| Error::Runtime(format!("cannot open source file: {error}")))?; let root = path.parent().ok_or_else(|| Error::Runtime("source file has no parent directory".into()))?.to_path_buf(); let source = fs::read_to_string(&path).map_err(|error| Error::Runtime(format!("cannot read source file: {error}")))?; let program = Parser::new(lex(&source)?).program()?; let code = Compiler::with_module_root(root).compile(program)?; let mut vm = Vm { interactive: true, ..Vm::default() }; vm.run(&code)?; Ok(()) }
 
@@ -2226,5 +2332,28 @@ mod immediate_regression_tests {
         encode_scalar(&Value::I32(0x0102_0304), &Type::I32, &mut bytes).unwrap();
         assert_eq!(bytes, [4, 3, 2, 1]);
         assert_eq!(decode_scalar(&bytes, 0, &Type::I32).unwrap(), Value::I32(0x0102_0304));
+    }
+    #[test]
+    fn queued_input_is_consumed_before_stdin() {
+        let mut vm = Vm::default();
+        vm.push_input("42".to_owned());
+        assert_eq!(vm.execute("let answer: i32 = input; print(answer)").unwrap(), vec!["42"]);
+    }
+    #[test]
+    fn zero_tensor_bytes_need_no_scalar_encoding() {
+        let mut vm = Vm::default();
+        assert_eq!(vm.make_tensor_bytes(TensorInit::Zeros, &Type::I32, &[2, 3]).unwrap(), vec![0; 24]);
+    }
+    #[test]
+    fn garbage_collection_tracks_payload_bytes() {
+        let mut heap = Heap::default();
+        heap.allocate(HeapObject::String("payload".repeat(128)));
+        assert!(heap.allocated_bytes > 0);
+        assert_eq!(heap.collect(Vec::new()), 1);
+        assert_eq!(heap.allocated_bytes, 0);
+    }
+    #[test]
+    fn builtins_are_resolved_during_compilation() {
+        assert_eq!(execute("let value: f32 = 4.0; print(sqrt(value)); print(min(value, 3.0))").unwrap(), vec!["2", "3"]);
     }
 }
