@@ -1,12 +1,21 @@
 struct Board {
     size: i8;
+ 
+    function grow() end
 
     function show_board()
-        print(size)
+       print(size)
         size = size + 1
     end
 }
 
+function Board::grow()
+       size = size + 11
+       print(size)
+end
+
 let board: Board = Board { size = 3 }
+board.show_board()
+board.grow()
 board.show_board()
 print(board.size)

@@ -26,3 +26,6 @@ md-5 = "0.10.6"
 [[example]]
 name = "md5_host"
 path = "examples/host_functions/md5_host.rs"
+[[example]]
+name = "exec_host"
+path = "examples/host_functions/exec_host.rs"

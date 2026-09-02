@@ -1,10 +1,52 @@
--- Packed C-style struct with typed scalar fields.
-struct Position { x: i32; y: i32; visible: bool; }
+-- Packed C-style struct with typed scalar fields and methods.
+struct Position {
+    x: i32;
+    y: i32;
+    dx: i32;
+    dy: i32;
+    visible: bool;
 
-let visible: bool = 1 == 1
-let position: Position = Position { y = 7, visible = visible, x = 4 }
+    function move()
+        x = x + dx
+        y = y + dy
+    end
+
+    -- Метод без аргументов, изменяющий булево поле на ложь
+    function hide()
+        visible = 1 == 0
+    end
+
+    -- Метод без аргументов, изменяющий булево поле на истину
+    function show()
+        visible = 1 == 1
+    end
+
+    -- Метод для вывода текущего состояния всех полей структуры
+    function print_status()
+}
+
+function Position::print_status()
+        printf("Position: x={}, y={}, visible={}\n", x, y, visible)
+end
+
+let is_visible: bool = 1 == 1
+let position: Position = Position { y = 7, visible = is_visible, x = 4 , dx =10, dy = -4}
+
+-- Проверка начального состояния
+position.print_status()
+
+-- Проверка прямого изменения поля
 position.x = 9
+position.print_status()
 
-print(position.x)
-print(position.y)
-print(position.visible)
+-- Проверка работы метода move
+position.move()
+position.print_status()
+
+-- Проверка работы метода hide
+position.hide()
+position.print_status()
+
+-- Проверка работы метода show
+position.show()
+position.print_status()
