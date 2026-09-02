@@ -27,3 +27,9 @@ A simple Sudoku solver, quite basic at the moment
 `sudoku/sudoku.l0` is the first L0 port. It carries the original `easy0` puzzle
 as a zero-indexed `vector<i8>` and calls the typed Sudoku standard-library
 functions `sudoku_solve` and `sudoku_show`.
+
+## Host functions
+
+`host_functions/` contains complete C and Rust host examples, each with a
+corresponding L0 script. See `host_functions/README.md` for build and run
+instructions.
