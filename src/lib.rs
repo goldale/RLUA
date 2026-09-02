@@ -20,8 +20,8 @@ pub struct StringId(pub u32);
 
 #[derive(Clone, Debug, Default)]
 pub struct StringInterner {
-    strings: Vec<String>,
-    lookup: std::collections::HashMap<String, StringId>,
+    strings: Vec<Rc<str>>,
+    lookup: std::collections::HashMap<Rc<str>, StringId>,
 }
 
 impl StringInterner {
@@ -29,8 +29,9 @@ impl StringInterner {
     pub fn intern(&mut self, s: &str) -> StringId {
         if let Some(&id) = self.lookup.get(s) { return id; }
         let id = StringId(self.strings.len() as u32);
-        self.strings.push(s.to_owned());
-        self.lookup.insert(s.to_owned(), id);
+        let text: Rc<str> = Rc::from(s);
+        self.strings.push(text.clone());
+        self.lookup.insert(text, id);
         id
     }
     pub fn resolve(&self, id: StringId) -> &str { &self.strings[id.0 as usize] }
@@ -362,7 +363,7 @@ pub enum UnOp { Neg, Not }
 #[derive(Clone, Debug, PartialEq)]
 enum Token {
     Let, Print, Printf, Putc, Input, This, Function, Export, Require, If, Then, Else, While, For, Do, Break, Continue, Struct, Table, End,
-    Ident(String), Integer(i128), Float(f64), StringLit(String), Colon, DoubleColon,
+    Ident(StringId), Integer(i128), Float(f64), StringLit(StringId), Colon, DoubleColon,
     Equal, EqualEqual, Bang, BangEq, Plus, Minus, Star, Slash, Percent,
     Ampersand, Pipe, Caret, Shl, Shr, AndAnd, OrOr,
     Dot, Lt, Le, Gt, Ge, LParen, RParen, LBracket, RBracket, LBrace, RBrace, Comma, Semi, Eof
@@ -381,7 +382,7 @@ impl TokenBuffer {
 
 #[derive(Clone, Debug)]
 enum Expr {
-    Integer(i128), Float(f64), String(String), Input, This, Require(String), Name(String),
+    Integer(i128), Float(f64), String(StringId), Input, This, Require(String), Name(StringId),
     Array(Vec<Expr>), Table(Vec<(TableLiteralKey, Expr)>), StructLiteral(String, Vec<(String, Expr)>),
     Binary(Box<Expr>, BinOp, Box<Expr>), Unary(UnOp, Box<Expr>),
     Index(Box<Expr>, Vec<Expr>), Field(Box<Expr>, String),
@@ -389,8 +390,10 @@ enum Expr {
     Located { node: Box<Expr>, location: SourceLocation },
 }
 
-fn lex(source: &str) -> Result<Vec<SpannedToken>, Error> {
-    let mut result = TokenBuffer::new(); let chars: Vec<char> = source.chars().collect(); let mut i = 0;
+struct LexedTokens { tokens: Vec<SpannedToken>, strings: StringInterner }
+
+fn lex(source: &str) -> Result<LexedTokens, Error> {
+    let mut result = TokenBuffer::new(); let mut strings = StringInterner::new(); let chars: Vec<char> = source.chars().collect(); let mut i = 0;
     while i < chars.len() {
         result.begin(&chars, i);
         match chars[i] {
@@ -449,7 +452,7 @@ fn lex(source: &str) -> Result<Vec<SpannedToken>, Error> {
                 }
                 if i >= chars.len() { return Err(Error::Lex("unterminated string".into()).at(result.location())); }
                 i += 1;
-                result.push(Token::StringLit(string_val));
+                result.push(Token::StringLit(strings.intern(&string_val)));
             },
             c if c.is_ascii_alphabetic() || c == '_' => {
                 let start = i; i += 1; while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') { i += 1; }
@@ -461,7 +464,7 @@ fn lex(source: &str) -> Result<Vec<SpannedToken>, Error> {
                     "if" => Token::If, "then" => Token::Then, "else" => Token::Else,
                     "while" => Token::While, "for" => Token::For, "do" => Token::Do,
                     "break" => Token::Break, "continue" => Token::Continue, "struct" => Token::Struct,
-                    "table" => Token::Table, "end" => Token::End, _ => Token::Ident(word)
+                    "table" => Token::Table, "end" => Token::End, _ => Token::Ident(strings.intern(&word))
                 });
             }
             c if c.is_ascii_digit() => {
@@ -473,7 +476,7 @@ fn lex(source: &str) -> Result<Vec<SpannedToken>, Error> {
             other => return Err(Error::Lex(format!("unexpected character '{other}'")).at(result.location())),
         }
     }
-    result.begin(&chars, i); result.push(Token::Eof); Ok(result.into_tokens())
+    result.begin(&chars, i); result.push(Token::Eof); Ok(LexedTokens { tokens: result.into_tokens(), strings })
 }
 
 #[derive(Clone, Debug)]
@@ -486,11 +489,11 @@ enum MethodReceiver { Name(String), This }
 enum Statement {
     Struct { name: String, fields: Vec<(String, Type)>, methods: Vec<StructMethod> },
     MethodDefinition { struct_name: String, method: String, args: Vec<(String, Type)>, body: Vec<Statement> },
-    ExportLet { name: String, ty: Type, expr: Expr },
+    ExportLet { name: StringId, ty: Type, expr: Expr },
     ExportStruct { name: String, fields: Vec<(String, Type)>, methods: Vec<StructMethod> },
     ExportFunction { name: String, body: Vec<Statement> },
     CallMethod { receiver: MethodReceiver, method: String },
-    Let { name: String, ty: Type, expr: Expr },
+    Let { name: StringId, ty: Type, expr: Expr },
     Assign { name: String, expr: Expr },
     SetIndex { name: String, indices: Vec<Expr>, expr: Expr },
     SetField { name: String, field: String, expr: Expr },
@@ -504,14 +507,19 @@ enum Statement {
     Located { node: Box<Statement>, location: SourceLocation },
 }
 
-struct Parser { tokens: Vec<SpannedToken>, at: usize, last_location: SourceLocation }
+struct Parser { tokens: Vec<SpannedToken>, strings: StringInterner, at: usize, last_location: SourceLocation }
 impl Parser {
-    fn new(tokens: Vec<SpannedToken>) -> Self { Self { tokens, at: 0, last_location: SourceLocation { offset: 0, line: 1, column: 1 } } }
+    fn new(lexed: LexedTokens) -> Self { Self { tokens: lexed.tokens, strings: lexed.strings, at: 0, last_location: SourceLocation { offset: 0, line: 1, column: 1 } } }
+    fn string(&self, id: StringId) -> String { self.strings.resolve(id).to_owned() }
     fn peek(&self) -> &Token { &self.tokens[self.at].kind }
     fn location(&self) -> SourceLocation { self.tokens.get(self.at).map(|token| token.location).unwrap_or(self.last_location) }
     fn next(&mut self) -> Token { let token = self.tokens[self.at].clone(); self.at += 1; self.last_location = token.location; token.kind }
     fn need(&mut self, wanted: Token) -> Result<(), Error> { let got = self.next(); if got == wanted { Ok(()) } else { Err(Error::Parse(format!("expected {wanted:?}, got {got:?}"))) } }
     fn program(&mut self) -> Result<Vec<Statement>, Error> { self.block().map_err(|error| error.at(self.location())) }
+    fn into_program(mut self) -> Result<(Vec<Statement>, StringInterner), Error> {
+        let program = self.program()?;
+        Ok((program, self.strings))
+    }
     fn block(&mut self) -> Result<Vec<Statement>, Error> {
         let mut statements = Vec::new();
         while !matches!(self.peek(), Token::Eof | Token::Else | Token::End) {
@@ -521,18 +529,18 @@ impl Parser {
         Ok(statements)
     }
     fn struct_declaration(&mut self) -> Result<(String, Vec<(String, Type)>, Vec<StructMethod>), Error> {
-        let name = match self.next() { Token::Ident(name) => name, token => return Err(Error::Parse(format!("expected struct name, got {token:?}"))) };
+        let name = match self.next() { Token::Ident(name) => self.string(name), token => return Err(Error::Parse(format!("expected struct name, got {token:?}"))) };
         self.need(Token::LBrace)?;
         let mut fields = Vec::new(); let mut methods = Vec::new();
         while *self.peek() != Token::RBrace { match self.next() {
-            Token::Ident(field) => { self.need(Token::Colon)?; let ty = self.ty()?; fields.push((field, ty)); if matches!(self.peek(), Token::Semi | Token::Comma) { self.next(); } },
+            Token::Ident(field) => { self.need(Token::Colon)?; let ty = self.ty()?; fields.push((self.string(field), ty)); if matches!(self.peek(), Token::Semi | Token::Comma) { self.next(); } },
             Token::Function => {
-                let method = match self.next() { Token::Ident(method) => method, token => return Err(Error::Parse(format!("expected method name, got {token:?}"))) };
+                let method = match self.next() { Token::Ident(method) => self.string(method), token => return Err(Error::Parse(format!("expected method name, got {token:?}"))) };
                 self.need(Token::LParen)?;
                 let mut args = Vec::new();
                 if *self.peek() != Token::RParen {
                     loop {
-                        let arg_name = match self.next() { Token::Ident(n) => n, t => return Err(Error::Parse(format!("expected argument name, got {t:?}"))) };
+                        let arg_name = match self.next() { Token::Ident(n) => self.string(n), t => return Err(Error::Parse(format!("expected argument name, got {t:?}"))) };
                         self.need(Token::Colon)?;
                         let arg_ty = self.ty()?;
                         args.push((arg_name, arg_ty));
@@ -557,7 +565,7 @@ impl Parser {
         } }
         self.need(Token::RBrace)?; Ok((name, fields, methods))
     }
-    fn let_declaration(&mut self) -> Result<(String, Type, Expr), Error> {
+    fn let_declaration(&mut self) -> Result<(StringId, Type, Expr), Error> {
         let name = match self.next() { Token::Ident(n) => n, x => return Err(Error::Parse(format!("expected name, got {x:?}"))) };
         self.need(Token::Colon)?; let ty = self.ty()?; self.need(Token::Equal)?; let expr = self.expr()?; Ok((name, ty, expr))
     }
@@ -567,18 +575,18 @@ impl Parser {
         Token::Export => match self.next() {
             Token::Let => { let (name, ty, expr) = self.let_declaration()?; Ok(Statement::ExportLet { name, ty, expr }) },
             Token::Struct => { let (name, fields, methods) = self.struct_declaration()?; Ok(Statement::ExportStruct { name, fields, methods }) },
-            Token::Function => { let name = match self.next() { Token::Ident(name) => name, token => return Err(Error::Parse(format!("expected exported function name, got {token:?}"))) }; self.need(Token::LParen)?; self.need(Token::RParen)?; let body = self.block()?; self.need(Token::End)?; Ok(Statement::ExportFunction { name, body }) },
+            Token::Function => { let name = match self.next() { Token::Ident(name) => self.string(name), token => return Err(Error::Parse(format!("expected exported function name, got {token:?}"))) }; self.need(Token::LParen)?; self.need(Token::RParen)?; let body = self.block()?; self.need(Token::End)?; Ok(Statement::ExportFunction { name, body }) },
             token => Err(Error::Parse(format!("expected let, struct, or function after export, got {token:?}"))),
         },
         Token::Function => {
-            let struct_name = match self.next() { Token::Ident(name) => name, token => return Err(Error::Parse(format!("expected struct name, got {token:?}"))) };
+            let struct_name = match self.next() { Token::Ident(name) => self.string(name), token => return Err(Error::Parse(format!("expected struct name, got {token:?}"))) };
             self.need(Token::DoubleColon)?;
-            let method = match self.next() { Token::Ident(method) => method, token => return Err(Error::Parse(format!("expected method name, got {token:?}"))) };
+            let method = match self.next() { Token::Ident(method) => self.string(method), token => return Err(Error::Parse(format!("expected method name, got {token:?}"))) };
             self.need(Token::LParen)?;
             let mut args = Vec::new();
             if *self.peek() != Token::RParen {
                 loop {
-                    let arg_name = match self.next() { Token::Ident(name) => name, token => return Err(Error::Parse(format!("expected argument name, got {token:?}"))) };
+                    let arg_name = match self.next() { Token::Ident(name) => self.string(name), token => return Err(Error::Parse(format!("expected argument name, got {token:?}"))) };
                     self.need(Token::Colon)?;
                     let arg_ty = self.ty()?;
                     args.push((arg_name, arg_ty));
@@ -609,7 +617,7 @@ impl Parser {
         Token::If => { let condition = self.expr()?; self.need(Token::Then)?; let then_body = self.block()?; let else_body = if *self.peek() == Token::Else { self.next(); self.block()? } else { Vec::new() }; self.need(Token::End)?; Ok(Statement::If { condition, then_body, else_body }) },
         Token::While => { let condition = self.expr()?; self.need(Token::Do)?; let body = self.block()?; self.need(Token::End)?; Ok(Statement::While { condition, body }) },
         Token::For => {
-            let name = match self.next() { Token::Ident(name) => name, token => return Err(Error::Parse(format!("expected loop variable, got {token:?}"))) };
+            let name = match self.next() { Token::Ident(name) => self.string(name), token => return Err(Error::Parse(format!("expected loop variable, got {token:?}"))) };
             self.need(Token::Equal)?;
             let start = self.expr()?;
             self.need(Token::Comma)?;
@@ -621,12 +629,12 @@ impl Parser {
         },
         Token::Break => Ok(Statement::Break),
         Token::Continue => Ok(Statement::Continue),
-        Token::This => { self.need(Token::Dot)?; let method = match self.next() { Token::Ident(method) => method, token => return Err(Error::Parse(format!("expected method name, got {token:?}"))) }; self.need(Token::LParen)?; self.need(Token::RParen)?; Ok(Statement::CallMethod { receiver: MethodReceiver::This, method }) },
-        Token::Ident(name) => match self.next() {
+        Token::This => { self.need(Token::Dot)?; let method = match self.next() { Token::Ident(method) => self.string(method), token => return Err(Error::Parse(format!("expected method name, got {token:?}"))) }; self.need(Token::LParen)?; self.need(Token::RParen)?; Ok(Statement::CallMethod { receiver: MethodReceiver::This, method }) },
+        Token::Ident(name) => { let name = self.string(name); match self.next() {
             Token::Equal => Ok(Statement::Assign { name, expr: self.expr()? }),
             Token::LBracket => { let indices = self.indices()?; self.need(Token::Equal)?; Ok(Statement::SetIndex { name, indices, expr: self.expr()? }) },
             Token::Dot => {
-                let field = match self.next() { Token::Ident(field) => field, token => return Err(Error::Parse(format!("expected field or method name, got {token:?}"))) };
+                let field = match self.next() { Token::Ident(field) => self.string(field), token => return Err(Error::Parse(format!("expected field or method name, got {token:?}"))) };
                 match self.next() {
                     Token::Equal => Ok(Statement::SetField { name, field, expr: self.expr()? }),
                     Token::LBracket => { let index = self.expr()?; self.need(Token::RBracket)?; self.need(Token::Equal)?; Ok(Statement::SetFieldIndex { name, field, index, expr: self.expr()? }) },
@@ -635,11 +643,11 @@ impl Parser {
                 }
             },
             token => Err(Error::Parse(format!("expected '=', '[' or '.', got {token:?}")))
-        },
+        }},
         x => Err(Error::Parse(format!("expected statement, got {x:?}"))), }
     }
     fn ty(&mut self) -> Result<Type, Error> { match self.next() {
-        Token::Ident(n) => match n.as_str() {
+        Token::Ident(n) => { let n = self.string(n); match n.as_str() {
             "i8" => Ok(Type::I8), "i16" => Ok(Type::I16), "i32" => Ok(Type::I32), "i64" => Ok(Type::I64),
             "u8" => Ok(Type::U8), "u16" => Ok(Type::U16), "u32" => Ok(Type::U32), "u64" => Ok(Type::U64),
             "f16" => Ok(Type::F16), "f32" => Ok(Type::F32), "f64" => Ok(Type::F64), "bool" => Ok(Type::Bool),
@@ -654,13 +662,13 @@ impl Parser {
             "module" => Ok(Type::Module(String::new())),
             _ if *self.peek() == Token::Dot => {
                 self.next();
-                let member = match self.next() { Token::Ident(member) => member, token => return Err(Error::Parse(format!("expected exported struct name, got {token:?}"))) };
-                Ok(Type::Struct(format!("{n}.{member}")))
+                let member = match self.next() { Token::Ident(member) => self.string(member), token => return Err(Error::Parse(format!("expected exported struct name, got {token:?}"))) };
+                Ok(Type::Struct(format!("{}.{}", n, member)))
             },
             _ => Ok(Type::Struct(n)),
-        },
+        }},
         Token::Table => { self.need(Token::Lt)?; let inner = self.ty()?; self.need(Token::Gt)?; Ok(Type::Table(Box::new(inner))) },
-        Token::Struct => match self.next() { Token::Ident(name) => Ok(Type::Struct(name)), token => Err(Error::Parse(format!("expected struct name, got {token:?}"))) },
+        Token::Struct => match self.next() { Token::Ident(name) => Ok(Type::Struct(self.string(name))), token => Err(Error::Parse(format!("expected struct name, got {token:?}"))) },
         x => Err(Error::Parse(format!("expected type, got {x:?}"))) }
     }
     fn expr(&mut self) -> Result<Expr, Error> { let location = self.location(); let node = self.expr_inner().map_err(|error| error.at(location))?; Ok(Expr::Located { node: Box::new(node), location }) }
@@ -762,7 +770,7 @@ impl Parser {
                 self.need(Token::LParen)?;
                 let path = match self.next() { Token::StringLit(path) => path, token => return Err(Error::Parse(format!("require expects a string literal, got {token:?}"))) };
                 self.need(Token::RParen)?;
-                Expr::Require(path)
+                Expr::Require(self.string(path))
             },
             Token::Table => {
                 self.need(Token::LBrace)?;
@@ -771,7 +779,7 @@ impl Parser {
                     let key = if *self.peek() == Token::LBracket {
                         self.next(); let index = self.expr()?; self.need(Token::RBracket)?; TableLiteralKey::Index(index)
                     } else {
-                        match self.next() { Token::Ident(name) => TableLiteralKey::Name(name), token => return Err(Error::Parse(format!("expected table key, got {token:?}"))), }
+                        match self.next() { Token::Ident(name) => TableLiteralKey::Name(self.string(name)), token => return Err(Error::Parse(format!("expected table key, got {token:?}"))), }
                     };
                     self.need(Token::Equal)?; entries.push((key, self.expr()?));
                     if matches!(self.peek(), Token::Comma | Token::Semi) { self.next(); }
@@ -779,16 +787,17 @@ impl Parser {
                 self.need(Token::RBrace)?; Expr::Table(entries)
             },
             Token::Ident(n) => {
-                let mut struct_name = n.clone();
+                let n_text = self.string(n);
+                let mut struct_name = n_text.clone();
                 if *self.peek() == Token::Dot
                     && matches!(self.tokens.get(self.at + 1), Some(SpannedToken { kind: Token::Ident(_), .. }))
                     && matches!(self.tokens.get(self.at + 2), Some(SpannedToken { kind: Token::LBrace, .. }))
                 {
                     self.next();
-                    let member = match self.next() { Token::Ident(member) => member, _ => unreachable!() };
-                    struct_name = format!("{n}.{member}");
+                    let member = match self.next() { Token::Ident(member) => self.string(member), _ => unreachable!() };
+                    struct_name = format!("{n_text}.{member}");
                 }
-                if *self.peek() == Token::Lt && matches!(n.as_str(), "zeros" | "random") {
+                if *self.peek() == Token::Lt && matches!(n_text.as_str(), "zeros" | "random") {
                     self.next();
                     let element = self.ty()?;
                     scalar_size(&element)?;
@@ -796,11 +805,11 @@ impl Parser {
                     self.need(Token::LParen)?;
                     let shape = self.expr()?;
                     self.need(Token::RParen)?;
-                    Expr::TensorFactory { name: n, element, shape: Box::new(shape) }
+                    Expr::TensorFactory { name: n_text, element, shape: Box::new(shape) }
                 } else if *self.peek() == Token::LBrace {
                     self.next(); let mut fields = Vec::new();
                     while *self.peek() != Token::RBrace {
-                        let field = match self.next() { Token::Ident(field) => field, token => return Err(Error::Parse(format!("expected field name, got {token:?}"))) };
+                        let field = match self.next() { Token::Ident(field) => self.string(field), token => return Err(Error::Parse(format!("expected field name, got {token:?}"))) };
                         self.need(Token::Equal)?; fields.push((field, self.expr()?));
                         if *self.peek() == Token::Comma { self.next(); }
                     }
@@ -816,7 +825,7 @@ impl Parser {
                         }
                     }
                     self.need(Token::RParen)?;
-                    Expr::Call(n, args)
+                    Expr::Call(n_text, args)
                 } else { Expr::Name(n) }
             },
             Token::LParen => { let grouped = self.expr()?; self.need(Token::RParen)?; grouped },
@@ -837,7 +846,7 @@ impl Parser {
             if *self.peek() == Token::LBracket {
                 self.next(); e = Expr::Index(Box::new(e), self.indices()?);
             } else if *self.peek() == Token::Dot {
-                self.next(); let field = match self.next() { Token::Ident(field) => field, token => return Err(Error::Parse(format!("expected field name, got {token:?}"))) }; e = Expr::Field(Box::new(e), field);
+                self.next(); let field = match self.next() { Token::Ident(field) => self.string(field), token => return Err(Error::Parse(format!("expected field name, got {token:?}"))) }; e = Expr::Field(Box::new(e), field);
             } else { break; }
         }
         Ok(e)
@@ -859,13 +868,15 @@ enum BinaryOp {
 }
 
 #[derive(Clone, Debug)]
-struct ModuleArtifact { id: String, code: Rc<[Op]>, exports: HashMap<String, ModuleExport> }
+struct ModuleArtifact { id: String, code: Rc<FlatBytecode>, exports: HashMap<String, ModuleExport> }
 
 #[derive(Clone, Debug)]
 struct HostSignature { arguments: Vec<Type>, result: Type }
 
 #[derive(Clone, Debug)]
-enum Op {
+/// Compiler-only intermediate instruction.  It is lowered before a program
+/// reaches the VM; the VM executes `FlatBytecode`, never this enum.
+enum IrOp {
     AddI32, AddF32, AddF64,
     Push(Value), MakeString(Rc<str>), Input(Rc<Type>), Require(Rc<ModuleArtifact>), Load(usize), LoadCurrentReceiver,
     LoadCurrentField(Rc<StructField>), Store(usize), StoreIndex(usize, Rc<Type>), StoreTableIndex(usize, Rc<Type>),
@@ -879,6 +890,139 @@ enum Op {
     JumpIfFalse(usize), Jump(usize), JumpIfFalseKeep(usize), JumpIfTrueKeep(usize),
     CallMethod(usize, usize), CallCurrentMethod(usize), CallModule(usize, Rc<str>),
     Return, Print, Printf(usize), Putc
+}
+
+// Kept as a source-compatible spelling for the compiler's private IR.  No
+// `Op` values are stored in executable bytecode or observed by the VM.
+type Op = IrOp;
+
+/// Compact executable program: opcode and operands are consecutive 32-bit
+/// words.  Heap-owning data lives once in the constant pool, rather than in
+/// every entry of the instruction stream.
+#[derive(Clone, Debug, Default)]
+struct FlatBytecode { words: Vec<u32>, constants: Vec<Constant> }
+
+#[derive(Clone, Debug)]
+enum Constant {
+    Value(Value), String(Rc<str>), Type(Rc<Type>), Module(Rc<ModuleArtifact>),
+    Field(Rc<StructField>), Entries(Rc<[TableEntry]>), Layout(Rc<StructLayout>),
+    Binary(BinaryOp), Unary(UnOp), Builtin(BuiltinFn), TensorInit(TensorInit),
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug)]
+enum Opcode {
+    AddI32, AddF32, AddF64, Push, MakeString, Input, Require, Load, LoadCurrentReceiver,
+    LoadCurrentField, Store, StoreIndex, StoreTableIndex, StoreTensorIndex, StoreTensorIndexF32,
+    StoreField, StoreFieldIndex, StoreTableField, StoreCurrentField, MakeArray, MakeTable,
+    MakeStruct, MakeTensor, Index, TensorIndex, TensorIndexF32, TableIndex, TableKeys,
+    TableKeysIndex, TableRemove, Field, TableField, ModuleField, Binary, Unary, Len,
+    ConcatString, Builtin1, Builtin2, CallExternal, JumpIfFalse, Jump, JumpIfFalseKeep,
+    JumpIfTrueKeep, CallMethod, CallCurrentMethod, CallModule, Return, Print, Printf, Putc,
+}
+
+impl Opcode {
+    fn from_word(word: u32) -> Result<Self, Error> {
+        // Opcodes are emitted only by this compiler.  Keep malformed external
+        // bytecode diagnosable rather than treating it as undefined behaviour.
+        if word > Self::Putc as u32 { return Err(Error::Runtime("invalid bytecode opcode".into())); }
+        Ok(unsafe { std::mem::transmute(word) })
+    }
+}
+
+enum DecodedOp<'a> {
+    AddI32, AddF32, AddF64, Push(&'a Value), MakeString(&'a str), Input(&'a Type), Require(&'a ModuleArtifact), Load(usize), LoadCurrentReceiver,
+    LoadCurrentField(&'a StructField), Store(usize), StoreIndex(usize, &'a Type), StoreTableIndex(usize, &'a Type),
+    StoreTensorIndex(usize, &'a Type, usize), StoreTensorIndexF32(usize, usize),
+    StoreField(usize, &'a StructField), StoreFieldIndex(usize, &'a StructField, &'a Type), StoreTableField(usize, &'a str, &'a Type),
+    StoreCurrentField(&'a StructField), MakeArray(usize, &'a Type), MakeTable(&'a [TableEntry], &'a Type), MakeStruct(&'a StructLayout),
+    MakeTensor(TensorInit, &'a Type, usize), Index, TensorIndex(&'a Type, usize), TensorIndexF32(usize), TableIndex, TableKeys, TableKeysIndex, TableRemove, Field(&'a StructField), TableField(&'a str), ModuleField(&'a str),
+    Binary(&'a BinaryOp), Unary(&'a UnOp, &'a Type), Len, ConcatString,
+    Builtin1(BuiltinFn, &'a Type), Builtin2(BuiltinFn, &'a Type), CallExternal(&'a str, usize),
+    JumpIfFalse(usize), Jump(usize), JumpIfFalseKeep(usize), JumpIfTrueKeep(usize),
+    CallMethod(usize, usize), CallCurrentMethod(usize), CallModule(usize, &'a str),
+    Return, Print, Printf(usize), Putc,
+}
+
+impl FlatBytecode {
+    fn constant(&mut self, constant: Constant) -> u32 { let index = self.constants.len() as u32; self.constants.push(constant); index }
+    fn word(&mut self, value: usize) { self.words.push(value as u32); }
+    fn op(&mut self, opcode: Opcode) { self.words.push(opcode as u32); }
+    fn lower(ir: Vec<IrOp>) -> Self {
+        let mut out = Self::default();
+        for op in ir { match op {
+            IrOp::AddI32 => out.op(Opcode::AddI32), IrOp::AddF32 => out.op(Opcode::AddF32), IrOp::AddF64 => out.op(Opcode::AddF64),
+            IrOp::Push(v) => { out.op(Opcode::Push); let x=out.constant(Constant::Value(v)); out.word(x as usize); }
+            IrOp::MakeString(v) => { out.op(Opcode::MakeString); let x=out.constant(Constant::String(v)); out.word(x as usize); }
+            IrOp::Input(v) => { out.op(Opcode::Input); let x=out.constant(Constant::Type(v)); out.word(x as usize); }
+            IrOp::Require(v) => { out.op(Opcode::Require); let x=out.constant(Constant::Module(v)); out.word(x as usize); }
+            IrOp::Load(v) => { out.op(Opcode::Load); out.word(v); }, IrOp::LoadCurrentReceiver => out.op(Opcode::LoadCurrentReceiver),
+            IrOp::LoadCurrentField(v) => { out.op(Opcode::LoadCurrentField); let x=out.constant(Constant::Field(v)); out.word(x as usize); }
+            IrOp::Store(v) => { out.op(Opcode::Store); out.word(v); }
+            IrOp::StoreIndex(a,b) => { out.op(Opcode::StoreIndex); out.word(a); let x=out.constant(Constant::Type(b)); out.word(x as usize); }
+            IrOp::StoreTableIndex(a,b) => { out.op(Opcode::StoreTableIndex); out.word(a); let x=out.constant(Constant::Type(b)); out.word(x as usize); }
+            IrOp::StoreTensorIndex(a,b,c) => { out.op(Opcode::StoreTensorIndex); out.word(a); let x=out.constant(Constant::Type(b)); out.word(x as usize); out.word(c); }
+            IrOp::StoreTensorIndexF32(a,b) => { out.op(Opcode::StoreTensorIndexF32); out.word(a); out.word(b); }
+            IrOp::StoreField(a,b) => { out.op(Opcode::StoreField); out.word(a); let x=out.constant(Constant::Field(b)); out.word(x as usize); }
+            IrOp::StoreFieldIndex(a,b,c) => { out.op(Opcode::StoreFieldIndex); out.word(a); let x=out.constant(Constant::Field(b)); out.word(x as usize); let x=out.constant(Constant::Type(c)); out.word(x as usize); }
+            IrOp::StoreTableField(a,b,c) => { out.op(Opcode::StoreTableField); out.word(a); let x=out.constant(Constant::String(b)); out.word(x as usize); let x=out.constant(Constant::Type(c)); out.word(x as usize); }
+            IrOp::StoreCurrentField(v) => { out.op(Opcode::StoreCurrentField); let x=out.constant(Constant::Field(v)); out.word(x as usize); }
+            IrOp::MakeArray(a,b) => { out.op(Opcode::MakeArray); out.word(a); let x=out.constant(Constant::Type(b)); out.word(x as usize); }
+            IrOp::MakeTable(a,b) => { out.op(Opcode::MakeTable); let x=out.constant(Constant::Entries(a)); out.word(x as usize); let x=out.constant(Constant::Type(b)); out.word(x as usize); }
+            IrOp::MakeStruct(v) => { out.op(Opcode::MakeStruct); let x=out.constant(Constant::Layout(v)); out.word(x as usize); }
+            IrOp::MakeTensor(a,b,c) => { out.op(Opcode::MakeTensor); let x=out.constant(Constant::TensorInit(a)); out.word(x as usize); let x=out.constant(Constant::Type(b)); out.word(x as usize); out.word(c); }
+            IrOp::Index => out.op(Opcode::Index), IrOp::TensorIndex(a,b) => { out.op(Opcode::TensorIndex); let x=out.constant(Constant::Type(a)); out.word(x as usize); out.word(b); }, IrOp::TensorIndexF32(v) => { out.op(Opcode::TensorIndexF32); out.word(v); },
+            IrOp::TableIndex => out.op(Opcode::TableIndex), IrOp::TableKeys => out.op(Opcode::TableKeys), IrOp::TableKeysIndex => out.op(Opcode::TableKeysIndex), IrOp::TableRemove => out.op(Opcode::TableRemove),
+            IrOp::Field(v) => { out.op(Opcode::Field); let x=out.constant(Constant::Field(v)); out.word(x as usize); }, IrOp::TableField(v) => { out.op(Opcode::TableField); let x=out.constant(Constant::String(v)); out.word(x as usize); }, IrOp::ModuleField(v) => { out.op(Opcode::ModuleField); let x=out.constant(Constant::String(v)); out.word(x as usize); },
+            IrOp::Binary(v) => { out.op(Opcode::Binary); let x=out.constant(Constant::Binary(v)); out.word(x as usize); }, IrOp::Unary(a,b) => { out.op(Opcode::Unary); let x=out.constant(Constant::Unary(a)); out.word(x as usize); let x=out.constant(Constant::Type(b)); out.word(x as usize); }, IrOp::Len => out.op(Opcode::Len), IrOp::ConcatString => out.op(Opcode::ConcatString),
+            IrOp::Builtin1(a,b) => { out.op(Opcode::Builtin1); let x=out.constant(Constant::Builtin(a)); out.word(x as usize); let x=out.constant(Constant::Type(b)); out.word(x as usize); }, IrOp::Builtin2(a,b) => { out.op(Opcode::Builtin2); let x=out.constant(Constant::Builtin(a)); out.word(x as usize); let x=out.constant(Constant::Type(b)); out.word(x as usize); },
+            IrOp::CallExternal(a,b) => { out.op(Opcode::CallExternal); let x=out.constant(Constant::String(a)); out.word(x as usize); out.word(b); },
+            IrOp::JumpIfFalse(v) => { out.op(Opcode::JumpIfFalse); out.word(v * 4); }, IrOp::Jump(v) => { out.op(Opcode::Jump); out.word(v * 4); }, IrOp::JumpIfFalseKeep(v) => { out.op(Opcode::JumpIfFalseKeep); out.word(v * 4); }, IrOp::JumpIfTrueKeep(v) => { out.op(Opcode::JumpIfTrueKeep); out.word(v * 4); },
+            IrOp::CallMethod(a,b) => { out.op(Opcode::CallMethod); out.word(a); out.word(b * 4); }, IrOp::CallCurrentMethod(v) => { out.op(Opcode::CallCurrentMethod); out.word(v * 4); }, IrOp::CallModule(a,b) => { out.op(Opcode::CallModule); out.word(a); let x=out.constant(Constant::String(b)); out.word(x as usize); },
+            IrOp::Return => out.op(Opcode::Return), IrOp::Print => out.op(Opcode::Print), IrOp::Printf(v) => { out.op(Opcode::Printf); out.word(v); }, IrOp::Putc => out.op(Opcode::Putc),
+        } while out.words.len() % 4 != 0 { out.words.push(0); } } out
+    }
+    fn decode(&self, mut pc: usize) -> Result<(DecodedOp<'_>, usize), Error> {
+        let instruction_start = pc;
+        let opcode=Opcode::from_word(*self.words.get(pc).ok_or_else(|| Error::Runtime("truncated bytecode".into()))?)?; pc+=1;
+        let word=|pc: &mut usize| -> Result<usize, Error> { let v=*self.words.get(*pc).ok_or_else(|| Error::Runtime("truncated bytecode operand".into()))? as usize; *pc+=1; Ok(v) };
+        let constant=|index: usize| -> Result<&Constant, Error> { self.constants.get(index).ok_or_else(|| Error::Runtime("invalid bytecode constant".into())) };
+        macro_rules! c {
+            (Constant::$kind:ident($name:ident)) => {
+                let $name = {
+                    let i = word(&mut pc)?;
+                    match constant(i)? {
+                        Constant::$kind(value) => value,
+                        _ => return Err(Error::Runtime("invalid bytecode constant kind".into())),
+                    }
+                };
+            };
+        }
+        let decoded=match opcode {
+            Opcode::AddI32=>DecodedOp::AddI32, Opcode::AddF32=>DecodedOp::AddF32, Opcode::AddF64=>DecodedOp::AddF64,
+            Opcode::Push=>{ c!(Constant::Value(v)); DecodedOp::Push(v) }, Opcode::MakeString=>{ c!(Constant::String(v)); DecodedOp::MakeString(v) }, Opcode::Input=>{ c!(Constant::Type(v)); DecodedOp::Input(v) }, Opcode::Require=>{ c!(Constant::Module(v)); DecodedOp::Require(v) }, Opcode::Load=>DecodedOp::Load(word(&mut pc)?), Opcode::LoadCurrentReceiver=>DecodedOp::LoadCurrentReceiver,
+            Opcode::LoadCurrentField=>{ c!(Constant::Field(v)); DecodedOp::LoadCurrentField(v) }, Opcode::Store=>DecodedOp::Store(word(&mut pc)?), Opcode::StoreIndex=>{ let a=word(&mut pc)?; c!(Constant::Type(v)); DecodedOp::StoreIndex(a,v) }, Opcode::StoreTableIndex=>{ let a=word(&mut pc)?; c!(Constant::Type(v)); DecodedOp::StoreTableIndex(a,v) }, Opcode::StoreTensorIndex=>{ let a=word(&mut pc)?; c!(Constant::Type(v)); let b=word(&mut pc)?; DecodedOp::StoreTensorIndex(a,v,b) }, Opcode::StoreTensorIndexF32=>DecodedOp::StoreTensorIndexF32(word(&mut pc)?,word(&mut pc)?),
+            Opcode::StoreField=>{let a=word(&mut pc)?;c!(Constant::Field(v));DecodedOp::StoreField(a,v)}, Opcode::StoreFieldIndex=>{let a=word(&mut pc)?;c!(Constant::Field(b));c!(Constant::Type(c));DecodedOp::StoreFieldIndex(a,b,c)}, Opcode::StoreTableField=>{let a=word(&mut pc)?;c!(Constant::String(b));c!(Constant::Type(c));DecodedOp::StoreTableField(a,b,c)}, Opcode::StoreCurrentField=>{c!(Constant::Field(v));DecodedOp::StoreCurrentField(v)},
+            Opcode::MakeArray=>{let a=word(&mut pc)?;c!(Constant::Type(b));DecodedOp::MakeArray(a,b)}, Opcode::MakeTable=>{c!(Constant::Entries(a));c!(Constant::Type(b));DecodedOp::MakeTable(a,b)}, Opcode::MakeStruct=>{c!(Constant::Layout(v));DecodedOp::MakeStruct(v)}, Opcode::MakeTensor=>{c!(Constant::TensorInit(a));c!(Constant::Type(b));let c=word(&mut pc)?;DecodedOp::MakeTensor(*a,b,c)},
+            Opcode::Index=>DecodedOp::Index, Opcode::TensorIndex=>{c!(Constant::Type(a));let b=word(&mut pc)?;DecodedOp::TensorIndex(a,b)}, Opcode::TensorIndexF32=>DecodedOp::TensorIndexF32(word(&mut pc)?), Opcode::TableIndex=>DecodedOp::TableIndex, Opcode::TableKeys=>DecodedOp::TableKeys, Opcode::TableKeysIndex=>DecodedOp::TableKeysIndex, Opcode::TableRemove=>DecodedOp::TableRemove, Opcode::Field=>{c!(Constant::Field(v));DecodedOp::Field(v)}, Opcode::TableField=>{c!(Constant::String(v));DecodedOp::TableField(v)}, Opcode::ModuleField=>{c!(Constant::String(v));DecodedOp::ModuleField(v)},
+            Opcode::Binary=>{c!(Constant::Binary(v));DecodedOp::Binary(v)}, Opcode::Unary=>{c!(Constant::Unary(a));c!(Constant::Type(b));DecodedOp::Unary(a,b)}, Opcode::Len=>DecodedOp::Len, Opcode::ConcatString=>DecodedOp::ConcatString, Opcode::Builtin1=>{c!(Constant::Builtin(a));c!(Constant::Type(b));DecodedOp::Builtin1(*a,b)}, Opcode::Builtin2=>{c!(Constant::Builtin(a));c!(Constant::Type(b));DecodedOp::Builtin2(*a,b)}, Opcode::CallExternal=>{c!(Constant::String(a));let b=word(&mut pc)?;DecodedOp::CallExternal(a,b)},
+            Opcode::JumpIfFalse=>DecodedOp::JumpIfFalse(word(&mut pc)?), Opcode::Jump=>DecodedOp::Jump(word(&mut pc)?), Opcode::JumpIfFalseKeep=>DecodedOp::JumpIfFalseKeep(word(&mut pc)?), Opcode::JumpIfTrueKeep=>DecodedOp::JumpIfTrueKeep(word(&mut pc)?), Opcode::CallMethod=>DecodedOp::CallMethod(word(&mut pc)?,word(&mut pc)?), Opcode::CallCurrentMethod=>DecodedOp::CallCurrentMethod(word(&mut pc)?), Opcode::CallModule=>{let a=word(&mut pc)?;c!(Constant::String(b));DecodedOp::CallModule(a,b)}, Opcode::Return=>DecodedOp::Return, Opcode::Print=>DecodedOp::Print, Opcode::Printf=>DecodedOp::Printf(word(&mut pc)?), Opcode::Putc=>DecodedOp::Putc,
+        }; Ok((decoded,instruction_start + 4))
+    }
+
+    fn decode_ir(&self, pc: usize) -> Result<(IrOp, usize), Error> {
+        let (op, next_pc) = self.decode(pc)?;
+        let op = match op {
+            DecodedOp::AddI32 => IrOp::AddI32, DecodedOp::AddF32 => IrOp::AddF32, DecodedOp::AddF64 => IrOp::AddF64,
+            DecodedOp::Push(v) => IrOp::Push(v.clone()), DecodedOp::MakeString(v) => IrOp::MakeString(Rc::from(v)), DecodedOp::Input(v) => IrOp::Input(Rc::new(v.clone())), DecodedOp::Require(v) => IrOp::Require(Rc::new(v.clone())), DecodedOp::Load(v) => IrOp::Load(v), DecodedOp::LoadCurrentReceiver => IrOp::LoadCurrentReceiver,
+            DecodedOp::LoadCurrentField(v) => IrOp::LoadCurrentField(Rc::new(v.clone())), DecodedOp::Store(v) => IrOp::Store(v), DecodedOp::StoreIndex(a,b) => IrOp::StoreIndex(a,Rc::new(b.clone())), DecodedOp::StoreTableIndex(a,b) => IrOp::StoreTableIndex(a,Rc::new(b.clone())), DecodedOp::StoreTensorIndex(a,b,c) => IrOp::StoreTensorIndex(a,Rc::new(b.clone()),c), DecodedOp::StoreTensorIndexF32(a,b) => IrOp::StoreTensorIndexF32(a,b),
+            DecodedOp::StoreField(a,b) => IrOp::StoreField(a,Rc::new(b.clone())), DecodedOp::StoreFieldIndex(a,b,c) => IrOp::StoreFieldIndex(a,Rc::new(b.clone()),Rc::new(c.clone())), DecodedOp::StoreTableField(a,b,c) => IrOp::StoreTableField(a,Rc::from(b),Rc::new(c.clone())), DecodedOp::StoreCurrentField(v) => IrOp::StoreCurrentField(Rc::new(v.clone())),
+            DecodedOp::MakeArray(a,b) => IrOp::MakeArray(a,Rc::new(b.clone())), DecodedOp::MakeTable(a,b) => IrOp::MakeTable(Rc::from(a),Rc::new(b.clone())), DecodedOp::MakeStruct(v) => IrOp::MakeStruct(Rc::new(v.clone())), DecodedOp::MakeTensor(a,b,c) => IrOp::MakeTensor(a,Rc::new(b.clone()),c),
+            DecodedOp::Index => IrOp::Index, DecodedOp::TensorIndex(a,b) => IrOp::TensorIndex(Rc::new(a.clone()),b), DecodedOp::TensorIndexF32(v) => IrOp::TensorIndexF32(v), DecodedOp::TableIndex => IrOp::TableIndex, DecodedOp::TableKeys => IrOp::TableKeys, DecodedOp::TableKeysIndex => IrOp::TableKeysIndex, DecodedOp::TableRemove => IrOp::TableRemove, DecodedOp::Field(v) => IrOp::Field(Rc::new(v.clone())), DecodedOp::TableField(v) => IrOp::TableField(Rc::from(v)), DecodedOp::ModuleField(v) => IrOp::ModuleField(Rc::from(v)),
+            DecodedOp::Binary(v) => IrOp::Binary(v.clone()), DecodedOp::Unary(a,b) => IrOp::Unary(a.clone(),Rc::new(b.clone())), DecodedOp::Len => IrOp::Len, DecodedOp::ConcatString => IrOp::ConcatString, DecodedOp::Builtin1(a,b) => IrOp::Builtin1(a,Rc::new(b.clone())), DecodedOp::Builtin2(a,b) => IrOp::Builtin2(a,Rc::new(b.clone())), DecodedOp::CallExternal(a,b) => IrOp::CallExternal(Rc::from(a),b),
+            DecodedOp::JumpIfFalse(v) => IrOp::JumpIfFalse(v), DecodedOp::Jump(v) => IrOp::Jump(v), DecodedOp::JumpIfFalseKeep(v) => IrOp::JumpIfFalseKeep(v), DecodedOp::JumpIfTrueKeep(v) => IrOp::JumpIfTrueKeep(v), DecodedOp::CallMethod(a,b) => IrOp::CallMethod(a,b), DecodedOp::CallCurrentMethod(v) => IrOp::CallCurrentMethod(v), DecodedOp::CallModule(a,b) => IrOp::CallModule(a,Rc::from(b)), DecodedOp::Return => IrOp::Return, DecodedOp::Print => IrOp::Print, DecodedOp::Printf(v) => IrOp::Printf(v), DecodedOp::Putc => IrOp::Putc,
+        }; Ok((op, next_pc))
+    }
 }
 
 /// Built-ins are resolved during compilation. Keeping their identity in the
@@ -923,14 +1067,17 @@ struct Compiler {
     compiling_modules: Rc<RefCell<HashSet<String>>>,
     exports: HashMap<String, ModuleExport>, extern_functions: HashMap<String, HostSignature>, code: Vec<Op>,
     interned_names: HashMap<String, Rc<str>>,
+    strings: StringInterner,
     next_slot: usize, loops: Vec<LoopContext>
 }
 
-impl Default for Compiler { fn default() -> Self { Self { names: HashMap::new(), structs: HashMap::new(), methods: HashMap::new(), pending_method_calls: Vec::new(), current_method_fields: None, current_method_struct: None, module_root: None, module_artifacts: HashMap::new(), compiling_modules: Rc::new(RefCell::new(HashSet::new())), exports: HashMap::new(), extern_functions: HashMap::new(), code: Vec::new(), interned_names: HashMap::new(), next_slot: 0, loops: Vec::new() } } }
+impl Default for Compiler { fn default() -> Self { Self { names: HashMap::new(), structs: HashMap::new(), methods: HashMap::new(), pending_method_calls: Vec::new(), current_method_fields: None, current_method_struct: None, module_root: None, module_artifacts: HashMap::new(), compiling_modules: Rc::new(RefCell::new(HashSet::new())), exports: HashMap::new(), extern_functions: HashMap::new(), code: Vec::new(), interned_names: HashMap::new(), strings: StringInterner::new(), next_slot: 0, loops: Vec::new() } } }
 
 impl Compiler {
     fn with_module_root(module_root: PathBuf) -> Self { Self { module_root: Some(module_root), ..Self::default() } }
     fn with_extern_functions(extern_functions: HashMap<String, HostSignature>) -> Self { Self { extern_functions, ..Self::default() } }
+    fn with_strings(mut self, strings: StringInterner) -> Self { self.strings = strings; self }
+    fn string(&self, id: StringId) -> &str { self.strings.resolve(id) }
 
     fn intern_name(&mut self, name: &str) -> Rc<str> {
         if let Some(interned) = self.interned_names.get(name) { return interned.clone(); }
@@ -966,9 +1113,17 @@ impl Compiler {
         }
     }
 
-    fn compile(mut self, program: Vec<Statement>) -> Result<Vec<Op>, Error> { self.compile_program(program)?; Ok(self.code) }
+    fn compile(mut self, program: Vec<Statement>) -> Result<FlatBytecode, Error> { self.compile_program(program)?; Ok(FlatBytecode::lower(self.code)) }
 
-    fn compile_module(mut self, id: String, program: Vec<Statement>) -> Result<ModuleArtifact, Error> { self.compile_program(program)?; Ok(ModuleArtifact { id, code: self.code.into(), exports: self.exports }) }
+    fn compile_module(mut self, id: String, program: Vec<Statement>) -> Result<ModuleArtifact, Error> {
+        self.compile_program(program)?;
+        // Entries are initially compiler-IR indices; each executable record is
+        // four u32 words in the final stream.
+        for export in self.exports.values_mut() {
+            if let ModuleExport::Function { entry } = export { *entry *= 4; }
+        }
+        Ok(ModuleArtifact { id, code: Rc::new(FlatBytecode::lower(self.code)), exports: self.exports })
+    }
 
     fn compile_program(&mut self, program: Vec<Statement>) -> Result<(), Error> {
         for s in program { self.statement(s)?; }
@@ -997,8 +1152,8 @@ impl Compiler {
         }
         let module = (|| {
             let source = fs::read_to_string(&canonical).map_err(|error| Error::Runtime(format!("cannot read module '{requested}': {error}")))?;
-            let program = Parser::new(lex(&source)?).program()?;
-            let mut module_compiler = Compiler::with_module_root(root.to_path_buf());
+            let (program, strings) = Parser::new(lex(&source)?).into_program()?;
+            let mut module_compiler = Compiler::with_module_root(root.to_path_buf()).with_strings(strings);
             module_compiler.compiling_modules = self.compiling_modules.clone();
             module_compiler.extern_functions = self.extern_functions.clone();
             module_compiler.compile_module(id.clone(), program)
@@ -1086,7 +1241,7 @@ impl Compiler {
         Statement::MethodDefinition { struct_name, method, args, body } => {
             self.compile_method_body(&struct_name, &method, args, body)
         },
-        Statement::ExportLet { name, ty, expr } => { self.statement(Statement::Let { name: name.clone(), ty, expr })?; let (slot, ty) = self.names.get(&name).cloned().ok_or_else(|| Error::Runtime("missing exported local".into()))?; if self.exports.insert(name.clone(), ModuleExport::Value { slot, ty }).is_some() { return Err(Error::Type(format!("module already exports '{name}'"))); } Ok(()) },
+        Statement::ExportLet { name, ty, expr } => { let name = self.string(name).to_owned(); let id = self.strings.intern(&name); self.statement(Statement::Let { name: id, ty, expr })?; let (slot, ty) = self.names.get(&name).cloned().ok_or_else(|| Error::Runtime("missing exported local".into()))?; if self.exports.insert(name.clone(), ModuleExport::Value { slot, ty }).is_some() { return Err(Error::Type(format!("module already exports '{name}'"))); } Ok(()) },
         Statement::ExportStruct { name, fields, methods } => { self.statement(Statement::Struct { name: name.clone(), fields, methods })?; let layout = self.structs.get(&name).cloned().ok_or_else(|| Error::Runtime("missing exported struct".into()))?; if self.exports.insert(name.clone(), ModuleExport::Struct(layout)).is_some() { return Err(Error::Type(format!("module already exports '{name}'"))); } Ok(()) },
         Statement::ExportFunction { name, body } => self.compile_module_function(name, body),
         Statement::CallMethod { receiver, method } => {
@@ -1114,6 +1269,7 @@ impl Compiler {
             Ok(())
         },
         Statement::Let { name, ty, expr } => {
+            let name = self.string(name).to_owned();
             let found = self.expr(expr, Some(&ty))?;
             if !types_compatible(&ty, &found) { return Err(Error::Type(format!("'{name}' declared {ty}, but expression has type {found}"))); }
 
@@ -1253,11 +1409,11 @@ impl Compiler {
             self.code.push(Op::Push(val));
             Ok(ty.clone())
         },
-        Expr::String(s) => { self.code.push(Op::MakeString(Rc::from(s))); Ok(Type::String) },
+        Expr::String(s) => { self.code.push(Op::MakeString(Rc::from(self.string(s)))); Ok(Type::String) },
         Expr::Input => { let ty = expected.filter(|t| is_numeric(t) || **t == Type::String).cloned().ok_or_else(|| Error::Type("input needs an expected scalar or string type, e.g. let value: i32 = input".into()))?; self.code.push(Op::Input(Rc::new(ty.clone()))); Ok(ty) },
         Expr::This => { let struct_name = self.current_method_struct.clone().ok_or_else(|| Error::Type("this is available only inside a struct method".into()))?; self.code.push(Op::LoadCurrentReceiver); Ok(Type::Struct(struct_name)) },
         Expr::Require(path) => { let module = self.load_module(&path)?; let id = module.id.clone(); self.code.push(Op::Require(Rc::new(module))); Ok(Type::Module(id)) },
-        Expr::Name(name) => { if let Some(field) = self.current_method_fields.as_ref().and_then(|fields| fields.get(&name)).cloned() { let ty = field.ty.clone(); self.code.push(Op::LoadCurrentField(Rc::new(field))); Ok(ty) } else { let (slot, ty) = self.names.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))?; self.code.push(Op::Load(slot)); Ok(ty) } },
+        Expr::Name(name) => { let name = self.string(name); if let Some(field) = self.current_method_fields.as_ref().and_then(|fields| fields.get(name)).cloned() { let ty = field.ty.clone(); self.code.push(Op::LoadCurrentField(Rc::new(field))); Ok(ty) } else { let (slot, ty) = self.names.get(name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))?; self.code.push(Op::Load(slot)); Ok(ty) } },
         Expr::Array(mut items) => {
             let inferred = expected.is_none();
             let element = match expected {
@@ -1534,8 +1690,8 @@ impl Vm {
     }
 
     pub fn execute(&mut self, source: &str) -> Result<Vec<String>, Error> {
-        let program = Parser::new(lex(source)?).program()?;
-        let code = Compiler::with_extern_functions(self.external_signatures()).compile(program)?;
+        let (program, strings) = Parser::new(lex(source)?).into_program()?;
+        let code = Compiler::with_extern_functions(self.external_signatures()).with_strings(strings).compile(program)?;
         self.output.clear();
         Ok(self.run(&code)?.to_vec())
     }
@@ -1556,8 +1712,8 @@ impl Vm {
             .to_path_buf();
         let source = fs::read_to_string(&path)
             .map_err(|error| Error::Runtime(format!("cannot read source file: {error}")))?;
-        let program = Parser::new(lex(&source)?).program()?;
-        let mut compiler = Compiler::with_module_root(root);
+        let (program, strings) = Parser::new(lex(&source)?).into_program()?;
+        let mut compiler = Compiler::with_module_root(root).with_strings(strings);
         compiler.extern_functions = self.external_signatures();
         let code = compiler.compile(program)?;
         self.output.clear();
@@ -1697,13 +1853,15 @@ impl Vm {
         Ok(())
     }
 
-    fn run(&mut self, code: &[Op]) -> Result<&[String], Error> { self.run_from(code, 0, false) }
+    fn run(&mut self, code: &FlatBytecode) -> Result<&[String], Error> { self.run_from(code, 0, false) }
 
-    fn run_from(&mut self, code: &[Op], mut pc: usize, terminal_return: bool) -> Result<&[String], Error> {
+    fn run_from(&mut self, code: &FlatBytecode, mut pc: usize, terminal_return: bool) -> Result<&[String], Error> {
         let mut call_stack: Vec<(usize, Option<usize>)> = Vec::new();
         let mut current_receiver: Option<usize> = None;
 
-        while pc < code.len() { match &code[pc] {
+        while pc < code.words.len() {
+            let (instruction, next_pc) = code.decode_ir(pc)?;
+            match &instruction {
             Op::AddI32 => {
                 // The compiler emits two operands for every arithmetic opcode.
                 // Keep the diagnostic in debug builds, but do not branch twice
@@ -1886,15 +2044,22 @@ impl Vm {
                 let Value::String(left_ref) = left else { return Err(Error::Runtime("VM string invariant broken".into())); };
                 let Value::String(right_ref) = right else { return Err(Error::Runtime("VM string invariant broken".into())); };
 
-                // Ограничиваем область видимости .borrow() с помощью блока
-                let (left, right) = {
+                // Borrow only long enough to copy both source slices directly
+                // into one exactly-sized allocation.
+                let combined = {
                     let heap = self.heap_ref();
                     match (heap.get(left_ref)?, heap.get(right_ref)?) {
-                        (HeapObject::String(l), HeapObject::String(r)) => (l.clone(), r.clone()),
+                        (HeapObject::String(l), HeapObject::String(r)) => {
+                            let capacity = l.len().checked_add(r.len()).ok_or_else(|| Error::Runtime("string concatenation is too large".into()))?;
+                            let mut text = String::with_capacity(capacity);
+                            text.push_str(l);
+                            text.push_str(r);
+                            text
+                        },
                         _ => return Err(Error::Runtime("string heap invariant broken".into())),
                     }
                 };
-                let reference = self.allocate(HeapObject::String(format!("{left}{right}")));
+                let reference = self.allocate(HeapObject::String(combined));
                 self.push(Value::String(reference));
                 self.collect_if_needed();
             },
@@ -1925,8 +2090,8 @@ impl Vm {
                     return Err(Error::Runtime("VM condition invariant broken".into()));
                 }
             },
-            Op::CallMethod(receiver, target) => { call_stack.push((pc + 1, current_receiver)); current_receiver = Some(*receiver); pc = *target; continue; },
-            Op::CallCurrentMethod(target) => { let receiver = current_receiver.ok_or_else(|| Error::Runtime("this is available only inside a method".into()))?; call_stack.push((pc + 1, current_receiver)); current_receiver = Some(receiver); pc = *target; continue; },
+            Op::CallMethod(receiver, target) => { call_stack.push((next_pc, current_receiver)); current_receiver = Some(*receiver); pc = *target; continue; },
+            Op::CallCurrentMethod(target) => { let receiver = current_receiver.ok_or_else(|| Error::Runtime("this is available only inside a method".into()))?; call_stack.push((next_pc, current_receiver)); current_receiver = Some(receiver); pc = *target; continue; },
             Op::CallModule(slot, name) => { self.call_module_function(*slot, name.as_ref())?; },
             Op::Return => { if let Some((return_pc, previous_receiver)) = call_stack.pop() { current_receiver = previous_receiver; pc = return_pc; continue; } if terminal_return { return Ok(&self.output); } return Err(Error::Runtime("return outside method".into())); },
             Op::Print => { let value = self.pop()?; let text = self.format_value(&value)?; self.emit(text); },
@@ -1971,7 +2136,7 @@ impl Vm {
                     .ok_or_else(|| Error::Runtime(format!("putc requires a valid Unicode scalar value, got {codepoint}")))?;
                 if self.interactive { print!("{c}"); let _ = std::io::stdout().flush(); }
             },
-        } pc += 1; } Ok(&self.output)
+        } pc = next_pc; } Ok(&self.output)
     }
 
     fn load_module(&mut self, artifact: ModuleArtifact) -> Result<(), Error> {
@@ -2274,7 +2439,7 @@ fn evaluate_unary(a: Value, op: &UnOp, ty: &Type) -> Result<Value, Error> {
 }
 
 /// Compile and execute a source unit. `print` output is returned line by line.
-pub fn execute(source: &str) -> Result<Vec<String>, Error> { let program = Parser::new(lex(source)?).program()?; let code = Compiler::default().compile(program)?; let mut vm = Vm::default(); Ok(vm.run(&code)?.to_vec()) }
+pub fn execute(source: &str) -> Result<Vec<String>, Error> { let (program, strings) = Parser::new(lex(source)?).into_program()?; let code = Compiler::default().with_strings(strings).compile(program)?; let mut vm = Vm::default(); Ok(vm.run(&code)?.to_vec()) }
 /// Compile and execute a source unit with deterministic input lines.  This is
 /// intended for embeddings and tests, where reading the host stdin is not
 /// appropriate.
@@ -2283,18 +2448,18 @@ where
     I: IntoIterator<Item = S>,
     S: Into<String>,
 {
-    let program = Parser::new(lex(source)?).program()?;
-    let code = Compiler::default().compile(program)?;
+    let (program, strings) = Parser::new(lex(source)?).into_program()?;
+    let code = Compiler::default().with_strings(strings).compile(program)?;
     let mut vm = Vm::default();
     vm.input.extend(input.into_iter().map(Into::into));
     Ok(vm.run(&code)?.to_vec())
 }
 /// Compile and execute a source unit with output flushed as it is produced.
-pub fn execute_interactive(source: &str) -> Result<(), Error> { let program = Parser::new(lex(source)?).program()?; let code = Compiler::default().compile(program)?; let mut vm = Vm { interactive: true, ..Vm::default() }; vm.run(&code)?; Ok(()) }
+pub fn execute_interactive(source: &str) -> Result<(), Error> { let (program, strings) = Parser::new(lex(source)?).into_program()?; let code = Compiler::default().with_strings(strings).compile(program)?; let mut vm = Vm { interactive: true, ..Vm::default() }; vm.run(&code)?; Ok(()) }
 /// Compile and execute an L0 file, allowing `require` to load relative modules below the directory containing that file.
 pub fn execute_file(path: impl AsRef<Path>) -> Result<Vec<String>, Error> { Vm::default().execute_file(path) }
 /// File-based interactive execution. Unlike `execute_interactive`, this mode supports `require` and treats the source file's directory as module root.
-pub fn execute_interactive_file(path: impl AsRef<Path>) -> Result<(), Error> { let path = fs::canonicalize(path.as_ref()).map_err(|error| Error::Runtime(format!("cannot open source file: {error}")))?; let root = path.parent().ok_or_else(|| Error::Runtime("source file has no parent directory".into()))?.to_path_buf(); let source = fs::read_to_string(&path).map_err(|error| Error::Runtime(format!("cannot read source file: {error}")))?; let program = Parser::new(lex(&source)?).program()?; let code = Compiler::with_module_root(root).compile(program)?; let mut vm = Vm { interactive: true, ..Vm::default() }; vm.run(&code)?; Ok(()) }
+pub fn execute_interactive_file(path: impl AsRef<Path>) -> Result<(), Error> { let path = fs::canonicalize(path.as_ref()).map_err(|error| Error::Runtime(format!("cannot open source file: {error}")))?; let root = path.parent().ok_or_else(|| Error::Runtime("source file has no parent directory".into()))?.to_path_buf(); let source = fs::read_to_string(&path).map_err(|error| Error::Runtime(format!("cannot read source file: {error}")))?; let (program, strings) = Parser::new(lex(&source)?).into_program()?; let code = Compiler::with_module_root(root).with_strings(strings).compile(program)?; let mut vm = Vm { interactive: true, ..Vm::default() }; vm.run(&code)?; Ok(()) }
 
 /// Opaque C ABI state. Only this crate may access its interior.
 #[repr(C)] pub struct L0State {
@@ -2575,5 +2740,33 @@ mod immediate_regression_tests {
     #[test]
     fn builtins_are_resolved_during_compilation() {
         assert_eq!(execute("let value: f32 = 4.0; print(sqrt(value)); print(min(value, 3.0))").unwrap(), vec!["2", "3"]);
+    }
+
+    #[test]
+    fn lexer_and_core_ast_names_share_string_ids() {
+        let lexed = lex("let repeated: i32 = 1; print(repeated)").unwrap();
+        let ids: Vec<_> = lexed.tokens.iter().filter_map(|token| match token.kind {
+            Token::Ident(id) => Some(id), _ => None,
+        }).collect();
+        assert_eq!(ids[0], ids[2]);
+        assert_eq!(lexed.strings.resolve(ids[0]), "repeated");
+    }
+
+    #[test]
+    fn executable_bytecode_is_a_flat_u32_stream() {
+        let (program, strings) = Parser::new(lex("let answer: i32 = 42; print(answer)").unwrap()).into_program().unwrap();
+        let code = Compiler::default().with_strings(strings).compile(program).unwrap();
+        assert!(code.words.iter().all(|word| *word <= u32::MAX));
+        assert_eq!(code.words.len() % 4, 0);
+        assert_eq!(Vm::default().run(&code).unwrap(), ["42"]);
+    }
+
+    #[test]
+    fn concat_allocates_exact_payload_capacity() {
+        let mut vm = Vm::default();
+        assert_eq!(vm.execute("let left: string = \"left\"; let right: string = \"right\"; let joined: string = left + right; print(joined)").unwrap(), ["leftright"]);
+        let Value::String(reference) = vm.locals[2] else { panic!("joined local is not a string") };
+        let HeapObject::String(joined) = vm.heap_ref().get(reference).unwrap() else { panic!("joined value is not a heap string") };
+        assert_eq!(joined.capacity(), joined.len());
     }
 }
