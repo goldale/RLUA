@@ -2948,21 +2948,24 @@ mod immediate_regression_tests {
         ));
     }
     #[test]
-    fn garbage_collection_allocates_and_frees_99999_chunks() {
+    fn garbage_collection_allocates_and_frees_999999_chunks() {
         let mut heap = Heap::default();
         let mut refs = Vec::new();
-        for i in 0..99999 {
-            refs.push(heap.allocate(HeapObject::String(format!("chunk {i}"))));
+        for i in 0..999999 {
+            let k:  i32 = i + 979999999 % 1333;
+            let j:   i64 = (i as i64) * (k as i64);
+            let fv: f32 = j  as f32;
+            refs.push(heap.allocate(HeapObject::String(format!("mem-Chunk {i}-{k}-{j}-{fv}"))));
         }
-        assert_eq!(heap.slots.len(), 99999);
-        let roots = vec![refs[0], refs[99998]];
+        assert_eq!(heap.slots.len(), 999999);
+        let roots = vec![refs[0], refs[999998]];
         let reclaimed = heap.collect(roots);
-        assert_eq!(reclaimed, 99997);
-        assert_eq!(heap.slots.len(), 99999);
+        assert_eq!(reclaimed, 999997);
+        assert_eq!(heap.slots.len(), 999999);
         assert!(heap.free_head.is_some());
         let reused_ref = heap.allocate(HeapObject::String("reused".into()));
-        assert!(reused_ref.0 > 0 && reused_ref.0 < 99998);
-        assert_eq!(heap.slots.len(), 99999);
+        assert!(reused_ref.0 > 0 && reused_ref.0 < 999998);
+        assert_eq!(heap.slots.len(), 999999);
         let reclaimed_final = heap.collect(Vec::new());
         assert_eq!(reclaimed_final, 3);
         assert_eq!(heap.slots.len(), 0);

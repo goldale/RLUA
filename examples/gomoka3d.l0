@@ -16,6 +16,7 @@ let dx: vector<i32> = [1, 0, 1,-1, 0, 1,-1, 0, 1,-1, 0, 1,-1]
 
 printf("--- 3D Гомоку 7x7x7 ---\n")
 printf("Вы играете за X (Игрок 1), Компьютер за O (Игрок 2). Соберите 5 в ряд!\n")
+printf("Игровое поле замкнуто! Линии проходят сквозь границы.\n")
 
 while active do
     if player == 1 then
@@ -28,70 +29,63 @@ while active do
         let action: i32 = input
 
         if action == 1 then
-            printf("Введите Z (слой/высота, 0-6): ")
+            printf("Введите Z (слой/высота): ")
             let z: i32 = input
-            printf("Введите Y (строка, 0-6): ")
+            printf("Введите Y (строка): ")
             let y: i32 = input
-            printf("Введите X (колонка, 0-6): ")
+            printf("Введите X (колонка): ")
             let x: i32 = input
 
-            if z >= 0 && z <= 6 && y >= 0 && y <= 6 && x >= 0 && x <= 6 then
-                if board[z, y, x] == 0 then
-                    board[z, y, x] = 1
-                    last_z = z
-                    last_y = y
-                    last_x = x
+            -- Замыкаем поле: любые координаты переносятся в пределы от 0 до 6
+            z = (z % 7 + 7) % 7
+            y = (y % 7 + 7) % 7
+            x = (x % 7 + 7) % 7
 
-                    -- Проверка на победу (Игрок 1)
-                    let win: bool = 1 == 0
-                    let dir: i32 = 0
+            if board[z, y, x] == 0 then
+                board[z, y, x] = 1
+                last_z = z
+                last_y = y
+                last_x = x
 
-                    while dir < 13 do
-                        let count: i32 = 1
+                -- Проверка на победу (Игрок 1)
+                let win: bool = 1 == 0
+                let dir: i32 = 0
 
-                        let step: i32 = 1
-                        let stop: bool = 1 == 0
-                        while step <= 4 && stop == (1 == 0) do
-                            let cz: i32 = z + dz[dir] * step
-                            let cy: i32 = y + dy[dir] * step
-                            let cx: i32 = x + dx[dir] * step
-                            if cz >= 0 && cz <= 6 && cy >= 0 && cy <= 6 && cx >= 0 && cx <= 6 then
-                                if board[cz, cy, cx] == 1 then count = count + 1 else stop = 1 == 1 end
-                            else
-                                stop = 1 == 1
-                            end
-                            step = step + 1
-                        end
+                while dir < 13 do
+                    let count: i32 = 1
 
-                        step = 1
-                        stop = 1 == 0
-                        while step <= 4 && stop == (1 == 0) do
-                            let cz: i32 = z - dz[dir] * step
-                            let cy: i32 = y - dy[dir] * step
-                            let cx: i32 = x - dx[dir] * step
-                            if cz >= 0 && cz <= 6 && cy >= 0 && cy <= 6 && cx >= 0 && cx <= 6 then
-                                if board[cz, cy, cx] == 1 then count = count + 1 else stop = 1 == 1 end
-                            else
-                                stop = 1 == 1
-                            end
-                            step = step + 1
-                        end
-
-                        if count >= 5 then win = 1 == 1 end
-                        dir = dir + 1
+                    let step: i32 = 1
+                    let stop: bool = 1 == 0
+                    while step <= 4 && stop == (1 == 0) do
+                        let cz: i32 = (z + dz[dir] * step + 35) % 7
+                        let cy: i32 = (y + dy[dir] * step + 35) % 7
+                        let cx: i32 = (x + dx[dir] * step + 35) % 7
+                        if board[cz, cy, cx] == 1 then count = count + 1 else stop = 1 == 1 end
+                        step = step + 1
                     end
 
-                    if win then
-                        printf("\n★★★ ВЫ ПОБЕДИЛИ! ★★★\n")
-                        active = 1 == 0
-                    else
-                        player = 2 -- Передаем ход компьютеру
+                    step = 1
+                    stop = 1 == 0
+                    while step <= 4 && stop == (1 == 0) do
+                        let cz: i32 = (z - dz[dir] * step + 35) % 7
+                        let cy: i32 = (y - dy[dir] * step + 35) % 7
+                        let cx: i32 = (x - dx[dir] * step + 35) % 7
+                        if board[cz, cy, cx] == 1 then count = count + 1 else stop = 1 == 1 end
+                        step = step + 1
                     end
+
+                    if count >= 5 then win = 1 == 1 end
+                    dir = dir + 1
+                end
+
+                if win then
+                    printf("\n★★★ ВЫ ПОБЕДИЛИ! ★★★\n")
+                    active = 1 == 0
                 else
-                    printf("Ошибка: эта ячейка уже занята!\n")
+                    player = 2 -- Передаем ход компьютеру
                 end
             else
-                printf("Ошибка: неверные координаты!\n")
+                printf("Ошибка: эта ячейка уже занята!\n")
             end
         end
 
@@ -180,18 +174,17 @@ while active do
             while cy_ai <= 1 && placed == (1 == 0) do
                 let cx_ai: i32 = -1
                 while cx_ai <= 1 && placed == (1 == 0) do
-                    let cand_z: i32 = last_z + cz_ai
-                    let cand_y: i32 = last_y + cy_ai
-                    let cand_x: i32 = last_x + cx_ai
+                    -- Логика ИИ также замкнута для поиска соседних клеток
+                    let cand_z: i32 = (last_z + cz_ai + 7) % 7
+                    let cand_y: i32 = (last_y + cy_ai + 7) % 7
+                    let cand_x: i32 = (last_x + cx_ai + 7) % 7
 
-                    if cand_z >= 0 && cand_z <= 6 && cand_y >= 0 && cand_y <= 6 && cand_x >= 0 && cand_x <= 6 then
-                        if board[cand_z, cand_y, cand_x] == 0 then
-                            board[cand_z, cand_y, cand_x] = 2
-                            placed = 1 == 1
-                            last_z = cand_z
-                            last_y = cand_y
-                            last_x = cand_x
-                        end
+                    if board[cand_z, cand_y, cand_x] == 0 then
+                        board[cand_z, cand_y, cand_x] = 2
+                        placed = 1 == 1
+                        last_z = cand_z
+                        last_y = cand_y
+                        last_x = cand_x
                     end
                     cx_ai = cx_ai + 1
                 end
@@ -235,28 +228,20 @@ while active do
             let step: i32 = 1
             let stop: bool = 1 == 0
             while step <= 4 && stop == (1 == 0) do
-                let cz: i32 = last_z + dz[ai_dir] * step
-                let cy: i32 = last_y + dy[ai_dir] * step
-                let cx: i32 = last_x + dx[ai_dir] * step
-                if cz >= 0 && cz <= 6 && cy >= 0 && cy <= 6 && cx >= 0 && cx <= 6 then
-                    if board[cz, cy, cx] == 2 then count = count + 1 else stop = 1 == 1 end
-                else
-                    stop = 1 == 1
-                end
+                let cz: i32 = (last_z + dz[ai_dir] * step + 35) % 7
+                let cy: i32 = (last_y + dy[ai_dir] * step + 35) % 7
+                let cx: i32 = (last_x + dx[ai_dir] * step + 35) % 7
+                if board[cz, cy, cx] == 2 then count = count + 1 else stop = 1 == 1 end
                 step = step + 1
             end
 
             step = 1
             stop = 1 == 0
             while step <= 4 && stop == (1 == 0) do
-                let cz: i32 = last_z - dz[ai_dir] * step
-                let cy: i32 = last_y - dy[ai_dir] * step
-                let cx: i32 = last_x - dx[ai_dir] * step
-                if cz >= 0 && cz <= 6 && cy >= 0 && cy <= 6 && cx >= 0 && cx <= 6 then
-                    if board[cz, cy, cx] == 2 then count = count + 1 else stop = 1 == 1 end
-                else
-                    stop = 1 == 1
-                end
+                let cz: i32 = (last_z - dz[ai_dir] * step + 35) % 7
+                let cy: i32 = (last_y - dy[ai_dir] * step + 35) % 7
+                let cx: i32 = (last_x - dx[ai_dir] * step + 35) % 7
+                if board[cz, cy, cx] == 2 then count = count + 1 else stop = 1 == 1 end
                 step = step + 1
             end
 

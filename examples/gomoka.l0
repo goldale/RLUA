@@ -7,6 +7,10 @@ let player: i8 = 1
 let last_r: i32 = 10
 let last_c: i32 = 10
 
+-- Направления для проверки выигрыша и эвристики ИИ (горизонталь, вертикаль, диагональ 1, диагональ 2)
+let chk_dr: vector<i32> = [0, 1, 1, 1]
+let chk_dc: vector<i32> = [1, 0, 1, -1]
+
 while active do
     putc(10)
     putc(32) putc(32)
@@ -42,56 +46,171 @@ while active do
         putc(67) putc(58) putc(32)
         let col: i32 = input
 
-        if row < 0 || row > 20 || col < 0 || col > 20 then
-            putc(33) putc(33) putc(10)
-        else
-            if board[row, col] == 0 then
-                board[row, col] = 1
-                last_r = row
-                last_c = col
-                player = 2
-            else
-                putc(88) putc(88) putc(10)
+        -- Тороидальное замыкание координат для игрока
+        row = (row % 21 + 21) % 21
+        col = (col % 21 + 21) % 21
+
+        if board[row, col] == 0 then
+            board[row, col] = 1
+            last_r = row
+            last_c = col
+
+            -- Проверка на победу (Игрок 1)
+            let win: bool = 1 == 0
+            let dir: i32 = 0
+            while dir < 4 do
+                let count: i32 = 1
+
+                let step: i32 = 1
+                let stop: bool = 1 == 0
+                while step <= 4 && stop == (1 == 0) do
+                    let cr: i32 = (last_r + chk_dr[dir] * step + 105) % 21
+                    let cc: i32 = (last_c + chk_dc[dir] * step + 105) % 21
+                    if board[cr, cc] == 1 then count = count + 1 else stop = 1 == 1 end
+                    step = step + 1
+                end
+
+                step = 1
+                stop = 1 == 0
+                while step <= 4 && stop == (1 == 0) do
+                    let cr: i32 = (last_r - chk_dr[dir] * step + 105) % 21
+                    let cc: i32 = (last_c - chk_dc[dir] * step + 105) % 21
+                    if board[cr, cc] == 1 then count = count + 1 else stop = 1 == 1 end
+                    step = step + 1
+                end
+
+                if count >= 5 then win = 1 == 1 end
+                dir = dir + 1
             end
+
+            if win then
+                printf("\n★★★ ВЫ ПОБЕДИЛИ! ★★★\n")
+                active = 1 == 0
+            else
+                player = 2
+            end
+        else
+            putc(88) putc(88) putc(10)
         end
     else
         putc(65) putc(73) putc(46) putc(46) putc(10)
-        let placed: bool = 1 == 0
-        let dr: vector<i32> = [0, 0, 1, -1, 1, 1, -1, -1, 0, 0, 2, -2, 2, 2, -2, -2]
-        let dc: vector<i32> = [1, -1, 0, 0, 1, -1, 1, -1, 2, -2, 0, 0, 2, -2, 2, -2]
-        let off_idx: i32 = 0
+        printf("Компьютер думает...\n")
 
-        while off_idx < 16 do
-            if placed == (1 == 0) then
-                let cand_r: i32 = last_r + dr[off_idx]
-                let cand_c: i32 = last_c + dc[off_idx]
-                if cand_r >= 0 && cand_r <= 20 && cand_c >= 0 && cand_c <= 20 then
-                    if board[cand_r, cand_c] == 0 then
-                        board[cand_r, cand_c] = 2
-                        last_r = cand_r
-                        last_c = cand_c
-                        placed = 1 == 1
+        let best_r: i32 = -1
+        let best_c: i32 = -1
+        let best_score: i32 = -1
+
+        -- ИИ анализирует все клетки на доске
+        let cand_r: i32 = 0
+        while cand_r < 21 do
+            let cand_c: i32 = 0
+            while cand_c < 21 do
+                if board[cand_r, cand_c] == 0 then
+                    let score: i32 = 0
+                    let dir: i32 = 0
+                    while dir < 4 do
+                        -- Симуляция постановки камня ИИ
+                        let c_ai: i32 = 1
+                        let step: i32 = 1
+                        let stop: bool = 1 == 0
+                        while step <= 4 && stop == (1 == 0) do
+                            let cr: i32 = (cand_r + chk_dr[dir] * step + 105) % 21
+                            let cc: i32 = (cand_c + chk_dc[dir] * step + 105) % 21
+                            if board[cr, cc] == 2 then c_ai = c_ai + 1 else stop = 1 == 1 end
+                            step = step + 1
+                        end
+                        step = 1
+                        stop = 1 == 0
+                        while step <= 4 && stop == (1 == 0) do
+                            let cr: i32 = (cand_r - chk_dr[dir] * step + 105) % 21
+                            let cc: i32 = (cand_c - chk_dc[dir] * step + 105) % 21
+                            if board[cr, cc] == 2 then c_ai = c_ai + 1 else stop = 1 == 1 end
+                            step = step + 1
+                        end
+
+                        -- Симуляция постановки камня игрока
+                        let c_pl: i32 = 1
+                        step = 1
+                        stop = 1 == 0
+                        while step <= 4 && stop == (1 == 0) do
+                            let cr: i32 = (cand_r + chk_dr[dir] * step + 105) % 21
+                            let cc: i32 = (cand_c + chk_dc[dir] * step + 105) % 21
+                            if board[cr, cc] == 1 then c_pl = c_pl + 1 else stop = 1 == 1 end
+                            step = step + 1
+                        end
+                        step = 1
+                        stop = 1 == 0
+                        while step <= 4 && stop == (1 == 0) do
+                            let cr: i32 = (cand_r - chk_dr[dir] * step + 105) % 21
+                            let cc: i32 = (cand_c - chk_dc[dir] * step + 105) % 21
+                            if board[cr, cc] == 1 then c_pl = c_pl + 1 else stop = 1 == 1 end
+                            step = step + 1
+                        end
+
+                        -- Расчёт веса позиции
+                        if c_ai >= 5 then score = score + 100000 end
+                        if c_ai == 4 then score = score + 1000 end
+                        if c_ai == 3 then score = score + 100 end
+                        if c_ai == 2 then score = score + 10 end
+
+                        if c_pl >= 5 then score = score + 80000 end
+                        if c_pl == 4 then score = score + 800 end
+                        if c_pl == 3 then score = score + 80 end
+                        if c_pl == 2 then score = score + 8 end
+
+                        dir = dir + 1
+                    end
+
+                    if score > best_score then
+                        best_score = score
+                        best_r = cand_r
+                        best_c = cand_c
                     end
                 end
+                cand_c = cand_c + 1
             end
-            off_idx = off_idx + 1
+            cand_r = cand_r + 1
         end
 
-        -- Fallback
-        if placed == (1 == 0) then
-            let f_r: i32 = 0
-            while f_r < 21 do
-                let f_c: i32 = 0
-                while f_c < 21 do
-                    if placed == (1 == 0) && board[f_r, f_c] == 0 then
-                        board[f_r, f_c] = 2
-                        placed = 1 == 1
-                    end
-                    f_c = f_c + 1
-                end
-                f_r = f_r + 1
-            end
+        if best_r != -1 then
+            board[best_r, best_c] = 2
+            last_r = best_r
+            last_c = best_c
         end
-        player = 1
+
+        -- Проверка на победу (ИИ)
+        let ai_win: bool = 1 == 0
+        let ai_dir: i32 = 0
+        while ai_dir < 4 do
+            let count: i32 = 1
+
+            let step: i32 = 1
+            let stop: bool = 1 == 0
+            while step <= 4 && stop == (1 == 0) do
+                let cr: i32 = (last_r + chk_dr[ai_dir] * step + 105) % 21
+                let cc: i32 = (last_c + chk_dc[ai_dir] * step + 105) % 21
+                if board[cr, cc] == 2 then count = count + 1 else stop = 1 == 1 end
+                step = step + 1
+            end
+
+            step = 1
+            stop = 1 == 0
+            while step <= 4 && stop == (1 == 0) do
+                let cr: i32 = (last_r - chk_dr[ai_dir] * step + 105) % 21
+                let cc: i32 = (last_c - chk_dc[ai_dir] * step + 105) % 21
+                if board[cr, cc] == 2 then count = count + 1 else stop = 1 == 1 end
+                step = step + 1
+            end
+
+            if count >= 5 then ai_win = 1 == 1 end
+            ai_dir = ai_dir + 1
+        end
+
+        if ai_win then
+            printf("\n☠ КОМПЬЮТЕР ПОБЕДИЛ! ☠\n")
+            active = 1 == 0
+        else
+            player = 1
+        end
     end
 end
