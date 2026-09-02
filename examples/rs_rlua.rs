@@ -7,14 +7,14 @@ fn main() -> Result<(), Error> {
         let b: i32 = 15;
         print(a + b);
     ";
-    
+
     // Компиляция и запуск скрипта с получением массива выведенных строк[cite: 1]
     let output = execute(script)?; //[cite: 1]
-    
+
     // Чтение строк, которые скрипт передал в функцию print() внутри VM
     for line in output {
         println!("Вывод L0-скрипта: {}", line);
     }
-    
+
     Ok(())
 }

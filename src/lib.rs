@@ -953,8 +953,8 @@ impl Compiler {
             }
             Ok(())
         },
-        Statement::MethodDefinition { struct_name, method, args, body } => { 
-            self.compile_method_body(&struct_name, &method, args, body) 
+        Statement::MethodDefinition { struct_name, method, args, body } => {
+            self.compile_method_body(&struct_name, &method, args, body)
         },
         Statement::ExportLet { name, ty, expr } => { self.statement(Statement::Let { name: name.clone(), ty, expr })?; let (slot, ty) = self.names.get(&name).cloned().ok_or_else(|| Error::Runtime("missing exported local".into()))?; if self.exports.insert(name.clone(), ModuleExport::Value { slot, ty }).is_some() { return Err(Error::Type(format!("module already exports '{name}'"))); } Ok(()) },
         Statement::ExportStruct { name, fields, methods } => { self.statement(Statement::Struct { name: name.clone(), fields, methods })?; let layout = self.structs.get(&name).cloned().ok_or_else(|| Error::Runtime("missing exported struct".into()))?; if self.exports.insert(name.clone(), ModuleExport::Struct(layout)).is_some() { return Err(Error::Type(format!("module already exports '{name}'"))); } Ok(()) },
