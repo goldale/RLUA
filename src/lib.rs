@@ -362,7 +362,7 @@ pub enum UnOp { Neg, Not }
 
 #[derive(Clone, Debug, PartialEq)]
 enum Token {
-    Let, Print, Printf, Putc, Input, This, Function, Export, Require, If, Then, Else, While, For, Do, Break, Continue, Struct, Table, End,
+    Let, Print, Printf, Putc, Input, This, Function, Export, Require, If, Then, Else, ElseIf, While, For, Do, Break, Continue, Struct, Table, End,
     Ident(StringId), Integer(i128), Float(f64), StringLit(StringId), Colon, DoubleColon,
     Equal, EqualEqual, Bang, BangEq, Plus, Minus, Star, Slash, Percent,
     Ampersand, Pipe, Caret, Shl, Shr, AndAnd, OrOr,
@@ -454,7 +454,7 @@ fn lex(source: &str) -> Result<LexedTokens, Error> {
                     "let" => Token::Let, "print" => Token::Print, "printf" => Token::Printf,
                     "putc" => Token::Putc, "input" => Token::Input, "this" => Token::This,
                     "function" => Token::Function, "export" => Token::Export, "require" => Token::Require,
-                    "if" => Token::If, "then" => Token::Then, "else" => Token::Else,
+                    "if" => Token::If, "then" => Token::Then, "else" => Token::Else, "elseif" => Token::ElseIf,
                     "while" => Token::While, "for" => Token::For, "do" => Token::Do,
                     "break" => Token::Break, "continue" => Token::Continue, "struct" => Token::Struct,
                     "table" => Token::Table, "end" => Token::End, _ => Token::Ident(strings.intern(&word))
@@ -515,11 +515,34 @@ impl Parser {
     }
     fn block(&mut self) -> Result<Vec<Statement>, Error> {
         let mut statements = Vec::new();
-        while !matches!(self.peek(), Token::Eof | Token::Else | Token::End) {
+        while !matches!(self.peek(), Token::Eof | Token::Else | Token::ElseIf | Token::End) {
             statements.push(self.statement()?);
             if *self.peek() == Token::Semi { self.next(); }
         }
         Ok(statements)
+    }
+    fn parse_else_if_chain(&mut self) -> Result<Vec<Statement>, Error> {
+        if *self.peek() == Token::ElseIf {
+            let location = self.location();
+            self.next(); // поглощаем ElseIf
+            let condition = self.expr()?;
+            self.need(Token::Then)?;
+            let then_body = self.block()?;
+            let else_body = self.parse_else_if_chain()?;
+            let nested_if = Statement::Located {
+                node: Box::new(Statement::If { condition, then_body, else_body }),
+                location
+            };
+            Ok(vec![nested_if])
+        } else if *self.peek() == Token::Else {
+            self.next();
+            let else_body = self.block()?;
+            self.need(Token::End)?;
+            Ok(else_body)
+        } else {
+            self.need(Token::End)?;
+            Ok(Vec::new())
+        }
     }
     fn struct_declaration(&mut self) -> Result<(String, Vec<(String, Type)>, Vec<StructMethod>), Error> {
         let name = match self.next() { Token::Ident(name) => self.string(name), token => return Err(Error::Parse(format!("expected struct name, got {token:?}"))) };
@@ -607,7 +630,7 @@ impl Parser {
             Ok(Statement::Printf { format, args })
         },
         Token::Putc => { let parenthesized = *self.peek() == Token::LParen; if parenthesized { self.next(); } let expr = self.expr()?; if parenthesized { self.need(Token::RParen)?; } Ok(Statement::Putc(expr)) },
-        Token::If => { let condition = self.expr()?; self.need(Token::Then)?; let then_body = self.block()?; let else_body = if *self.peek() == Token::Else { self.next(); self.block()? } else { Vec::new() }; self.need(Token::End)?; Ok(Statement::If { condition, then_body, else_body }) },
+        Token::If => { let condition = self.expr()?; self.need(Token::Then)?; let then_body = self.block()?; let else_body = self.parse_else_if_chain()?; Ok(Statement::If { condition, then_body, else_body }) },
         Token::While => { let condition = self.expr()?; self.need(Token::Do)?; let body = self.block()?; self.need(Token::End)?; Ok(Statement::While { condition, body }) },
         Token::For => {
             let name = match self.next() { Token::Ident(name) => self.string(name), token => return Err(Error::Parse(format!("expected loop variable, got {token:?}"))) };
@@ -2734,7 +2757,6 @@ mod immediate_regression_tests {
     fn builtins_are_resolved_during_compilation() {
         assert_eq!(execute("let value: f32 = 4.0; print(sqrt(value)); print(min(value, 3.0))").unwrap(), vec!["2", "3"]);
     }
-
     #[test]
     fn lexer_and_core_ast_names_share_string_ids() {
         let lexed = lex("let repeated: i32 = 1; print(repeated)").unwrap();
@@ -2761,5 +2783,21 @@ mod immediate_regression_tests {
         let Value::String(reference) = vm.locals[2] else { panic!("joined local is not a string") };
         let HeapObject::String(joined) = vm.heap_ref().get(reference).unwrap() else { panic!("joined value is not a heap string") };
         assert_eq!(joined.capacity(), joined.len());
+    }
+    #[test]
+    fn elseif_chain_evaluates_correctly() {
+        let source = "
+            let x: i32 = 2
+            if x == 1 then
+                print(10)
+            elseif x == 2 then
+                print(20)
+            elseif x == 3 then
+                print(30)
+            else
+                print(40)
+            end
+        ";
+        assert_eq!(execute(source).unwrap(), vec!["20".to_owned()]);
     }
 }
