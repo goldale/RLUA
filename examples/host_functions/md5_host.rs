@@ -1,0 +1,108 @@
+use l0::{Error, Heap, HeapObject, Type, Value, Vm};
+use md5::{Digest, Md5};
+use std::cell::RefCell;
+
+/// Вычисляет MD5 для массива байтов (vector<u8>)
+fn md5_bytes(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Error> {
+    let [arg] = arguments else {
+        return Err(Error::Runtime("md5_bytes expects 1 argument".into()));
+    };
+
+    // Блок для локального неизменяемого заимствования кучи
+    let digest = {
+        let h = heap.borrow();
+        let bytes: &[u8] = match arg {
+            Value::Array(reference, ty) if **ty == Type::U8 => {
+                match h.get(*reference)? {
+                    HeapObject::Array { bytes, .. } => bytes.as_slice(),
+                    _ => return Err(Error::Runtime("invalid array heap object".into())),
+                }
+            }
+            _ => return Err(Error::Type("md5_bytes expects vector<u8>".into())),
+        };
+
+        let mut hasher = Md5::new();
+        hasher.update(bytes);
+        hasher.finalize()
+    };
+
+    let hex_str = format!("{:x}", digest);
+
+    // Изменяемое заимствование для аллокации результата-строки
+    let mut h = heap.borrow_mut();
+    let ref_id = h.allocate(HeapObject::String(hex_str));
+    Ok(Value::String(ref_id))
+}
+
+/// Вычисляет MD5 для строки (string)
+fn md5_string(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Error> {
+    let [arg] = arguments else {
+        return Err(Error::Runtime("md5_string expects 1 argument".into()));
+    };
+
+    let digest = {
+        let h = heap.borrow();
+        let bytes: &[u8] = match arg {
+            Value::String(reference) => match h.get(*reference)? {
+                HeapObject::String(text) => text.as_bytes(),
+                _ => return Err(Error::Runtime("invalid string heap object".into())),
+            },
+            _ => return Err(Error::Type("md5_string expects a string".into())),
+        };
+
+        let mut hasher = Md5::new();
+        hasher.update(bytes);
+        hasher.finalize()
+    };
+
+    let hex_str = format!("{:x}", digest);
+
+    let mut h = heap.borrow_mut();
+    let ref_id = h.allocate(HeapObject::String(hex_str));
+    Ok(Value::String(ref_id))
+}
+
+fn main() -> Result<(), Error> {
+    let mut vm = Vm::default();
+
+    // Регистрация функции для vector<u8>
+    vm.register_rust_function(
+        "md5_bytes",
+        vec![Type::Array(Box::new(Type::U8))],
+        Type::String,
+        md5_bytes,
+    )?;
+
+    // Регистрация функции для string
+    vm.register_rust_function(
+        "md5_string",
+        vec![Type::String],
+        Type::String,
+        md5_string,
+    )?;
+
+    // Выполнение тестового скрипта L0
+    let script = r#"
+        -- 1. Хэширование массива байтов (ASCII коды слова "hello")
+        let data: vector<u8> = [104, 101, 108, 108, 111]
+        let hash1: string = md5_bytes(data)
+        
+        -- 2. Хэширование строки
+        let str_data: string = "hello"
+        let hash2: string = md5_string(str_data)
+
+        print("MD5 from vector<u8>:")
+        print(hash1)
+        
+        print("MD5 from string:")
+        print(hash2)
+        
+        if hash1 == hash2 then
+            print("Hashes match!")
+        end
+    "#;
+    for line in vm.execute(script)? {
+        println!("{line}");
+    }
+    Ok(())
+}

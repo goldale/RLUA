@@ -1,0 +1,30 @@
+-- examples/cust_test_casting.l0
+printf("=== RUN   cust_test_casting ===\n")
+
+-- 1. Преобразование целых чисел (сужение и изменение знаковости)
+let a: i32 = 300
+let b: u8 = a as u8 -- усечение старших битов (300 % 256 = 44)
+printf("300 as u8 = {}\n", b)
+
+let neg: i32 = -1
+let u: u8 = neg as u8 -- знаковое в беззнаковое с циклическим переносом (-1 -> 255)
+printf("-1 as u8 = {}\n", u)
+
+-- 2. Преобразование чисел с плавающей точкой в целые (отбрасывание дробной части)
+let float_val: f64 = -3.7
+let int_val: i32 = float_val as i32 -- результат: -3
+printf("-3.7 as i32 = {}\n", int_val)
+
+-- 3. Преобразование между форматами с плавающей точкой (включая f16)
+let orig_f32: f32 = 2.5
+let half: f16 = orig_f32 as f16
+let back_f64: f64 = half as f64
+printf("2.5 (f32) -> f16 -> f64 = {}\n", back_f64)
+
+-- 4. Цепочки преобразований
+let chained: i32 = 123.75 as f32 as i32
+printf("123.75 as f32 as i32 = {}\n", chained)
+
+-- 5. Преобразование результата выражения (в скобках)
+let expr_cast: f64 = (10 + 5) as f64 / 2.0
+printf("(10 + 5) as f64 / 2.0 = {}\n", expr_cast)

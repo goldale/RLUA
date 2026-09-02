@@ -21,3 +21,8 @@ codegen-units = 1
 
 [dependencies]
 half = "2.7.1"
+md-5 = "0.10.6"
+
+[[example]]
+name = "md5_host"
+path = "examples/host_functions/md5_host.rs"
