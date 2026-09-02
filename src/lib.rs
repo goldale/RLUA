@@ -285,10 +285,15 @@ fn write_scalar(bytes: &mut [u8], index: usize, value: &Value, element: &Type) -
     if offset + size > bytes.len() {
         return Err(Error::Runtime(format!("array index {} is out of bounds", index)));
     }
-
-    let mut encoded = Vec::with_capacity(size);
-    encode_scalar(value, element, &mut encoded)?;
-    bytes[offset..offset + size].copy_from_slice(&encoded);
+    if &value.ty() != element { return Err(Error::Runtime("VM array type invariant broken".into())); }
+    let cell = &mut bytes[offset..offset + size];
+    match value {
+        Value::I8(v) => cell[0] = *v as u8, Value::U8(v) => cell[0] = *v, Value::Bool(v) => cell[0] = u8::from(*v),
+        Value::I16(v) => cell.copy_from_slice(&v.to_le_bytes()), Value::U16(v) | Value::F16(v) => cell.copy_from_slice(&v.to_le_bytes()),
+        Value::I32(v) => cell.copy_from_slice(&v.to_le_bytes()), Value::U32(v) => cell.copy_from_slice(&v.to_le_bytes()), Value::F32(v) => cell.copy_from_slice(&v.to_bits().to_le_bytes()),
+        Value::I64(v) => cell.copy_from_slice(&v.to_le_bytes()), Value::U64(v) => cell.copy_from_slice(&v.to_le_bytes()), Value::F64(v) => cell.copy_from_slice(&v.to_bits().to_le_bytes()),
+        _ => return Err(Error::Type("packed arrays can contain only scalar values".into())),
+    }
     Ok(())
 }
 impl fmt::Display for Value {
@@ -305,9 +310,18 @@ impl fmt::Display for Value {
         }
     }
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SourceLocation { pub offset: usize, pub line: usize, pub column: usize }
+impl SourceLocation {
+    fn at(chars: &[char], offset: usize) -> Self { let mut line = 1; let mut column = 1; for ch in &chars[..offset.min(chars.len())] { if *ch == '\n' { line += 1; column = 1; } else { column += 1; } } Self { offset, line, column } }
+}
 #[derive(Debug, Clone, PartialEq)]
-pub enum Error { Lex(String), Parse(String), Type(String), Runtime(String) }
-impl fmt::Display for Error { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{:?}", self) } }
+pub enum Error { Lex(String), Parse(String), Type(String), Runtime(String), Located { source: Box<Error>, location: SourceLocation } }
+impl Error {
+    fn at(self, location: SourceLocation) -> Self { match self { Self::Located { .. } => self, source => Self::Located { source: Box::new(source), location } } }
+    pub fn location(&self) -> Option<SourceLocation> { match self { Self::Located { location, .. } => Some(*location), _ => None } }
+}
+impl fmt::Display for Error { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { match self { Self::Lex(message) => write!(f, "lex error: {message}"), Self::Parse(message) => write!(f, "parse error: {message}"), Self::Type(message) => write!(f, "type error: {message}"), Self::Runtime(message) => write!(f, "runtime error: {message}"), Self::Located { source, location } => write!(f, "{source} at line {}, column {}", location.line, location.column), } } }
 impl std::error::Error for Error {}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -325,17 +339,30 @@ enum Token {
 }
 
 #[derive(Clone, Debug)]
+struct SpannedToken { kind: Token, location: SourceLocation }
+struct TokenBuffer { tokens: Vec<SpannedToken>, location: SourceLocation }
+impl TokenBuffer {
+    fn new() -> Self { Self { tokens: Vec::new(), location: SourceLocation { offset: 0, line: 1, column: 1 } } }
+    fn begin(&mut self, chars: &[char], offset: usize) { self.location = SourceLocation::at(chars, offset); }
+    fn location(&self) -> SourceLocation { self.location }
+    fn push(&mut self, kind: Token) { self.tokens.push(SpannedToken { kind, location: self.location }); }
+    fn into_tokens(self) -> Vec<SpannedToken> { self.tokens }
+}
+
+#[derive(Clone, Debug)]
 enum Expr {
     Integer(i128), Float(f64), String(String), Input, This, Require(String), Name(String),
     Array(Vec<Expr>), Table(Vec<(TableLiteralKey, Expr)>), StructLiteral(String, Vec<(String, Expr)>),
     Binary(Box<Expr>, BinOp, Box<Expr>), Unary(UnOp, Box<Expr>),
     Index(Box<Expr>, Vec<Expr>), Field(Box<Expr>, String),
-    Call(String, Vec<Expr>), TensorFactory { name: String, element: Type, shape: Box<Expr> }
+    Call(String, Vec<Expr>), TensorFactory { name: String, element: Type, shape: Box<Expr> },
+    Located { node: Box<Expr>, location: SourceLocation },
 }
 
-fn lex(source: &str) -> Result<Vec<Token>, Error> {
-    let mut result = Vec::new(); let chars: Vec<char> = source.chars().collect(); let mut i = 0;
+fn lex(source: &str) -> Result<Vec<SpannedToken>, Error> {
+    let mut result = TokenBuffer::new(); let chars: Vec<char> = source.chars().collect(); let mut i = 0;
     while i < chars.len() {
+        result.begin(&chars, i);
         match chars[i] {
             c if c.is_whitespace() => i += 1,
             '-' if chars.get(i + 1) == Some(&'-') => { while i < chars.len() && chars[i] != '\n' { i += 1; } }
@@ -390,7 +417,7 @@ fn lex(source: &str) -> Result<Vec<Token>, Error> {
                     }
                     i += 1;
                 }
-                if i >= chars.len() { return Err(Error::Lex("unterminated string".into())); }
+                if i >= chars.len() { return Err(Error::Lex("unterminated string".into()).at(result.location())); }
                 i += 1;
                 result.push(Token::StringLit(string_val));
             },
@@ -413,10 +440,10 @@ fn lex(source: &str) -> Result<Vec<Token>, Error> {
                 let raw: String = chars[start..i].iter().collect();
                 result.push(if dot { Token::Float(raw.parse().map_err(|_| Error::Lex(raw.clone()))?) } else { Token::Integer(raw.parse().map_err(|_| Error::Lex(raw.clone()))?) });
             }
-            other => return Err(Error::Lex(format!("unexpected character '{other}'"))),
+            other => return Err(Error::Lex(format!("unexpected character '{other}'")).at(result.location())),
         }
     }
-    result.push(Token::Eof); Ok(result)
+    result.begin(&chars, i); result.push(Token::Eof); Ok(result.into_tokens())
 }
 
 #[derive(Clone, Debug)]
@@ -444,15 +471,17 @@ enum Statement {
     For { name: String, start: Expr, end: Expr, body: Vec<Statement> },
     Break,
     Continue,
+    Located { node: Box<Statement>, location: SourceLocation },
 }
 
-struct Parser { tokens: Vec<Token>, at: usize }
+struct Parser { tokens: Vec<SpannedToken>, at: usize, last_location: SourceLocation }
 impl Parser {
-    fn new(tokens: Vec<Token>) -> Self { Self { tokens, at: 0 } }
-    fn peek(&self) -> &Token { &self.tokens[self.at] }
-    fn next(&mut self) -> Token { let t = self.tokens[self.at].clone(); self.at += 1; t }
+    fn new(tokens: Vec<SpannedToken>) -> Self { Self { tokens, at: 0, last_location: SourceLocation { offset: 0, line: 1, column: 1 } } }
+    fn peek(&self) -> &Token { &self.tokens[self.at].kind }
+    fn location(&self) -> SourceLocation { self.tokens.get(self.at).map(|token| token.location).unwrap_or(self.last_location) }
+    fn next(&mut self) -> Token { let token = self.tokens[self.at].clone(); self.at += 1; self.last_location = token.location; token.kind }
     fn need(&mut self, wanted: Token) -> Result<(), Error> { let got = self.next(); if got == wanted { Ok(()) } else { Err(Error::Parse(format!("expected {wanted:?}, got {got:?}"))) } }
-    fn program(&mut self) -> Result<Vec<Statement>, Error> { self.block() }
+    fn program(&mut self) -> Result<Vec<Statement>, Error> { self.block().map_err(|error| error.at(self.location())) }
     fn block(&mut self) -> Result<Vec<Statement>, Error> {
         let mut statements = Vec::new();
         while !matches!(self.peek(), Token::Eof | Token::Else | Token::End) {
@@ -502,7 +531,8 @@ impl Parser {
         let name = match self.next() { Token::Ident(n) => n, x => return Err(Error::Parse(format!("expected name, got {x:?}"))) };
         self.need(Token::Colon)?; let ty = self.ty()?; self.need(Token::Equal)?; let expr = self.expr()?; Ok((name, ty, expr))
     }
-    fn statement(&mut self) -> Result<Statement, Error> { match self.next() {
+    fn statement(&mut self) -> Result<Statement, Error> { let location = self.location(); let node = self.statement_inner().map_err(|error| error.at(location))?; Ok(Statement::Located { node: Box::new(node), location }) }
+    fn statement_inner(&mut self) -> Result<Statement, Error> { match self.next() {
         Token::Struct => { let (name, fields, methods) = self.struct_declaration()?; Ok(Statement::Struct { name, fields, methods }) },
         Token::Export => match self.next() {
             Token::Let => { let (name, ty, expr) = self.let_declaration()?; Ok(Statement::ExportLet { name, ty, expr }) },
@@ -602,7 +632,8 @@ impl Parser {
         Token::Struct => match self.next() { Token::Ident(name) => Ok(Type::Struct(name)), token => Err(Error::Parse(format!("expected struct name, got {token:?}"))) },
         x => Err(Error::Parse(format!("expected type, got {x:?}"))) }
     }
-    fn expr(&mut self) -> Result<Expr, Error> { self.logical_or() }
+    fn expr(&mut self) -> Result<Expr, Error> { let location = self.location(); let node = self.expr_inner().map_err(|error| error.at(location))?; Ok(Expr::Located { node: Box::new(node), location }) }
+    fn expr_inner(&mut self) -> Result<Expr, Error> { self.logical_or() }
     fn indices(&mut self) -> Result<Vec<Expr>, Error> {
         let mut indices = Vec::new();
         loop {
@@ -718,7 +749,10 @@ impl Parser {
             },
             Token::Ident(n) => {
                 let mut struct_name = n.clone();
-                if *self.peek() == Token::Dot && matches!(self.tokens.get(self.at + 1), Some(Token::Ident(_))) && matches!(self.tokens.get(self.at + 2), Some(Token::LBrace)) {
+                if *self.peek() == Token::Dot
+                    && matches!(self.tokens.get(self.at + 1), Some(SpannedToken { kind: Token::Ident(_), .. }))
+                    && matches!(self.tokens.get(self.at + 2), Some(SpannedToken { kind: Token::LBrace, .. }))
+                {
                     self.next();
                     let member = match self.next() { Token::Ident(member) => member, _ => unreachable!() };
                     struct_name = format!("{n}.{member}");
@@ -992,6 +1026,7 @@ impl Compiler {
         Ok(())
     }
     fn statement(&mut self, stmt: Statement) -> Result<(), Error> { match stmt {
+        Statement::Located { node, location } => return self.statement(*node).map_err(|error| error.at(location)),
         Statement::Struct { name, fields, methods } => {
             if self.structs.contains_key(&name) {
                 return Err(Error::Type(format!("struct '{name}' is already defined")));
@@ -1176,6 +1211,7 @@ impl Compiler {
     }
 
     fn expr(&mut self, expr: Expr, expected: Option<&Type>) -> Result<Type, Error> { match expr {
+        Expr::Located { node, location } => return self.expr(*node, expected).map_err(|error| error.at(location)),
         Expr::Integer(n) => { let ty = expected.unwrap_or(&Type::I32); let val = int_value(n, ty)?; self.code.push(Op::Push(val)); Ok(ty.clone()) },
         Expr::Float(n) => {
             let ty = expected.unwrap_or(&Type::F64);
@@ -1685,7 +1721,7 @@ impl Vm {
                 }
             },
             Op::StoreField(slot, field) => { let new_value = self.pop()?; if &new_value.ty() != &field.ty { return Err(Error::Runtime("VM type invariant broken".into())); } let Value::Struct(reference, _) = self.locals.get(*slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? else { return Err(Error::Runtime("VM struct slot invariant broken".into())); }; match self.heap.borrow_mut().get_mut(*reference)? { HeapObject::Struct { values, .. } => { *values.get_mut(field.index).ok_or_else(|| Error::Runtime("invalid struct field index".into()))? = new_value; }, _ => return Err(Error::Runtime("struct heap invariant broken".into())), } },
-            Op::StoreFieldIndex(slot, field, element) => { let value = self.pop()?; if &value.ty() != element { return Err(Error::Runtime("VM vector type invariant broken".into())); } let index = integer_to_usize(&self.pop()?)?; let Value::Struct(struct_reference, _) = self.locals.get(*slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? else { return Err(Error::Runtime("VM struct slot invariant broken".into())); }; let array_reference = match self.heap.borrow().get(*struct_reference)? { HeapObject::Struct { values, .. } => match values.get(field.index) { Some(Value::Array(reference, _)) => *reference, _ => return Err(Error::Runtime("VM struct vector field invariant broken".into())), }, _ => return Err(Error::Runtime("struct heap invariant broken".into())), }; let mut encoded = Vec::new(); encode_scalar(&value, element, &mut encoded)?; match self.heap.borrow_mut().get_mut(array_reference)? { HeapObject::Array { bytes, element: stored_element } if stored_element == element => { let start = index.checked_mul(encoded.len()).ok_or_else(|| Error::Runtime("array index too large".into()))?; let end = start.checked_add(encoded.len()).ok_or_else(|| Error::Runtime("array index too large".into()))?; if end > bytes.len() { return Err(Error::Runtime(format!("array index {index} is out of bounds (length {})", bytes.len() / encoded.len()))); } bytes[start..end].copy_from_slice(&encoded); }, _ => return Err(Error::Runtime("array heap invariant broken".into())), } },
+            Op::StoreFieldIndex(slot, field, element) => { let value = self.pop()?; if &value.ty() != element { return Err(Error::Runtime("VM vector type invariant broken".into())); } let index = integer_to_usize(&self.pop()?)?; let Value::Struct(struct_reference, _) = self.locals.get(*slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? else { return Err(Error::Runtime("VM struct slot invariant broken".into())); }; let array_reference = match self.heap.borrow().get(*struct_reference)? { HeapObject::Struct { values, .. } => match values.get(field.index) { Some(Value::Array(reference, _)) => *reference, _ => return Err(Error::Runtime("VM struct vector field invariant broken".into())), }, _ => return Err(Error::Runtime("struct heap invariant broken".into())), }; match self.heap.borrow_mut().get_mut(array_reference)? { HeapObject::Array { bytes, element: stored_element } if stored_element == element => write_scalar(bytes, index, &value, element)?, _ => return Err(Error::Runtime("array heap invariant broken".into())), } },
             Op::StoreTableField(slot, name, element) => { let value = self.pop()?; if &value.ty() != element { return Err(Error::Runtime("VM table type invariant broken".into())); } let Value::Table(reference, _) = self.locals.get(*slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? else { return Err(Error::Runtime("VM table slot invariant broken".into())); }; match self.heap.borrow_mut().get_mut(*reference)? { HeapObject::Table { entries, element: stored_element } if stored_element == element => { entries.insert(TableKey::Name(name.clone()), value); }, _ => return Err(Error::Runtime("table heap invariant broken".into())), } },
             Op::StoreCurrentField(field) => { let new_value = self.pop()?; if &new_value.ty() != &field.ty { return Err(Error::Runtime("VM type invariant broken".into())); } let receiver = current_receiver.ok_or_else(|| Error::Runtime("field assignment outside method".into()))?; let Value::Struct(reference, _) = self.locals.get(receiver).ok_or_else(|| Error::Runtime("invalid method receiver".into()))? else { return Err(Error::Runtime("VM method receiver invariant broken".into())); }; match self.heap.borrow_mut().get_mut(*reference)? { HeapObject::Struct { values, .. } => { *values.get_mut(field.index).ok_or_else(|| Error::Runtime("invalid struct field index".into()))? = new_value; }, _ => return Err(Error::Runtime("struct heap invariant broken".into())), } },
             Op::MakeArray(len, ty) => { if self.stack_ptr < *len { return Err(Error::Runtime("stack underflow".into())); } let at = self.stack_ptr - len; let values = self.stack[at..self.stack_ptr].to_vec(); self.stack_ptr = at; let bytes = Value::pack_array(values, ty)?; let reference = self.allocate(HeapObject::Array { bytes, element: ty.clone() }); self.push(Value::Array(reference, Box::new(ty.clone()))); self.collect_if_needed(); },
@@ -2287,8 +2323,8 @@ mod immediate_regression_tests {
     use super::*;
     #[test]
     fn float_literals_cannot_claim_non_float_types() {
-        assert!(matches!(execute("let value: i32 = 1.0"), Err(Error::Type(_))));
-        assert!(matches!(execute("let value: bool = 1.0"), Err(Error::Type(_))));
+        assert!(matches!(execute("let value: i32 = 1.0"), Err(Error::Located { source, location: SourceLocation { line: 1, column: 18, .. } }) if matches!(*source, Error::Type(_))));
+        assert!(matches!(execute("let value: bool = 1.0"), Err(Error::Located { source, location: SourceLocation { line: 1, column: 19, .. } }) if matches!(*source, Error::Type(_))));
     }
     #[test]
     fn specialized_i32_addition_reports_overflow() {
@@ -2312,11 +2348,11 @@ mod immediate_regression_tests {
     fn block_locals_do_not_escape_or_consume_slots_forever() {
         assert!(matches!(
             execute("if 1 == 1 then let inner: i32 = 7 end print(inner)"),
-            Err(Error::Type(message)) if message == "unknown name 'inner'"
+            Err(Error::Located { source, location: SourceLocation { line: 1, column: 45, .. } }) if matches!(&*source, Error::Type(message) if message == "unknown name 'inner'")
         ));
         assert!(matches!(
             execute("for i = 1, 2 do let temporary: i32 = i end print(i)"),
-            Err(Error::Type(message)) if message == "unknown name 'i'"
+            Err(Error::Located { source, location: SourceLocation { line: 1, column: 50, .. } }) if matches!(&*source, Error::Type(message) if message == "unknown name 'i'")
         ));
     }
     #[test]
