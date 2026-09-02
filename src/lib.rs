@@ -11,7 +11,7 @@ use std::os::raw::c_int;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Type {
@@ -1373,6 +1373,78 @@ pub fn execute_interactive_file(path: impl AsRef<Path>) -> Result<(), Error> { l
 /// Opaque C ABI state. Only this crate may access its interior.
 #[repr(C)] pub struct L0State { vm: Vm, ffi_call: Option<FfiCall> }
 pub type L0CFunction = unsafe extern "C" fn(*mut L0State) -> c_int;
+
+/// Stable scalar type IDs accepted by the C FFI registration API.
+///
+/// C values are decoded from `c_int` before becoming this enum, so invalid C
+/// input cannot create an invalid Rust enum discriminant.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum L0TypeId {
+    I8 = 0, I16, I32, I64, U8, U16, U32, U64, F16, F32, F64, Bool,
+}
+
+impl L0TypeId {
+    fn from_raw(value: c_int) -> Option<Self> {
+        Some(match value {
+            0 => Self::I8, 1 => Self::I16, 2 => Self::I32, 3 => Self::I64,
+            4 => Self::U8, 5 => Self::U16, 6 => Self::U32, 7 => Self::U64,
+            8 => Self::F16, 9 => Self::F32, 10 => Self::F64, 11 => Self::Bool,
+            _ => return None,
+        })
+    }
+
+    fn to_l0_type(self) -> Type {
+        match self {
+            Self::I8 => Type::I8, Self::I16 => Type::I16, Self::I32 => Type::I32, Self::I64 => Type::I64,
+            Self::U8 => Type::U8, Self::U16 => Type::U16, Self::U32 => Type::U32, Self::U64 => Type::U64,
+            Self::F16 => Type::F16, Self::F32 => Type::F32, Self::F64 => Type::F64, Self::Bool => Type::Bool,
+        }
+    }
+}
+
+fn c_scalar_type(value: c_int) -> Option<Type> { L0TypeId::from_raw(value).map(L0TypeId::to_l0_type) }
+fn ffi_argument(state: &L0State, index: usize) -> Option<&Value> { if let Some(call) = state.ffi_call.as_ref() { call.arguments.get(index) } else { state.vm.stack.get(index) } }
+fn ffi_push(state: &mut L0State, value: Value) { if let Some(call) = state.ffi_call.as_mut() { call.results.push(value); } else { state.vm.stack.push(value); } }
+
+macro_rules! c_scalar_helpers {
+    ($push:ident, $read:ident, $variant:ident, $ty:ty) => {
+        #[no_mangle] pub unsafe extern "C" fn $push(state: *mut L0State, value: $ty) {
+            if let Some(state) = state.as_mut() { ffi_push(state, Value::$variant(value)); }
+        }
+        #[no_mangle] pub unsafe extern "C" fn $read(state: *mut L0State, index: usize, out: *mut $ty) -> c_int {
+            let Some(state) = state.as_ref() else { return 0 };
+            let Some(out) = out.as_mut() else { return 0 };
+            let Some(Value::$variant(value)) = ffi_argument(state, index) else { return 0 };
+            *out = *value;
+            1
+        }
+    };
+}
+
+c_scalar_helpers!(l0_push_i8, l0_to_i8, I8, i8);
+c_scalar_helpers!(l0_push_i16, l0_to_i16, I16, i16);
+c_scalar_helpers!(l0_push_i32, l0_to_i32, I32, i32);
+c_scalar_helpers!(l0_push_i64, l0_to_i64, I64, i64);
+c_scalar_helpers!(l0_push_u8, l0_to_u8, U8, u8);
+c_scalar_helpers!(l0_push_u16, l0_to_u16, U16, u16);
+c_scalar_helpers!(l0_push_u32, l0_to_u32, U32, u32);
+c_scalar_helpers!(l0_push_u64, l0_to_u64, U64, u64);
+c_scalar_helpers!(l0_push_f16, l0_to_f16, F16, u16);
+c_scalar_helpers!(l0_push_f32, l0_to_f32, F32, f32);
+c_scalar_helpers!(l0_push_f64, l0_to_f64, F64, f64);
+
+#[no_mangle] pub unsafe extern "C" fn l0_push_bool(state: *mut L0State, value: c_int) {
+    if let Some(state) = state.as_mut() { ffi_push(state, Value::Bool(value != 0)); }
+}
+#[no_mangle] pub unsafe extern "C" fn l0_to_bool(state: *mut L0State, index: usize, out: *mut c_int) -> c_int {
+    let Some(state) = state.as_ref() else { return 0 };
+    let Some(out) = out.as_mut() else { return 0 };
+    let Some(Value::Bool(value)) = ffi_argument(state, index) else { return 0 };
+    *out = c_int::from(*value);
+    1
+}
+
 #[no_mangle] pub extern "C" fn l0_abi_version() -> u32 { ABI_VERSION }
 #[no_mangle] pub extern "C" fn l0_new_state() -> *mut L0State { Box::into_raw(Box::new(L0State { vm: Vm::default(), ffi_call: None })) }
 /// # Safety
@@ -1387,6 +1459,19 @@ pub type L0CFunction = unsafe extern "C" fn(*mut L0State) -> c_int;
     match state.vm.register_c_i32_function(name, argument_count, function) { Ok(()) => 1, Err(_) => 0 }
 }
 /// # Safety
+/// `state` must be valid, `name` must be NUL-terminated UTF-8, and `arg_types`
+/// must address `argument_count` type IDs when that count is nonzero.
+#[no_mangle] pub unsafe extern "C" fn l0_register_c_function(state: *mut L0State, name: *const std::os::raw::c_char, function: L0CFunction, arg_types: *const c_int, argument_count: usize, result_type: c_int) -> c_int {
+    let Some(state) = state.as_mut() else { return 0 };
+    if name.is_null() || (argument_count != 0 && arg_types.is_null()) { return 0; }
+    let Ok(name) = CStr::from_ptr(name).to_str() else { return 0; };
+    let Some(result) = c_scalar_type(result_type) else { return 0; };
+    let raw_arguments = if argument_count == 0 { &[] } else { std::slice::from_raw_parts(arg_types, argument_count) };
+    let mut arguments = Vec::with_capacity(argument_count);
+    for &raw_type in raw_arguments { let Some(ty) = c_scalar_type(raw_type) else { return 0; }; arguments.push(ty); }
+    match state.vm.register_external(name.to_owned(), HostSignature { arguments, result }, ExternalFunction::C(function)) { Ok(()) => 1, Err(_) => 0 }
+}
+/// # Safety
 /// `state` must be valid and `source` must be a NUL-terminated UTF-8 L0 unit.
 #[no_mangle] pub unsafe extern "C" fn l0_execute(state: *mut L0State, source: *const std::os::raw::c_char) -> c_int {
     let Some(state_ref) = state.as_mut() else { return 0 };
@@ -1397,13 +1482,6 @@ pub type L0CFunction = unsafe extern "C" fn(*mut L0State) -> c_int;
     state_ref.vm.callback_state = previous_state;
     if result.is_ok() { 1 } else { 0 }
 }
-/// # Safety
-/// `state` must be a valid L0 state.
-#[no_mangle] pub unsafe extern "C" fn l0_push_i32(state: *mut L0State, value: i32) { if let Some(s) = state.as_mut() { if let Some(call) = s.ffi_call.as_mut() { call.results.push(Value::I32(value)); } else { s.vm.stack.push(Value::I32(value)); } } }
-/// # Safety
-/// `state` must be valid. Returns 1 on success and 0 if the top value is not i32.
-#[no_mangle] pub unsafe extern "C" fn l0_to_i32(state: *mut L0State, index: usize, out: *mut i32) -> c_int { let Some(s)=state.as_ref() else{return 0}; let value=if let Some(call)=s.ffi_call.as_ref(){call.arguments.get(index)}else{s.vm.stack.get(index)}; let Some(Value::I32(v))=value else{return 0}; if out.is_null(){return 0}; *out=*v; 1 }
-
 // IEEE binary16 conversion, dependency-free so the language's f16 type is portable.
 pub fn f32_to_f16(value: f32) -> u16 { let bits=value.to_bits(); let sign=((bits>>16)&0x8000) as u16; let exp=((bits>>23)&0xff) as i32-127+15; let mant=bits&0x7fffff; if exp<=0 { if exp < -10{return sign}; return sign|(((mant|0x800000)>>(14-exp)) as u16); } if exp>=31 { return sign|0x7c00|if mant==0{0}else{1}; } sign|((exp as u16)<<10)|((mant>>13) as u16) }
 pub fn f16_to_f32(bits: u16) -> f32 { let sign=((bits as u32)&0x8000)<<16; let exp=(bits>>10)&0x1f; let mant=(bits&0x03ff) as u32; let out=if exp==0 { if mant==0 {sign} else { let mut m=mant; let mut e=-14i32; while m&0x400==0 {m<<=1;e-=1;} sign|(((e+127) as u32)<<23)|((m&0x3ff)<<13) } } else if exp==31 {sign|0x7f800000|(mant<<13)} else {sign|(((exp as u32+112)<<23))|(mant<<13)}; f32::from_bits(out) }
@@ -1602,6 +1680,31 @@ mod tests {
         let source = b"let total: i32 = c_add(10, 32); print(total);\0";
         assert_eq!(unsafe { l0_execute(&mut state, source.as_ptr().cast()) }, 1);
         assert_eq!(state.vm.output, ["42"]);
+    }
+
+    unsafe extern "C" fn c_calculate_distance(state: *mut L0State) -> c_int {
+        let mut distance = 0.0;
+        let mut boosted = 0;
+        if l0_to_f32(state, 0, &mut distance) == 0 || l0_to_bool(state, 1, &mut boosted) == 0 { return 1; }
+        l0_push_f32(state, if boosted != 0 { distance * 1.5 } else { distance });
+        0
+    }
+
+    #[test]
+    fn generic_c_function_accepts_f32_and_bool() {
+        let mut state = L0State { vm: Vm::default(), ffi_call: None };
+        let argument_types = [L0TypeId::F32 as c_int, L0TypeId::Bool as c_int];
+        assert_eq!(unsafe { l0_register_c_function(&mut state, b"calc_dist\0".as_ptr().cast(), c_calculate_distance, argument_types.as_ptr(), argument_types.len(), L0TypeId::F32 as c_int) }, 1);
+        let source = b"let d: f32 = calc_dist(100.5, 1 == 1); print(d);\0";
+        assert_eq!(unsafe { l0_execute(&mut state, source.as_ptr().cast()) }, 1);
+        assert_eq!(state.vm.output, ["150.75"]);
+    }
+
+    #[test]
+    fn generic_c_registration_rejects_invalid_type_ids_and_null_type_arrays() {
+        let mut state = L0State { vm: Vm::default(), ffi_call: None };
+        assert_eq!(unsafe { l0_register_c_function(&mut state, b"bad_result\0".as_ptr().cast(), c_add, std::ptr::null(), 0, 99) }, 0);
+        assert_eq!(unsafe { l0_register_c_function(&mut state, b"missing_args\0".as_ptr().cast(), c_add, std::ptr::null(), 1, L0TypeId::I32 as c_int) }, 0);
     }
 
     #[test]
