@@ -17,7 +17,7 @@ while active do
         ch = ch + 1
     end
     putc(10)
-    
+
     let r_p: i32 = 0
     while r_p < 21 do
         putc(labels[r_p])
@@ -35,13 +35,13 @@ while active do
         r_p = r_p + 1
     end
     putc(10)
-    
+
     if player == 1 then
         putc(80) putc(49) putc(32) putc(82) putc(58) putc(32)
         let row: i32 = input
         putc(67) putc(58) putc(32)
         let col: i32 = input
-        
+
         if row < 0 || row > 20 || col < 0 || col > 20 then
             putc(33) putc(33) putc(10)
         else
@@ -60,7 +60,7 @@ while active do
         let dr: vector<i32> = [0, 0, 1, -1, 1, 1, -1, -1, 0, 0, 2, -2, 2, 2, -2, -2]
         let dc: vector<i32> = [1, -1, 0, 0, 1, -1, 1, -1, 2, -2, 0, 0, 2, -2, 2, -2]
         let off_idx: i32 = 0
-        
+
         while off_idx < 16 do
             if placed == (1 == 0) then
                 let cand_r: i32 = last_r + dr[off_idx]
@@ -76,7 +76,7 @@ while active do
             end
             off_idx = off_idx + 1
         end
-        
+
         -- Fallback
         if placed == (1 == 0) then
             let f_r: i32 = 0

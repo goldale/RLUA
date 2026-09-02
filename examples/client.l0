@@ -1,7 +1,7 @@
 -- client.l0
 -- Эмуляция клиентской логики Admin Script на языке L0
 
--- ОБНОВЛЕНИЕ: Таблица должна быть объявлена ВНЕ структуры (до неё), 
+-- ОБНОВЛЕНИЕ: Таблица должна быть объявлена ВНЕ структуры (до неё),
 -- так как структуры поддерживают только скалярные типы данных.
 let admins: table<bool> = table { [0] = 1 == 0 }
 
@@ -32,14 +32,14 @@ struct Client {
     -- Эмуляция цикла Citizen.CreateThread и проверок дистанции
     function check_pursuit_proximity()
         let is_admin: bool = admins[target_id]
-        
+
         if is_admin then
             let dx: f32 = local_pos_x - target_x
             let dy: f32 = local_pos_y - target_y
             let dz: f32 = local_pos_z - target_z
-            
+
             let dist_sq: f32 = (dx * dx) + (dy * dy) + (dz * dz)
-            
+
             if dist_sq < 5625.0 then
                 printf("~g~Priorities Are On Hold\n")
                 printf("~r~ ADMIN PURSUIT NEARBY\n")
@@ -74,7 +74,7 @@ client_env.target_id = 5
 client_env.target_x = 120.0
 client_env.target_y = 210.0
 client_env.target_z = 30.0
-client_env.check_pursuit_proximity() 
+client_env.check_pursuit_proximity()
 
 -- Убираем админа и проверяем снова (ошибок/вывода не будет)
 client_env.target_id = 5

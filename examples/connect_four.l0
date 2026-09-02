@@ -1,7 +1,7 @@
 -- Четыре в ряд (Connect Four) - Версия 9x9 (2D Тензор)
 let board: tensor<i8, 2> = zeros<i8>([9, 9])
 let active: bool = 1 == 1
-let turn: i8 = 1 
+let turn: i8 = 1
 
 printf("--- Четыре в ряд 9x9 ---\n")
 printf("Вы играете за крестики (X), компьютер за нолики (O).\n")
@@ -16,13 +16,13 @@ while active do
         let c: i32 = 0
         while c < 9 do
             let val: i8 = board[r, c]
-            if val == 0 then putc(46) end 
-            if val == 1 then putc(88) end 
-            if val == 2 then putc(79) end 
+            if val == 0 then putc(46) end
+            if val == 1 then putc(88) end
+            if val == 2 then putc(79) end
             putc(32)
             c = c + 1
         end
-        putc(10) 
+        putc(10)
         r = r + 1
     end
     printf("-------------------\n")
@@ -80,7 +80,7 @@ while active do
         if turn == 1 then
             printf("Ваш ход (0-8): ")
             let move: i32 = input
-            
+
             if move >= 0 && move <= 8 then
                 let drop_r: i32 = 8
                 let placed: bool = 1 == 0
@@ -100,7 +100,7 @@ while active do
             printf("Ход компьютера...\n")
             let best_col: i32 = -1
             let check_player: i8 = 2
-            
+
             while check_player >= 1 && best_col == -1 do
                 let cand_col: i32 = 0
                 while cand_col < 9 && best_col == -1 do

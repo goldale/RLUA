@@ -56,7 +56,7 @@ while active do
         if turn == 1 then
             printf("Ваш ход (0-8): ")
             let move: i32 = input
-            
+
             if move >= 0 && move <= 8 then
                 if board[move / 3, move % 3] == 0 then
                     board[move / 3, move % 3] = 1
