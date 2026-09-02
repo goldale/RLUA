@@ -56,7 +56,7 @@ The first module slice exports a structure's data layout. Cross-module member me
 ## Runtime roadmap
 
 1. **Current stage:** typed vector fields in structures and cached filesystem modules with explicit exports.
-2. **Next stage — garbage collector:** replace owned complex `Value` payloads (`vector`, `table`, `struct`, module state, and subsequently strings) with references into a mark-and-sweep arena. Roots include the operand stack, local slots, active method receivers, and module cache. Collection occurs automatically at an allocation threshold and is directly testable.
+2. **Current runtime layer — garbage collector:** vectors, tables, structures, and strings are heap objects addressed by stable `HeapRef` handles, so copying a `Value` preserves object identity instead of copying its payload. Loaded module VMs are long-lived roots. The non-moving mark-and-sweep arena traces the operand stack, local slots, and those module roots; collection runs automatically after an allocation threshold and can also be requested explicitly through `Vm::collect_garbage()`. This makes cycles collectible without reference counting.
 3. **Later stage:** strings, richer module interfaces, cross-module struct method dispatch, parameter and return-value design, and standard libraries.
 
 The GC stage must preserve the observable semantics above and collect cyclic tables and structures only when they become unreachable from all roots.
