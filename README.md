@@ -1,4 +1,4 @@
-# RLUA language standard — draft 0.1
+# RLUA language standard
 
 This document specifies the implemented core and the approved implementation order for the next runtime layers. Every value has an explicit static type; tables are data containers, not objects.
 
