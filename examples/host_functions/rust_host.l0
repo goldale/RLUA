@@ -1,0 +1,3 @@
+-- rust_multiply is registered by examples/host_functions/rust_host.rs.
+let area: i32 = rust_multiply(6, 7)
+print(area)
