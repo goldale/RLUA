@@ -77,9 +77,14 @@ pub enum Value {
     /// in the heap object so future hardware backends can replace the storage.
     Tensor(HeapRef, Box<Type>, usize),
     Table(HeapRef, Box<Type>),
-    TableKey(TableKey),
+    /// `TableKey::Index(i128)` has 16-byte alignment; boxing it prevents that
+    /// uncommon key representation from raising the alignment of every stack
+    /// value.
+    TableKey(Rc<TableKey>),
     TableKeys(HeapRef),
-    Struct(HeapRef, StructLayout),
+    /// Layouts are immutable compiler metadata.  Keeping a shared reference
+    /// here avoids embedding the `String` and `Vec` headers in every VM slot.
+    Struct(HeapRef, Rc<StructLayout>),
     Module(String),
 }
 
@@ -125,7 +130,7 @@ pub enum HeapObject {
     String(String),
     Table { entries: HashMap<TableKey, Value>, element: Type },
     TableKeys(Vec<TableKey>),
-    Struct { values: Vec<Value>, layout: StructLayout },
+    Struct { values: Vec<Value>, layout: Rc<StructLayout> },
 }
 
 #[derive(Clone, Debug)]
@@ -249,7 +254,7 @@ fn table_key_from_value(heap: &Heap, value: &Value) -> Result<TableKey, Error> {
     let index = match value {
         Value::I8(v) => *v as i128, Value::I16(v) => *v as i128, Value::I32(v) => *v as i128, Value::I64(v) => *v as i128,
         Value::U8(v) => *v as i128, Value::U16(v) => *v as i128, Value::U32(v) => *v as i128, Value::U64(v) => *v as i128,
-        Value::TableKey(key) => return Ok(key.clone()),
+        Value::TableKey(key) => return Ok((**key).clone()),
         Value::String(reference) => return match heap.get(*reference)? {
             HeapObject::String(name) => Ok(TableKey::Name(Rc::from(name.as_str()))),
             _ => Err(Error::Runtime("string heap invariant broken".into())),
@@ -862,17 +867,17 @@ struct HostSignature { arguments: Vec<Type>, result: Type }
 #[derive(Clone, Debug)]
 enum Op {
     AddI32, AddF32, AddF64,
-    Push(Value), MakeString(String), Input(Type), Require(ModuleArtifact), Load(usize), LoadCurrentReceiver,
-    LoadCurrentField(StructField), Store(usize), StoreIndex(usize, Type), StoreTableIndex(usize, Type),
-    StoreTensorIndex(usize, Type, usize), StoreTensorIndexF32(usize, usize),
-    StoreField(usize, StructField), StoreFieldIndex(usize, StructField, Type), StoreTableField(usize, Rc<str>, Type),
-    StoreCurrentField(StructField), MakeArray(usize, Type), MakeTable(Vec<TableEntry>, Type), MakeStruct(StructLayout),
-    MakeTensor(TensorInit, Type, usize), Index, TensorIndex(Type, usize), TensorIndexF32(usize), TableIndex, TableKeys, TableKeysIndex, TableRemove, Field(StructField), TableField(Rc<str>), ModuleField(String),
-    Binary(BinaryOp), Unary(UnOp, Type), Len, ConcatString,
-    Builtin1(BuiltinFn, Type), Builtin2(BuiltinFn, Type),
-    CallExternal(String, usize),
+    Push(Value), MakeString(Rc<str>), Input(Rc<Type>), Require(Rc<ModuleArtifact>), Load(usize), LoadCurrentReceiver,
+    LoadCurrentField(Rc<StructField>), Store(usize), StoreIndex(usize, Rc<Type>), StoreTableIndex(usize, Rc<Type>),
+    StoreTensorIndex(usize, Rc<Type>, usize), StoreTensorIndexF32(usize, usize),
+    StoreField(usize, Rc<StructField>), StoreFieldIndex(usize, Rc<StructField>, Rc<Type>), StoreTableField(usize, Rc<str>, Rc<Type>),
+    StoreCurrentField(Rc<StructField>), MakeArray(usize, Rc<Type>), MakeTable(Rc<[TableEntry]>, Rc<Type>), MakeStruct(Rc<StructLayout>),
+    MakeTensor(TensorInit, Rc<Type>, usize), Index, TensorIndex(Rc<Type>, usize), TensorIndexF32(usize), TableIndex, TableKeys, TableKeysIndex, TableRemove, Field(Rc<StructField>), TableField(Rc<str>), ModuleField(Rc<str>),
+    Binary(BinaryOp), Unary(UnOp, Rc<Type>), Len, ConcatString,
+    Builtin1(BuiltinFn, Rc<Type>), Builtin2(BuiltinFn, Rc<Type>),
+    CallExternal(Rc<str>, usize),
     JumpIfFalse(usize), Jump(usize), JumpIfFalseKeep(usize), JumpIfTrueKeep(usize),
-    CallMethod(usize, usize), CallCurrentMethod(usize), CallModule(usize, String),
+    CallMethod(usize, usize), CallCurrentMethod(usize), CallModule(usize, Rc<str>),
     Return, Print, Printf(usize), Putc
 }
 
@@ -1093,7 +1098,7 @@ impl Compiler {
                         Type::Module(module_id) => {
                             let module = self.module_artifacts.get(&module_id).ok_or_else(|| Error::Runtime("missing compiled module".into()))?;
                             if !matches!(module.exports.get(&method), Some(ModuleExport::Function { .. })) { return Err(Error::Type(format!("module has no exported function '{method}'"))); }
-                            self.code.push(Op::CallModule(slot, method)); return Ok(());
+                            self.code.push(Op::CallModule(slot, Rc::from(method))); return Ok(());
                         },
                         _ => return Err(Error::Type(format!("'{name}' is not a struct or module"))),
                     }
@@ -1125,7 +1130,7 @@ impl Compiler {
             self.code.push(Op::Store(slot));
             Ok(())
         },
-        Statement::Assign { name, expr } => { if let Some(field) = self.current_method_fields.as_ref().and_then(|fields| fields.get(&name)).cloned() { let found = self.expr(expr, Some(&field.ty))?; if found != field.ty { return Err(Error::Type(format!("field '{name}' is {}, but expression has type {found}", field.ty))); } self.code.push(Op::StoreCurrentField(field)); Ok(()) } else { let (slot, ty) = self.names.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))?; let found = self.expr(expr, Some(&ty))?; if found != ty { return Err(Error::Type(format!("'{name}' is {ty}, but expression has type {found}"))); } self.code.push(Op::Store(slot)); Ok(()) } },
+        Statement::Assign { name, expr } => { if let Some(field) = self.current_method_fields.as_ref().and_then(|fields| fields.get(&name)).cloned() { let found = self.expr(expr, Some(&field.ty))?; if found != field.ty { return Err(Error::Type(format!("field '{name}' is {}, but expression has type {found}", field.ty))); } self.code.push(Op::StoreCurrentField(Rc::new(field))); Ok(()) } else { let (slot, ty) = self.names.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))?; let found = self.expr(expr, Some(&ty))?; if found != ty { return Err(Error::Type(format!("'{name}' is {ty}, but expression has type {found}"))); } self.code.push(Op::Store(slot)); Ok(()) } },
         Statement::SetIndex { name, indices, expr } => {
             let (slot, container_ty) = self.names.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))?;
             match container_ty {
@@ -1134,27 +1139,27 @@ impl Compiler {
                     scalar_size(&inner)?; self.compile_tensor_indices(indices)?;
                     let element = *inner; let found = self.expr(expr, Some(&element))?;
                     if found != element { return Err(Error::Type(format!("item is {found}; expected {element}"))); }
-                    self.code.push(Op::StoreIndex(slot, element)); Ok(())
+                    self.code.push(Op::StoreIndex(slot, Rc::new(element))); Ok(())
                 },
                 Type::Table(inner) => {
                     if indices.len() != 1 { return Err(Error::Type("table indexing requires exactly one index".into())); }
                     self.compile_table_key(indices.into_iter().next().expect("checked table index count"))?;
                     let element = *inner; let found = self.expr(expr, Some(&element))?;
                     if found != element { return Err(Error::Type(format!("item is {found}; expected {element}"))); }
-                    self.code.push(Op::StoreTableIndex(slot, element)); Ok(())
+                    self.code.push(Op::StoreTableIndex(slot, Rc::new(element))); Ok(())
                 },
                 Type::Tensor(inner, rank) => {
                     if indices.len() != rank { return Err(Error::Type(format!("tensor rank {rank} requires {rank} index(es)"))); }
                     self.compile_tensor_indices(indices)?;
                     let element = *inner; let found = self.expr(expr, Some(&element))?;
                     if found != element { return Err(Error::Type(format!("tensor item is {found}; expected {element}"))); }
-                    if element == Type::F32 { self.code.push(Op::StoreTensorIndexF32(slot, rank)); } else { self.code.push(Op::StoreTensorIndex(slot, element, rank)); } Ok(())
+                    if element == Type::F32 { self.code.push(Op::StoreTensorIndexF32(slot, rank)); } else { self.code.push(Op::StoreTensorIndex(slot, Rc::new(element), rank)); } Ok(())
                 },
                 _ => Err(Error::Type(format!("'{name}' is not indexable"))),
             }
         },
-        Statement::SetField { name, field, expr } => { let (slot, ty) = self.names.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))?; match ty { Type::Struct(struct_name) => { let layout = self.structs.get(&struct_name).ok_or_else(|| Error::Type(format!("unknown struct '{struct_name}'")))?; let field = layout.fields.iter().find(|candidate| candidate.name == field).cloned().ok_or_else(|| Error::Type(format!("struct '{struct_name}' has no field '{field}'")))?; let found = self.expr(expr, Some(&field.ty))?; if found != field.ty { return Err(Error::Type("struct field type mismatch".into())); } self.code.push(Op::StoreField(slot, field)); Ok(()) }, Type::Table(element) => { let element = *element; let found = self.expr(expr, Some(&element))?; if found != element { return Err(Error::Type("table value type mismatch".into())); } let field = self.intern_name(&field); self.code.push(Op::StoreTableField(slot, field, element)); Ok(()) }, _ => Err(Error::Type(format!("'{name}' has no named keys"))), } },
-        Statement::SetFieldIndex { name, field, index, expr } => { let (slot, Type::Struct(struct_name)) = self.names.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))? else { return Err(Error::Type(format!("'{name}' is not a struct"))); }; let layout = self.structs.get(&struct_name).ok_or_else(|| Error::Type(format!("unknown struct '{struct_name}'")))?; let field = layout.fields.iter().find(|candidate| candidate.name == field).cloned().ok_or_else(|| Error::Type(format!("struct '{struct_name}' has no field '{field}'")))?; let Type::Array(element) = field.ty.clone() else { return Err(Error::Type(format!("field '{}' is not a vector", field.name))); }; let element = *element; scalar_size(&element)?; let index_ty = self.expr(index, None)?; if !matches!(index_ty, Type::I8|Type::I16|Type::I32|Type::I64|Type::U8|Type::U16|Type::U32|Type::U64) { return Err(Error::Type("index must be an integer".into())); } let found = self.expr(expr, Some(&element))?; if found != element { return Err(Error::Type(format!("item is {found}; expected {element}"))); } self.code.push(Op::StoreFieldIndex(slot, field, element)); Ok(()) },
+        Statement::SetField { name, field, expr } => { let (slot, ty) = self.names.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))?; match ty { Type::Struct(struct_name) => { let layout = self.structs.get(&struct_name).ok_or_else(|| Error::Type(format!("unknown struct '{struct_name}'")))?; let field = layout.fields.iter().find(|candidate| candidate.name == field).cloned().ok_or_else(|| Error::Type(format!("struct '{struct_name}' has no field '{field}'")))?; let found = self.expr(expr, Some(&field.ty))?; if found != field.ty { return Err(Error::Type("struct field type mismatch".into())); } self.code.push(Op::StoreField(slot, Rc::new(field))); Ok(()) }, Type::Table(element) => { let element = *element; let found = self.expr(expr, Some(&element))?; if found != element { return Err(Error::Type("table value type mismatch".into())); } let field = self.intern_name(&field); self.code.push(Op::StoreTableField(slot, field, Rc::new(element))); Ok(()) }, _ => Err(Error::Type(format!("'{name}' has no named keys"))), } },
+        Statement::SetFieldIndex { name, field, index, expr } => { let (slot, Type::Struct(struct_name)) = self.names.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))? else { return Err(Error::Type(format!("'{name}' is not a struct"))); }; let layout = self.structs.get(&struct_name).ok_or_else(|| Error::Type(format!("unknown struct '{struct_name}'")))?; let field = layout.fields.iter().find(|candidate| candidate.name == field).cloned().ok_or_else(|| Error::Type(format!("struct '{struct_name}' has no field '{field}'")))?; let Type::Array(element) = field.ty.clone() else { return Err(Error::Type(format!("field '{}' is not a vector", field.name))); }; let element = *element; scalar_size(&element)?; let index_ty = self.expr(index, None)?; if !matches!(index_ty, Type::I8|Type::I16|Type::I32|Type::I64|Type::U8|Type::U16|Type::U32|Type::U64) { return Err(Error::Type("index must be an integer".into())); } let found = self.expr(expr, Some(&element))?; if found != element { return Err(Error::Type(format!("item is {found}; expected {element}"))); } self.code.push(Op::StoreFieldIndex(slot, Rc::new(field), Rc::new(element))); Ok(()) },
         Statement::Print(expr) => { self.expr(expr, None)?; self.code.push(Op::Print); Ok(()) },
         Statement::Printf { format, args } => {
             let num_args = args.len();
@@ -1248,11 +1253,11 @@ impl Compiler {
             self.code.push(Op::Push(val));
             Ok(ty.clone())
         },
-        Expr::String(s) => { self.code.push(Op::MakeString(s)); Ok(Type::String) },
-        Expr::Input => { let ty = expected.filter(|t| is_numeric(t) || **t == Type::String).cloned().ok_or_else(|| Error::Type("input needs an expected scalar or string type, e.g. let value: i32 = input".into()))?; self.code.push(Op::Input(ty.clone())); Ok(ty) },
+        Expr::String(s) => { self.code.push(Op::MakeString(Rc::from(s))); Ok(Type::String) },
+        Expr::Input => { let ty = expected.filter(|t| is_numeric(t) || **t == Type::String).cloned().ok_or_else(|| Error::Type("input needs an expected scalar or string type, e.g. let value: i32 = input".into()))?; self.code.push(Op::Input(Rc::new(ty.clone()))); Ok(ty) },
         Expr::This => { let struct_name = self.current_method_struct.clone().ok_or_else(|| Error::Type("this is available only inside a struct method".into()))?; self.code.push(Op::LoadCurrentReceiver); Ok(Type::Struct(struct_name)) },
-        Expr::Require(path) => { let module = self.load_module(&path)?; let id = module.id.clone(); self.code.push(Op::Require(module)); Ok(Type::Module(id)) },
-        Expr::Name(name) => { if let Some(field) = self.current_method_fields.as_ref().and_then(|fields| fields.get(&name)).cloned() { let ty = field.ty.clone(); self.code.push(Op::LoadCurrentField(field)); Ok(ty) } else { let (slot, ty) = self.names.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))?; self.code.push(Op::Load(slot)); Ok(ty) } },
+        Expr::Require(path) => { let module = self.load_module(&path)?; let id = module.id.clone(); self.code.push(Op::Require(Rc::new(module))); Ok(Type::Module(id)) },
+        Expr::Name(name) => { if let Some(field) = self.current_method_fields.as_ref().and_then(|fields| fields.get(&name)).cloned() { let ty = field.ty.clone(); self.code.push(Op::LoadCurrentField(Rc::new(field))); Ok(ty) } else { let (slot, ty) = self.names.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))?; self.code.push(Op::Load(slot)); Ok(ty) } },
         Expr::Array(mut items) => {
             let inferred = expected.is_none();
             let element = match expected {
@@ -1270,10 +1275,10 @@ impl Compiler {
                 let found = self.expr(item, Some(&element))?;
                 if found != element { return Err(Error::Type(format!("array item is {found}; expected {element}"))); }
             }
-            self.code.push(Op::MakeArray(count, element.clone()));
+            self.code.push(Op::MakeArray(count, Rc::new(element.clone())));
             Ok(Type::Array(Box::new(element)))
         },
-        Expr::Table(items) => { let element = match expected { Some(Type::Table(t)) => (**t).clone(), _ => return Err(Error::Type("table needs an explicit value type, e.g. table<i32>".into())) }; let mut entries = Vec::with_capacity(items.len()); for (key, value) in items { match key { TableLiteralKey::Name(name) => { let name = self.intern_name(&name); entries.push(TableEntry::Name(name)); }, TableLiteralKey::Index(index) => { self.compile_table_key(index)?; entries.push(TableEntry::Index); } } let found = self.expr(value, Some(&element))?; if found != element { return Err(Error::Type(format!("table value is {found}; expected {element}"))); } } self.code.push(Op::MakeTable(entries, element.clone())); Ok(Type::Table(Box::new(element))) },
+        Expr::Table(items) => { let element = match expected { Some(Type::Table(t)) => (**t).clone(), _ => return Err(Error::Type("table needs an explicit value type, e.g. table<i32>".into())) }; let mut entries = Vec::with_capacity(items.len()); for (key, value) in items { match key { TableLiteralKey::Name(name) => { let name = self.intern_name(&name); entries.push(TableEntry::Name(name)); }, TableLiteralKey::Index(index) => { self.compile_table_key(index)?; entries.push(TableEntry::Index); } } let found = self.expr(value, Some(&element))?; if found != element { return Err(Error::Type(format!("table value is {found}; expected {element}"))); } } self.code.push(Op::MakeTable(entries.into(), Rc::new(element.clone()))); Ok(Type::Table(Box::new(element))) },
         Expr::TensorFactory { name, element, shape } => {
             let Type::Tensor(expected_element, rank) = expected.cloned().ok_or_else(|| Error::Type(format!("{name}<T> needs an expected tensor type, e.g. let x: tensor<f32, 2> = {name}<f32>([2, 3])")))? else { return Err(Error::Type(format!("{name}<{}> creates a tensor, but the expected type is not tensor", element))); };
             if expected_element.as_ref() != &element { return Err(Error::Type(format!("{name} element type is {element}; expected {expected_element}"))); }
@@ -1281,10 +1286,10 @@ impl Compiler {
             if shape_ty != Type::Array(Box::new(Type::U64)) { return Err(Error::Type("tensor shape must be vector<u64>".into())); }
             let init = if name == "zeros" { TensorInit::Zeros } else { TensorInit::Random };
             if matches!(init, TensorInit::Random) && !matches!(element, Type::F16 | Type::F32 | Type::F64) { return Err(Error::Type("random<T> supports f16, f32, and f64 tensors only".into())); }
-            self.code.push(Op::MakeTensor(init, element.clone(), rank));
+            self.code.push(Op::MakeTensor(init, Rc::new(element.clone()), rank));
             Ok(Type::Tensor(Box::new(element), rank))
         },
-        Expr::StructLiteral(name, fields) => { let layout = self.structs.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown struct '{name}'")))?; if let Some(expected) = expected { if expected != &Type::Struct(name.clone()) { return Err(Error::Type(format!("expected {expected}, got {name}"))); } } if fields.len() != layout.fields.len() { return Err(Error::Type(format!("struct '{name}' needs {} field(s)", layout.fields.len()))); } let mut provided = HashMap::new(); for (field_name, field_expr) in fields { if provided.insert(field_name.clone(), field_expr).is_some() { return Err(Error::Type(format!("struct '{name}' initializes field '{field_name}' more than once"))); } } for field in &layout.fields { let expr = provided.remove(&field.name).ok_or_else(|| Error::Type(format!("struct '{name}' is missing field '{}'", field.name)))?; let found = self.expr(expr, Some(&field.ty))?; if found != field.ty { return Err(Error::Type(format!("field '{}' is {found}; expected {}", field.name, field.ty))); } } if let Some((unknown, _)) = provided.into_iter().next() { return Err(Error::Type(format!("struct '{name}' has no field '{unknown}'"))); } self.code.push(Op::MakeStruct(layout)); Ok(Type::Struct(name)) },
+        Expr::StructLiteral(name, fields) => { let layout = self.structs.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown struct '{name}'")))?; if let Some(expected) = expected { if expected != &Type::Struct(name.clone()) { return Err(Error::Type(format!("expected {expected}, got {name}"))); } } if fields.len() != layout.fields.len() { return Err(Error::Type(format!("struct '{name}' needs {} field(s)", layout.fields.len()))); } let mut provided = HashMap::new(); for (field_name, field_expr) in fields { if provided.insert(field_name.clone(), field_expr).is_some() { return Err(Error::Type(format!("struct '{name}' initializes field '{field_name}' more than once"))); } } for field in &layout.fields { let expr = provided.remove(&field.name).ok_or_else(|| Error::Type(format!("struct '{name}' is missing field '{}'", field.name)))?; let found = self.expr(expr, Some(&field.ty))?; if found != field.ty { return Err(Error::Type(format!("field '{}' is {found}; expected {}", field.name, field.ty))); } } if let Some((unknown, _)) = provided.into_iter().next() { return Err(Error::Type(format!("struct '{name}' has no field '{unknown}'"))); } self.code.push(Op::MakeStruct(Rc::new(layout))); Ok(Type::Struct(name)) },
         Expr::Call(name, mut args) => {
             match name.as_str() {
                 "len" => {
@@ -1314,7 +1319,7 @@ impl Compiler {
                     let arg = args.remove(0);
                     let ty = self.expr(arg, expected)?;
                     if !matches!(ty, Type::F16 | Type::F32 | Type::F64) { return Err(Error::Type(format!("{} requires a float argument, got {}", name, ty))); }
-                    self.code.push(Op::Builtin1(BuiltinFn::unary(&name).expect("known unary built-in"), ty.clone()));
+                    self.code.push(Op::Builtin1(BuiltinFn::unary(&name).expect("known unary built-in"), Rc::new(ty.clone())));
                     Ok(ty)
                 },
                 "abs" => {
@@ -1322,7 +1327,7 @@ impl Compiler {
                     let arg = args.remove(0);
                     let ty = self.expr(arg, expected)?;
                     if !is_numeric(&ty) { return Err(Error::Type("abs requires a numeric argument".into())); }
-                    self.code.push(Op::Builtin1(BuiltinFn::unary(&name).expect("known unary built-in"), ty.clone()));
+                    self.code.push(Op::Builtin1(BuiltinFn::unary(&name).expect("known unary built-in"), Rc::new(ty.clone())));
                     Ok(ty)
                 },
                 "pow" | "min" | "max" | "atan2" => {
@@ -1333,7 +1338,7 @@ impl Compiler {
                     let t2 = self.expr(arg2, Some(&t1))?;
                     if !types_compatible(&t1, &t2) { return Err(Error::Type(format!("{} arguments must have same type", name))); }
                     if name == "atan2" && !matches!(t1, Type::F16 | Type::F32 | Type::F64) { return Err(Error::Type("atan2 requires float arguments".into())); }
-                    self.code.push(Op::Builtin2(BuiltinFn::binary(&name).expect("known binary built-in"), t1.clone()));
+                    self.code.push(Op::Builtin2(BuiltinFn::binary(&name).expect("known binary built-in"), Rc::new(t1.clone())));
                     Ok(t1)
                 },
                 _ => {
@@ -1343,7 +1348,7 @@ impl Compiler {
                         let found = self.expr(argument, Some(expected_type))?;
                         if found != *expected_type { return Err(Error::Type(format!("{name} argument is {found}; expected {expected_type}"))); }
                     }
-                    self.code.push(Op::CallExternal(name, signature.arguments.len()));
+                    self.code.push(Op::CallExternal(Rc::from(name), signature.arguments.len()));
                     Ok(signature.result)
                 }
             }
@@ -1354,7 +1359,7 @@ impl Compiler {
                 UnOp::Neg => if !is_numeric(&ty) { return Err(Error::Type("'-' requires a numeric type".into())); },
                 UnOp::Not => if ty != Type::Bool { return Err(Error::Type("'!' requires a bool".into())); },
             }
-            self.code.push(Op::Unary(op, ty.clone()));
+            self.code.push(Op::Unary(op, Rc::new(ty.clone())));
             Ok(ty)
         },
         Expr::Binary(left, op, right) => {
@@ -1418,11 +1423,11 @@ impl Compiler {
                 Type::Array(element) => { if indices.len() != 1 { return Err(Error::Type("vector indexing requires exactly one index".into())); } self.compile_tensor_indices(indices)?; self.code.push(Op::Index); Ok(*element) },
                 Type::Table(element) => { if indices.len() != 1 { return Err(Error::Type("table indexing requires exactly one index".into())); } self.compile_table_key(indices.into_iter().next().expect("checked table index count"))?; self.code.push(Op::TableIndex); Ok(*element) },
                 Type::TableKeys => { if indices.len() != 1 { return Err(Error::Type("table_keys indexing requires exactly one index".into())); } self.compile_tensor_indices(indices)?; self.code.push(Op::TableKeysIndex); Ok(Type::TableKey) },
-                Type::Tensor(element, rank) => { if indices.len() != rank { return Err(Error::Type(format!("tensor rank {rank} requires {rank} index(es)"))); } self.compile_tensor_indices(indices)?; if *element == Type::F32 { self.code.push(Op::TensorIndexF32(rank)); } else { self.code.push(Op::TensorIndex((*element).clone(), rank)); } Ok(*element) },
+                Type::Tensor(element, rank) => { if indices.len() != rank { return Err(Error::Type(format!("tensor rank {rank} requires {rank} index(es)"))); } self.compile_tensor_indices(indices)?; if *element == Type::F32 { self.code.push(Op::TensorIndexF32(rank)); } else { self.code.push(Op::TensorIndex(Rc::new((*element).clone()), rank)); } Ok(*element) },
                 _ => Err(Error::Type(format!("cannot index {ct}"))),
             }
         },
-        Expr::Field(container, field_name) => { let container_ty = self.expr(*container, None)?; match container_ty { Type::Struct(struct_name) => { let layout = self.structs.get(&struct_name).ok_or_else(|| Error::Type(format!("unknown struct '{struct_name}'")))?; let field = layout.fields.iter().find(|field| field.name == field_name).cloned().ok_or_else(|| Error::Type(format!("struct '{struct_name}' has no field '{field_name}'")))?; self.code.push(Op::Field(field.clone())); Ok(field.ty) }, Type::Table(element) => { let element = *element; let field_name = self.intern_name(&field_name); self.code.push(Op::TableField(field_name)); Ok(element) }, Type::Module(module_id) => { let ty = { let module = self.module_artifacts.get(&module_id).ok_or_else(|| Error::Runtime("missing compiled module".into()))?; let ModuleExport::Value { ty, .. } = module.exports.get(&field_name).ok_or_else(|| Error::Type(format!("module has no exported value '{field_name}'")))? else { return Err(Error::Type(format!("'{field_name}' is not an exported module value"))); }; ty.clone() }; self.code.push(Op::ModuleField(field_name)); Ok(ty) }, _ => Err(Error::Type("field access requires a struct, table, or module".into())), } },
+        Expr::Field(container, field_name) => { let container_ty = self.expr(*container, None)?; match container_ty { Type::Struct(struct_name) => { let layout = self.structs.get(&struct_name).ok_or_else(|| Error::Type(format!("unknown struct '{struct_name}'")))?; let field = layout.fields.iter().find(|field| field.name == field_name).cloned().ok_or_else(|| Error::Type(format!("struct '{struct_name}' has no field '{field_name}'")))?; self.code.push(Op::Field(Rc::new(field.clone()))); Ok(field.ty) }, Type::Table(element) => { let element = *element; let field_name = self.intern_name(&field_name); self.code.push(Op::TableField(field_name)); Ok(element) }, Type::Module(module_id) => { let ty = { let module = self.module_artifacts.get(&module_id).ok_or_else(|| Error::Runtime("missing compiled module".into()))?; let ModuleExport::Value { ty, .. } = module.exports.get(&field_name).ok_or_else(|| Error::Type(format!("module has no exported value '{field_name}'")))? else { return Err(Error::Type(format!("'{field_name}' is not an exported module value"))); }; ty.clone() }; self.code.push(Op::ModuleField(Rc::from(field_name))); Ok(ty) }, _ => Err(Error::Type("field access requires a struct, table, or module".into())), } },
     } }
 
     fn compile_tensor_indices(&mut self, indices: Vec<Expr>) -> Result<(), Error> {
@@ -1700,8 +1705,11 @@ impl Vm {
 
         while pc < code.len() { match &code[pc] {
             Op::AddI32 => {
-                let right = self.pop()?;
-                let left = self.pop()?;
+                // The compiler emits two operands for every arithmetic opcode.
+                // Keep the diagnostic in debug builds, but do not branch twice
+                // per instruction in the production arithmetic hot path.
+                let right = self.pop_compiled();
+                let left = self.pop_compiled();
                 let (Value::I32(left), Value::I32(right)) = (left, right) else {
                     return Err(Error::Runtime("VM i32 addition invariant broken".into()));
                 };
@@ -1710,25 +1718,25 @@ impl Vm {
                 self.push(Value::I32(result));
             },
             Op::AddF32 => {
-                let right = self.pop()?;
-                let left = self.pop()?;
+                let right = self.pop_compiled();
+                let left = self.pop_compiled();
                 let (Value::F32(left), Value::F32(right)) = (left, right) else {
                     return Err(Error::Runtime("VM f32 addition invariant broken".into()));
                 };
                 self.push(Value::F32(left + right));
             },
             Op::AddF64 => {
-                let right = self.pop()?;
-                let left = self.pop()?;
+                let right = self.pop_compiled();
+                let left = self.pop_compiled();
                 let (Value::F64(left), Value::F64(right)) = (left, right) else {
                     return Err(Error::Runtime("VM f64 addition invariant broken".into()));
                 };
                 self.push(Value::F64(left + right));
             },
             Op::Push(v) => self.push(v.clone()),
-            Op::MakeString(s) => { let reference = self.allocate(HeapObject::String(s.clone())); self.push(Value::String(reference)); self.collect_if_needed(); },
+            Op::MakeString(s) => { let reference = self.allocate(HeapObject::String(s.to_string())); self.push(Value::String(reference)); self.collect_if_needed(); },
             Op::Input(ty) => { let val = self.read_input(ty)?; self.push(val); self.collect_if_needed(); },
-            Op::Require(module) => self.load_module(module.clone())?,
+            Op::Require(module) => self.load_module((**module).clone())?,
             Op::Load(slot) => self.push(self.locals.get(*slot).cloned().ok_or_else(|| Error::Runtime("invalid local slot".into()))?),
             Op::LoadCurrentReceiver => { let receiver = current_receiver.ok_or_else(|| Error::Runtime("this is available only inside a method".into()))?; self.push(self.locals.get(receiver).cloned().ok_or_else(|| Error::Runtime("invalid method receiver".into()))?); },
             Op::LoadCurrentField(field) => { let receiver = current_receiver.ok_or_else(|| Error::Runtime("field access outside method".into()))?; let Value::Struct(reference, _) = self.locals.get(receiver).ok_or_else(|| Error::Runtime("invalid method receiver".into()))? else { return Err(Error::Runtime("VM method receiver invariant broken".into())); }; let value = match self.heap_ref().get(*reference)? { HeapObject::Struct { values, .. } => values.get(field.index).cloned().ok_or_else(|| Error::Runtime("invalid struct field index".into()))?, _ => return Err(Error::Runtime("struct heap invariant broken".into())) }; self.push(value); },
@@ -1739,30 +1747,30 @@ impl Vm {
             },
             Op::StoreIndex(slot, element) => {
                 let value = self.pop()?;
-                if &value.ty() != element { return Err(Error::Runtime("VM type invariant broken".into())); }
+                if &value.ty() != element.as_ref() { return Err(Error::Runtime("VM type invariant broken".into())); }
                 let index = integer_to_usize(&self.pop()?)?;
                 let reference = match self.locals.get(*slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? {
                     Value::Array(reference, _) => *reference,
                     _ => return Err(Error::Runtime("VM array slot invariant broken".into())),
                 };
                 match self.heap_mut().get_mut(reference)? {
-                    HeapObject::Array { bytes, element: stored_element } if stored_element == element => {
-                        write_scalar(bytes, index, &value, element)?;
+                    HeapObject::Array { bytes, element: stored_element } if stored_element == element.as_ref() => {
+                        write_scalar(bytes, index, &value, element.as_ref())?;
                     },
                     _ => return Err(Error::Runtime("array heap invariant broken".into())),
                 }
             },
-            Op::StoreTableIndex(slot, element) => { let value = self.pop()?; if &value.ty() != element { return Err(Error::Runtime("VM table type invariant broken".into())); } let key_value = self.pop()?; let key = table_key_from_value(self.heap_ref(), &key_value)?; let reference = match self.locals.get(*slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? { Value::Table(reference, _) => *reference, _ => return Err(Error::Runtime("VM table slot invariant broken".into())), }; match self.heap_mut().get_mut(reference)? { HeapObject::Table { entries, element: stored_element } if stored_element == element => { entries.insert(key, value); }, _ => return Err(Error::Runtime("table heap invariant broken".into())), } },
+            Op::StoreTableIndex(slot, element) => { let value = self.pop()?; if &value.ty() != element.as_ref() { return Err(Error::Runtime("VM table type invariant broken".into())); } let key_value = self.pop()?; let key = table_key_from_value(self.heap_ref(), &key_value)?; let reference = match self.locals.get(*slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? { Value::Table(reference, _) => *reference, _ => return Err(Error::Runtime("VM table slot invariant broken".into())), }; match self.heap_mut().get_mut(reference)? { HeapObject::Table { entries, element: stored_element } if stored_element == element.as_ref() => { entries.insert(key, value); }, _ => return Err(Error::Runtime("table heap invariant broken".into())), } },
             Op::StoreTensorIndex(slot, element, rank) => {
                 let value = self.pop()?;
-                if &value.ty() != element { return Err(Error::Runtime("VM tensor type invariant broken".into())); }
+                if &value.ty() != element.as_ref() { return Err(Error::Runtime("VM tensor type invariant broken".into())); }
                 let indices = self.pop_tensor_indices(*rank)?;
                 let Value::Tensor(reference, stored_element, stored_rank) = self.locals.get(*slot).cloned().ok_or_else(|| Error::Runtime("invalid local slot".into()))? else { return Err(Error::Runtime("VM tensor slot invariant broken".into())); };
-                if stored_element.as_ref() != element || stored_rank != *rank { return Err(Error::Runtime("VM tensor slot type invariant broken".into())); }
+                if stored_element.as_ref() != element.as_ref() || stored_rank != *rank { return Err(Error::Runtime("VM tensor slot type invariant broken".into())); }
                 match self.heap_mut().get_mut(reference)? {
-                    HeapObject::Tensor { bytes, element: stored_element, shape } if stored_element == element && shape.len() == *rank => {
+                    HeapObject::Tensor { bytes, element: stored_element, shape } if stored_element == element.as_ref() && shape.len() == *rank => {
                         let offset = Self::tensor_offset(shape, &indices)?;
-                        write_scalar(bytes, offset, &value, element)?;
+                        write_scalar(bytes, offset, &value, element.as_ref())?;
                     },
                     _ => return Err(Error::Runtime("tensor heap invariant broken".into())),
                 }
@@ -1785,29 +1793,29 @@ impl Vm {
                 }
             },
             Op::StoreField(slot, field) => { let new_value = self.pop()?; if &new_value.ty() != &field.ty { return Err(Error::Runtime("VM type invariant broken".into())); } let reference = match self.locals.get(*slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? { Value::Struct(reference, _) => *reference, _ => return Err(Error::Runtime("VM struct slot invariant broken".into())), }; match self.heap_mut().get_mut(reference)? { HeapObject::Struct { values, .. } => { *values.get_mut(field.index).ok_or_else(|| Error::Runtime("invalid struct field index".into()))? = new_value; }, _ => return Err(Error::Runtime("struct heap invariant broken".into())), } },
-            Op::StoreFieldIndex(slot, field, element) => { let value = self.pop()?; if &value.ty() != element { return Err(Error::Runtime("VM vector type invariant broken".into())); } let index = integer_to_usize(&self.pop()?)?; let Value::Struct(struct_reference, _) = self.locals.get(*slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? else { return Err(Error::Runtime("VM struct slot invariant broken".into())); }; let array_reference = match self.heap_ref().get(*struct_reference)? { HeapObject::Struct { values, .. } => match values.get(field.index) { Some(Value::Array(reference, _)) => *reference, _ => return Err(Error::Runtime("VM struct vector field invariant broken".into())), }, _ => return Err(Error::Runtime("struct heap invariant broken".into())), }; match self.heap_mut().get_mut(array_reference)? { HeapObject::Array { bytes, element: stored_element } if stored_element == element => write_scalar(bytes, index, &value, element)?, _ => return Err(Error::Runtime("array heap invariant broken".into())), } },
-            Op::StoreTableField(slot, name, element) => { let value = self.pop()?; if &value.ty() != element { return Err(Error::Runtime("VM table type invariant broken".into())); } let reference = match self.locals.get(*slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? { Value::Table(reference, _) => *reference, _ => return Err(Error::Runtime("VM table slot invariant broken".into())), }; match self.heap_mut().get_mut(reference)? { HeapObject::Table { entries, element: stored_element } if stored_element == element => { entries.insert(TableKey::Name(name.clone()), value); }, _ => return Err(Error::Runtime("table heap invariant broken".into())), } },
+            Op::StoreFieldIndex(slot, field, element) => { let value = self.pop()?; if &value.ty() != element.as_ref() { return Err(Error::Runtime("VM vector type invariant broken".into())); } let index = integer_to_usize(&self.pop()?)?; let Value::Struct(struct_reference, _) = self.locals.get(*slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? else { return Err(Error::Runtime("VM struct slot invariant broken".into())); }; let array_reference = match self.heap_ref().get(*struct_reference)? { HeapObject::Struct { values, .. } => match values.get(field.index) { Some(Value::Array(reference, _)) => *reference, _ => return Err(Error::Runtime("VM struct vector field invariant broken".into())), }, _ => return Err(Error::Runtime("struct heap invariant broken".into())), }; match self.heap_mut().get_mut(array_reference)? { HeapObject::Array { bytes, element: stored_element } if stored_element == element.as_ref() => write_scalar(bytes, index, &value, element.as_ref())?, _ => return Err(Error::Runtime("array heap invariant broken".into())), } },
+            Op::StoreTableField(slot, name, element) => { let value = self.pop()?; if &value.ty() != element.as_ref() { return Err(Error::Runtime("VM table type invariant broken".into())); } let reference = match self.locals.get(*slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? { Value::Table(reference, _) => *reference, _ => return Err(Error::Runtime("VM table slot invariant broken".into())), }; match self.heap_mut().get_mut(reference)? { HeapObject::Table { entries, element: stored_element } if stored_element == element.as_ref() => { entries.insert(TableKey::Name(name.clone()), value); }, _ => return Err(Error::Runtime("table heap invariant broken".into())), } },
             Op::StoreCurrentField(field) => { let new_value = self.pop()?; if &new_value.ty() != &field.ty { return Err(Error::Runtime("VM type invariant broken".into())); } let receiver = current_receiver.ok_or_else(|| Error::Runtime("field assignment outside method".into()))?; let reference = match self.locals.get(receiver).ok_or_else(|| Error::Runtime("invalid method receiver".into()))? { Value::Struct(reference, _) => *reference, _ => return Err(Error::Runtime("VM method receiver invariant broken".into())), }; match self.heap_mut().get_mut(reference)? { HeapObject::Struct { values, .. } => { *values.get_mut(field.index).ok_or_else(|| Error::Runtime("invalid struct field index".into()))? = new_value; }, _ => return Err(Error::Runtime("struct heap invariant broken".into())), } },
-            Op::MakeArray(len, ty) => { if self.stack_ptr < *len { return Err(Error::Runtime("stack underflow".into())); } let at = self.stack_ptr - len; let values = self.stack[at..self.stack_ptr].to_vec(); self.stack_ptr = at; let bytes = Value::pack_array(values, ty)?; let reference = self.allocate(HeapObject::Array { bytes, element: ty.clone() }); self.push(Value::Array(reference, Box::new(ty.clone()))); self.collect_if_needed(); },
+            Op::MakeArray(len, ty) => { if self.stack_ptr < *len { return Err(Error::Runtime("stack underflow".into())); } let at = self.stack_ptr - len; let values = self.stack[at..self.stack_ptr].to_vec(); self.stack_ptr = at; let bytes = Value::pack_array(values, ty.as_ref())?; let reference = self.allocate(HeapObject::Array { bytes, element: ty.as_ref().clone() }); self.push(Value::Array(reference, Box::new(ty.as_ref().clone()))); self.collect_if_needed(); },
             Op::MakeTensor(init, element, rank) => {
                 let shape_value = self.pop()?;
                 let shape = self.tensor_shape_from_value(&shape_value)?;
                 if shape.len() != *rank { return Err(Error::Runtime(format!("tensor rank {rank} requires {rank} dimensions, got {}", shape.len()))); }
-                let bytes = self.make_tensor_bytes(*init, element, &shape)?;
-                let reference = self.allocate(HeapObject::Tensor { bytes, element: element.clone(), shape });
-                self.push(Value::Tensor(reference, Box::new(element.clone()), *rank));
+                let bytes = self.make_tensor_bytes(*init, element.as_ref(), &shape)?;
+                let reference = self.allocate(HeapObject::Tensor { bytes, element: element.as_ref().clone(), shape });
+                self.push(Value::Tensor(reference, Box::new(element.as_ref().clone()), *rank));
                 self.collect_if_needed();
             },
-            Op::MakeTable(entries, element) => { let value_count = entries.iter().map(|entry| match entry { TableEntry::Index => 2usize, TableEntry::Name(_) => 1usize }).sum(); if self.stack_ptr < value_count { return Err(Error::Runtime("stack underflow".into())); } let at = self.stack_ptr - value_count; let values = self.stack[at..self.stack_ptr].to_vec(); self.stack_ptr = at; let mut cursor = 0; let mut table = HashMap::with_capacity(entries.len()); for entry in entries { let key = match entry { TableEntry::Index => { let key = table_key_from_value(self.heap_ref(), values.get(cursor).ok_or_else(|| Error::Runtime("stack underflow".into()))?)?; cursor += 1; key }, TableEntry::Name(name) => TableKey::Name(name.clone()), }; let value = values.get(cursor).cloned().ok_or_else(|| Error::Runtime("stack underflow".into()))?; cursor += 1; if &value.ty() != element { return Err(Error::Runtime("VM table type invariant broken".into())); } if table.insert(key.clone(), value).is_some() { return Err(Error::Runtime(format!("table key {} is declared more than once", table_key_display(&key)))); } } let reference = self.allocate(HeapObject::Table { entries: table, element: element.clone() }); self.push(Value::Table(reference, Box::new(element.clone()))); self.collect_if_needed(); },
+            Op::MakeTable(entries, element) => { let value_count = entries.iter().map(|entry| match entry { TableEntry::Index => 2usize, TableEntry::Name(_) => 1usize }).sum(); if self.stack_ptr < value_count { return Err(Error::Runtime("stack underflow".into())); } let at = self.stack_ptr - value_count; let values = self.stack[at..self.stack_ptr].to_vec(); self.stack_ptr = at; let mut cursor = 0; let mut table = HashMap::with_capacity(entries.len()); for entry in entries.iter() { let key = match entry { TableEntry::Index => { let key = table_key_from_value(self.heap_ref(), values.get(cursor).ok_or_else(|| Error::Runtime("stack underflow".into()))?)?; cursor += 1; key }, TableEntry::Name(name) => TableKey::Name(name.clone()), }; let value = values.get(cursor).cloned().ok_or_else(|| Error::Runtime("stack underflow".into()))?; cursor += 1; if &value.ty() != element.as_ref() { return Err(Error::Runtime("VM table type invariant broken".into())); } if table.insert(key.clone(), value).is_some() { return Err(Error::Runtime(format!("table key {} is declared more than once", table_key_display(&key)))); } } let reference = self.allocate(HeapObject::Table { entries: table, element: element.as_ref().clone() }); self.push(Value::Table(reference, Box::new(element.as_ref().clone()))); self.collect_if_needed(); },
             Op::MakeStruct(layout) => { if self.stack_ptr < layout.fields.len() { return Err(Error::Runtime("stack underflow".into())); } let at = self.stack_ptr - layout.fields.len(); let values = self.stack[at..self.stack_ptr].to_vec(); self.stack_ptr = at; for (field, value) in layout.fields.iter().zip(values.iter()) { if value.ty() != field.ty { return Err(Error::Runtime("VM struct type invariant broken".into())); } } let reference = self.allocate(HeapObject::Struct { values, layout: layout.clone() }); self.push(Value::Struct(reference, layout.clone())); self.collect_if_needed(); },
             Op::Index => { let index = integer_to_usize(&self.pop()?)?; let object = self.pop()?; let Value::Array(reference, element) = object else { return Err(Error::Runtime("VM array invariant broken".into())); }; let value = match self.heap_ref().get(reference)? { HeapObject::Array { bytes, element: stored_element } if stored_element == element.as_ref() => decode_scalar(bytes, index, &element)?, _ => return Err(Error::Runtime("array heap invariant broken".into())) }; self.push(value); },
             Op::TensorIndex(element, rank) => {
                 let indices = self.pop_tensor_indices(*rank)?;
                 let object = self.pop()?;
                 let Value::Tensor(reference, stored_element, stored_rank) = object else { return Err(Error::Runtime("VM tensor invariant broken".into())); };
-                if stored_element.as_ref() != element || stored_rank != *rank { return Err(Error::Runtime("VM tensor type invariant broken".into())); }
+                if stored_element.as_ref() != element.as_ref() || stored_rank != *rank { return Err(Error::Runtime("VM tensor type invariant broken".into())); }
                 let value = match self.heap_ref().get(reference)? {
-                    HeapObject::Tensor { bytes, element: stored_element, shape } if stored_element == element && shape.len() == *rank => decode_scalar(bytes, Self::tensor_offset(shape, &indices)?, element)?,
+                    HeapObject::Tensor { bytes, element: stored_element, shape } if stored_element == element.as_ref() && shape.len() == *rank => decode_scalar(bytes, Self::tensor_offset(shape, &indices)?, element.as_ref())?,
                     _ => return Err(Error::Runtime("tensor heap invariant broken".into())),
                 };
                 self.push(value);
@@ -1829,21 +1837,21 @@ impl Vm {
             },
             Op::TableIndex => { let key_value = self.pop()?; let key = table_key_from_value(self.heap_ref(), &key_value)?; let object = self.pop()?; let Value::Table(reference, _) = object else { return Err(Error::Runtime("VM table invariant broken".into())); }; let value = match self.heap_ref().get(reference)? { HeapObject::Table { entries, .. } => entries.get(&key).cloned().ok_or_else(|| Error::Runtime(format!("table has no key {}", table_key_display(&key))))?, _ => return Err(Error::Runtime("table heap invariant broken".into())) }; self.push(value); },
             Op::TableKeys => { let object = self.pop()?; let Value::Table(reference, _) = object else { return Err(Error::Runtime("VM table invariant broken".into())); }; let mut keys = match self.heap_ref().get(reference)? { HeapObject::Table { entries, .. } => entries.keys().cloned().collect::<Vec<_>>(), _ => return Err(Error::Runtime("table heap invariant broken".into())) }; keys.sort_by(|left, right| match (left, right) { (TableKey::Index(a), TableKey::Index(b)) => a.cmp(b), (TableKey::Name(a), TableKey::Name(b)) => a.cmp(b), (TableKey::Index(_), TableKey::Name(_)) => std::cmp::Ordering::Less, (TableKey::Name(_), TableKey::Index(_)) => std::cmp::Ordering::Greater, }); let reference = self.allocate(HeapObject::TableKeys(keys)); self.push(Value::TableKeys(reference)); self.collect_if_needed(); },
-            Op::TableKeysIndex => { let index = integer_to_usize(&self.pop()?)?; let object = self.pop()?; let Value::TableKeys(reference) = object else { return Err(Error::Runtime("VM table_keys invariant broken".into())); }; let key = match self.heap_ref().get(reference)? { HeapObject::TableKeys(keys) => keys.get(index).cloned().ok_or_else(|| Error::Runtime(format!("table key index {index} is out of bounds")))?, _ => return Err(Error::Runtime("table_keys heap invariant broken".into())) }; self.push(Value::TableKey(key)); },
+            Op::TableKeysIndex => { let index = integer_to_usize(&self.pop()?)?; let object = self.pop()?; let Value::TableKeys(reference) = object else { return Err(Error::Runtime("VM table_keys invariant broken".into())); }; let key = match self.heap_ref().get(reference)? { HeapObject::TableKeys(keys) => keys.get(index).cloned().ok_or_else(|| Error::Runtime(format!("table key index {index} is out of bounds")))?, _ => return Err(Error::Runtime("table_keys heap invariant broken".into())) }; self.push(Value::TableKey(Rc::new(key))); },
             Op::TableRemove => { let key_value = self.pop()?; let key = table_key_from_value(self.heap_ref(), &key_value)?; let object = self.pop()?; let Value::Table(reference, _) = object else { return Err(Error::Runtime("VM table invariant broken".into())); }; let removed = match self.heap_mut().get_mut(reference)? { HeapObject::Table { entries, .. } => entries.remove(&key).is_some(), _ => return Err(Error::Runtime("table heap invariant broken".into())) }; self.push(Value::Bool(removed)); },
             Op::Field(field) => { let object = self.pop()?; let Value::Struct(reference, _) = object else { return Err(Error::Runtime("VM struct invariant broken".into())); }; let value = match self.heap_ref().get(reference)? { HeapObject::Struct { values, .. } => values.get(field.index).cloned().ok_or_else(|| Error::Runtime("invalid struct field index".into()))?, _ => return Err(Error::Runtime("struct heap invariant broken".into())) }; self.push(value); },
             Op::TableField(name) => { let object = self.pop()?; let Value::Table(reference, _) = object else { return Err(Error::Runtime("VM table invariant broken".into())); }; let value = match self.heap_ref().get(reference)? { HeapObject::Table { entries, .. } => entries.get(&TableKey::Name(name.clone())).cloned().ok_or_else(|| Error::Runtime(format!("table has no key {name}")))?, _ => return Err(Error::Runtime("table heap invariant broken".into())) }; self.push(value); },
-            Op::ModuleField(name) => { let Value::Module(id) = self.pop()? else { return Err(Error::Runtime("VM module invariant broken".into())); }; let value = { let instance = self.modules.get(&id).ok_or_else(|| Error::Runtime("loaded module is missing".into()))?; let ModuleExport::Value { slot, .. } = instance.artifact.exports.get(name).ok_or_else(|| Error::Runtime(format!("module has no exported value '{name}'")))? else { return Err(Error::Runtime(format!("'{name}' is not an exported module value"))); }; instance.vm.locals.get(*slot).cloned().ok_or_else(|| Error::Runtime("invalid module export slot".into()))? }; self.push(value); },
+            Op::ModuleField(name) => { let Value::Module(id) = self.pop()? else { return Err(Error::Runtime("VM module invariant broken".into())); }; let value = { let instance = self.modules.get(&id).ok_or_else(|| Error::Runtime("loaded module is missing".into()))?; let ModuleExport::Value { slot, .. } = instance.artifact.exports.get(name.as_ref()).ok_or_else(|| Error::Runtime(format!("module has no exported value '{name}'")))? else { return Err(Error::Runtime(format!("'{name}' is not an exported module value"))); }; instance.vm.locals.get(*slot).cloned().ok_or_else(|| Error::Runtime("invalid module export slot".into()))? }; self.push(value); },
             Op::Binary(op) => {
-                let right = self.pop()?;
-                let left = self.pop()?;
+                let right = self.pop_compiled();
+                let left = self.pop_compiled();
                 let result = {
                     let heap = self.heap_ref();
                     evaluate_binary(&heap, left, right, op)?
                 };
                 self.push(result);
             },
-            Op::Unary(op, ty) => { let val = self.pop()?; self.push(evaluate_unary(val, op, ty)?); },
+            Op::Unary(op, ty) => { let val = self.pop()?; self.push(evaluate_unary(val, op, ty.as_ref())?); },
             Op::Len => {
                 let value = self.pop()?;
                 let length = match value {
@@ -1891,8 +1899,8 @@ impl Vm {
                 self.collect_if_needed();
             },
             Op::Builtin1(name, _ty) => { let arg = self.pop()?; self.push(evaluate_builtin1(*name, arg)?); },
-            Op::Builtin2(name, ty) => { let arg2 = self.pop()?; let arg1 = self.pop()?; self.push(evaluate_builtin2(*name, arg1, arg2, ty)?); },
-            Op::CallExternal(name, argument_count) => self.call_external(name, *argument_count)?,
+            Op::Builtin2(name, ty) => { let arg2 = self.pop_compiled(); let arg1 = self.pop_compiled(); self.push(evaluate_builtin2(*name, arg1, arg2, ty.as_ref())?); },
+            Op::CallExternal(name, argument_count) => self.call_external(name.as_ref(), *argument_count)?,
             Op::JumpIfFalse(target) => { match self.pop()? { Value::Bool(false) => { pc = *target; continue; }, Value::Bool(true) => {}, _ => return Err(Error::Runtime("VM condition invariant broken".into())), } },
             Op::Jump(target) => { pc = *target; continue; },
             Op::JumpIfFalseKeep(target) => {
@@ -1919,7 +1927,7 @@ impl Vm {
             },
             Op::CallMethod(receiver, target) => { call_stack.push((pc + 1, current_receiver)); current_receiver = Some(*receiver); pc = *target; continue; },
             Op::CallCurrentMethod(target) => { let receiver = current_receiver.ok_or_else(|| Error::Runtime("this is available only inside a method".into()))?; call_stack.push((pc + 1, current_receiver)); current_receiver = Some(receiver); pc = *target; continue; },
-            Op::CallModule(slot, name) => { self.call_module_function(*slot, name)?; },
+            Op::CallModule(slot, name) => { self.call_module_function(*slot, name.as_ref())?; },
             Op::Return => { if let Some((return_pc, previous_receiver)) = call_stack.pop() { current_receiver = previous_receiver; pc = return_pc; continue; } if terminal_return { return Ok(&self.output); } return Err(Error::Runtime("return outside method".into())); },
             Op::Print => { let value = self.pop()?; let text = self.format_value(&value)?; self.emit(text); },
             Op::Printf(num_args) => {
@@ -2012,6 +2020,16 @@ impl Vm {
         self.stack_ptr -= 1;
         self.stack.get_unchecked(self.stack_ptr).clone()
     }
+
+    /// Used only by opcodes whose stack effect is fixed and emitted by the
+    /// compiler.  The debug assertion keeps compiler/VM mismatches visible
+    /// during development; release builds perform no underflow branch.
+    #[inline(always)]
+    fn pop_compiled(&mut self) -> Value {
+        debug_assert!(self.stack_ptr > 0, "compiler emitted a stack underflow");
+        unsafe { self.pop_unchecked() }
+    }
+
     fn pop(&mut self) -> Result<Value, Error> {
         if self.stack_ptr == 0 { return Err(Error::Runtime("stack underflow".into())); }
         Ok(unsafe { self.pop_unchecked() })
@@ -2521,6 +2539,13 @@ mod immediate_regression_tests {
     fn zero_tensor_bytes_need_no_scalar_encoding() {
         let mut vm = Vm::default();
         assert_eq!(vm.make_tensor_bytes(TensorInit::Zeros, &Type::I32, &[2, 3]).unwrap(), vec![0; 24]);
+    }
+
+    #[test]
+    fn stack_value_stays_within_four_machine_words() {
+        // This protects the VM stack from a future metadata-bearing variant
+        // accidentally turning every stack slot into a cache-line fragment.
+        assert!(std::mem::size_of::<Value>() <= 4 * std::mem::size_of::<usize>());
     }
     #[test]
     fn garbage_collection_tracks_payload_bytes() {
