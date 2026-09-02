@@ -1,0 +1,47 @@
+-- server.l0
+-- Эмуляция серверной логики Admin Script на языке L0
+
+let current_version: f32 = 2.0
+let newest_version: f32 = 2.0
+
+printf("Admin Script by rhys19 has loaded successfully!!!\n")
+printf("\n--------------------------------------------------------------------\n\n")
+printf("Admin Script\n\n")
+printf("Current Version: {}\n", current_version)
+printf("Newest Version: {}\n\n", newest_version)
+
+if current_version != newest_version then
+    printf("--------------------------------------------------------------------\n\n")
+else
+    printf("-- Up to date!\n--------------\n\n")
+end
+
+-- Эмуляция серверных команд через структуру
+struct Server {
+    dummy: i8;
+    
+    -- НОВОЕ ПОЛЕ: Используется вместо аргумента для методов
+    source_id: i32;
+
+    -- Убраны аргументы из сигнатуры
+    function start_admin()
+        -- Эмуляция TriggerClientEvent("adminpursuit:AddAdmin")
+        printf("[Server] Команда startadmin: Отправка AddAdmin для игрока {}\n", source_id)
+    end
+
+    function stop_admin()
+        -- Эмуляция TriggerClientEvent("adminpursuit:RemoveAdmin")
+        printf("[Server] Команда stopadmin: Отправка RemoveAdmin для игрока {}\n", source_id)
+    end
+}
+
+-- Инициализируем структуру с новым полем
+let srv: Server = Server { dummy = 0, source_id = 0 }
+
+-- Тестирование вызовов (симуляция ввода команд игроком с ID = 5)
+srv.source_id = 5
+srv.start_admin()
+
+-- Значение source_id все еще 5, но для надежности можно задать заново
+srv.source_id = 5
+srv.stop_admin()

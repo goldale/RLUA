@@ -1,0 +1,7 @@
+let game: module = require("game")
+game.init()
+game.init()
+print(game.score)
+
+let board: game.Board = game.Board { cells = [0, 0, 0] }
+print(board.cells[1])

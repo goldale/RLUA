@@ -1,0 +1,4 @@
+let greeting: string = "Hello"
+let version: f32 = 1.0
+
+printf("{}! L0 is running on version {}\n", greeting, version)

@@ -1,0 +1,10 @@
+-- Packed C-style struct with typed scalar fields.
+struct Position { x: i32; y: i32; visible: bool; }
+
+let visible: bool = 1 == 1
+let position: Position = Position { y = 7, visible = visible, x = 4 }
+position.x = 9
+
+print(position.x)
+print(position.y)
+print(position.visible)

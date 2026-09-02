@@ -1,0 +1,8 @@
+-- L0 uses Lua-like statement layout, strict types, and zero-based arrays.
+let left: i16 = 300
+let right: i16 = 27
+let samples: vector<f16> = [0.5, 1.5, 2.0]
+
+print(left + right)
+print(samples[0])
+print(samples[2])

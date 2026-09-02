@@ -1,0 +1,10 @@
+export let score: i8 = 0
+
+export struct Board {
+    cells: vector<i8>;
+}
+
+export function init()
+    score = score + 1
+    print(score)
+end

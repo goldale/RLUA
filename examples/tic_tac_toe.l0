@@ -1,0 +1,28 @@
+-- A deterministic replay of a Tic-Tac-Toe game.
+-- Board cells are zero-indexed: 0 = empty, 1 = X, 2 = O.
+let board: vector<i8> = [0, 0, 0, 0, 0, 0, 0, 0, 0]
+let x: i8 = 1
+let o: i8 = 2
+
+board[0] = x
+board[1] = o
+board[4] = x
+board[2] = o
+board[8] = x
+
+-- Print the resulting board, then the winner.
+print(board[0])
+print(board[1])
+print(board[2])
+print(board[3])
+print(board[4])
+print(board[5])
+print(board[6])
+print(board[7])
+print(board[8])
+
+if board[0] == board[4] then
+    if board[4] == board[8] then
+        print(x)
+    end
+end

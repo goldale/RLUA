@@ -1,0 +1,18 @@
+-- A method calls another method on the same struct instance through `this`.
+struct Counter {
+    value: i8;
+
+    function increment()
+        value = value + 1
+    end
+
+    function advance_twice()
+        this.increment()
+        this.increment()
+        print(this.value)
+    end
+}
+
+let counter: Counter = Counter { value = 3 }
+counter.advance_twice()
+print(counter.value)

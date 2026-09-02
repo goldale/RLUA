@@ -1,0 +1,5 @@
+-- Each `input` reads one numeric line from standard input.
+let move: i8 = input
+let weight: f32 = input
+print(move)
+print(weight)

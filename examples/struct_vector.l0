@@ -1,0 +1,9 @@
+-- A structure field can hold a typed vector.
+struct Board {
+    cells: vector<i8>;
+    score: i8;
+}
+
+let board: Board = Board { cells = [0, 0, 0], score = 0 }
+board.cells[0] = 1
+print(board.cells[0])

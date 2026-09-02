@@ -1,0 +1,12 @@
+struct Board {
+    size: i8;
+
+    function show_board()
+        print(size)
+        size = size + 1
+    end
+}
+
+let board: Board = Board { size = 3 }
+board.show_board()
+print(board.size)
