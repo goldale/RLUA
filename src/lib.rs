@@ -363,7 +363,8 @@ pub enum UnOp { Neg, Not }
 #[derive(Clone, Debug, PartialEq)]
 enum Token {
     Let, Print, Printf, Putc, Input, This, Function, Export, Require, If, Then, Else, ElseIf, While, For, Do, Break, Continue, Struct, Table, End,
-    Ident(StringId), Integer(i128), Float(f64), StringLit(StringId), Colon, DoubleColon,
+    Let, Print, Printf, Putc, Input, This, Function, Export, Require, If, Then, Else, ElseIf, While, For, Do, Break, Continue, Struct, Table, End,
+    As, Ident(StringId), Integer(i128), Float(f64), StringLit(StringId), Colon, DoubleColon,
     Equal, EqualEqual, Bang, BangEq, Plus, Minus, Star, Slash, Percent,
     Ampersand, Pipe, Caret, Shl, Shr, AndAnd, OrOr,
     Dot, Lt, Le, Gt, Ge, LParen, RParen, LBracket, RBracket, LBrace, RBrace, Comma, Semi, Eof
@@ -384,6 +385,7 @@ impl TokenBuffer {
 enum Expr {
     Integer(i128), Float(f64), String(StringId), Input, This, Require(String), Name(StringId),
     Array(Vec<Expr>), Table(Vec<(TableLiteralKey, Expr)>), StructLiteral(String, Vec<(String, Expr)>),
+    Cast(Box<Expr>, Type),
     Binary(Box<Expr>, BinOp, Box<Expr>), Unary(UnOp, Box<Expr>),
     Index(Box<Expr>, Vec<Expr>), Field(Box<Expr>, String),
     Call(String, Vec<Expr>), TensorFactory { name: String, element: Type, shape: Box<Expr> },
@@ -457,7 +459,8 @@ fn lex(source: &str) -> Result<LexedTokens, Error> {
                     "if" => Token::If, "then" => Token::Then, "else" => Token::Else, "elseif" => Token::ElseIf,
                     "while" => Token::While, "for" => Token::For, "do" => Token::Do,
                     "break" => Token::Break, "continue" => Token::Continue, "struct" => Token::Struct,
-                    "table" => Token::Table, "end" => Token::End, _ => Token::Ident(strings.intern(&word))
+                    "break" => Token::Break, "continue" => Token::Continue, "struct" => Token::Struct,
+                    "table" => Token::Table, "end" => Token::End, "as" => Token::As, _ => Token::Ident(strings.intern(&word))
                 });
             }
             c if c.is_ascii_digit() => {
@@ -764,6 +767,15 @@ impl Parser {
         }
         Ok(e)
     }
+    fn cast(&mut self) -> Result<Expr, Error> {
+        let mut e = self.primary()?;
+        while *self.peek() == Token::As {
+            self.next();
+            let target_ty = self.ty()?;
+            e = Expr::Cast(Box::new(e), target_ty);
+        }
+        Ok(e)
+    }
     fn unary(&mut self) -> Result<Expr, Error> {
         if *self.peek() == Token::Minus {
             self.next();
@@ -772,7 +784,7 @@ impl Parser {
             self.next();
             Ok(Expr::Unary(UnOp::Not, Box::new(self.unary()?)))
         } else {
-            self.primary()
+            self.cast()
         }
     }
     fn primary(&mut self) -> Result<Expr, Error> {
@@ -901,6 +913,7 @@ enum IrOp {
     StoreCurrentField(Rc<StructField>), MakeArray(usize, Rc<Type>), MakeTable(Rc<[TableEntry]>, Rc<Type>), MakeStruct(Rc<StructLayout>),
     MakeTensor(TensorInit, Rc<Type>, usize), Index, TensorIndex(Rc<Type>, usize), TensorIndexF32(usize), TableIndex, TableKeys, TableKeysIndex, TableRemove, Field(Rc<StructField>), TableField(Rc<str>), ModuleField(Rc<str>),
     Binary(BinaryOp), Unary(UnOp, Rc<Type>), Len, ConcatString,
+    Cast(Rc<Type>),
     Builtin1(BuiltinFn, Rc<Type>), Builtin2(BuiltinFn, Rc<Type>),
     CallExternal(Rc<str>, usize),
     JumpIfFalse(usize), Jump(usize), JumpIfFalseKeep(usize), JumpIfTrueKeep(usize),
@@ -1462,6 +1475,14 @@ impl Compiler {
             Ok(Type::Tensor(Box::new(element), rank))
         },
         Expr::StructLiteral(name, fields) => { let layout = self.structs.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown struct '{name}'")))?; if let Some(expected) = expected { if expected != &Type::Struct(name.clone()) { return Err(Error::Type(format!("expected {expected}, got {name}"))); } } if fields.len() != layout.fields.len() { return Err(Error::Type(format!("struct '{name}' needs {} field(s)", layout.fields.len()))); } let mut provided = HashMap::new(); for (field_name, field_expr) in fields { if provided.insert(field_name.clone(), field_expr).is_some() { return Err(Error::Type(format!("struct '{name}' initializes field '{field_name}' more than once"))); } } for field in &layout.fields { let expr = provided.remove(&field.name).ok_or_else(|| Error::Type(format!("struct '{name}' is missing field '{}'", field.name)))?; let found = self.expr(expr, Some(&field.ty))?; if found != field.ty { return Err(Error::Type(format!("field '{}' is {found}; expected {}", field.name, field.ty))); } } if let Some((unknown, _)) = provided.into_iter().next() { return Err(Error::Type(format!("struct '{name}' has no field '{unknown}'"))); } self.code.push(Op::MakeStruct(Rc::new(layout))); Ok(Type::Struct(name)) },
+        Expr::Cast(inner, target_ty) => {
+            let source_ty = self.expr(*inner, None)?;
+            if !is_numeric(&source_ty) || !is_numeric(&target_ty) {
+                return Err(Error::Type(format!("cannot cast {} to {}", source_ty, target_ty)));
+            }
+            self.code.push(Op::Cast(Rc::new(target_ty.clone())));
+            Ok(target_ty)
+        },
         Expr::Call(name, mut args) => {
             match name.as_str() {
                 "len" => {
@@ -2026,6 +2047,10 @@ impl Vm {
                 self.push(result);
             },
             Op::Unary(op, ty) => { let val = self.pop()?; self.push(evaluate_unary(val, op, ty.as_ref())?); },
+            Op::Cast(target_ty) => {
+                let val = self.pop()?;
+                self.push(cast_numeric(val, target_ty.as_ref())?);
+            },
             Op::Len => {
                 let value = self.pop()?;
                 let length = match value {
@@ -2454,6 +2479,41 @@ fn evaluate_unary(a: Value, op: &UnOp, ty: &Type) -> Result<Value, Error> {
     Err(Error::Runtime("VM execution invariant broken: unsupported unary op".into()))
 }
 
+fn cast_numeric(val: Value, target_ty: &Type) -> Result<Value, Error> {
+    macro_rules! cast_macro {
+        ($v:ident) => {
+            match target_ty {
+                Type::I8 => Value::I8(*$v as i8),
+                Type::I16 => Value::I16(*$v as i16),
+                Type::I32 => Value::I32(*$v as i32),
+                Type::I64 => Value::I64(*$v as i64),
+                Type::U8 => Value::U8(*$v as u8),
+                Type::U16 => Value::U16(*$v as u16),
+                Type::U32 => Value::U32(*$v as u32),
+                Type::U64 => Value::U64(*$v as u64),
+                Type::F32 => Value::F32(*$v as f32),
+                Type::F64 => Value::F64(*$v as f64),
+                Type::F16 => Value::F16(f32_to_f16(*$v as f32)),
+                _ => return Err(Error::Runtime("invalid cast target".into())),
+            }
+        }
+    }
+    Ok(match val {
+        Value::I8(ref v) => cast_macro!(v),
+        Value::I16(ref v) => cast_macro!(v),
+        Value::I32(ref v) => cast_macro!(v),
+        Value::I64(ref v) => cast_macro!(v),
+        Value::U8(ref v) => cast_macro!(v),
+        Value::U16(ref v) => cast_macro!(v),
+        Value::U32(ref v) => cast_macro!(v),
+        Value::U64(ref v) => cast_macro!(v),
+        Value::F32(ref v) => cast_macro!(v),
+        Value::F64(ref v) => cast_macro!(v),
+        Value::F16(v_raw) => { let val = f16_to_f32(v_raw); let v = &val; cast_macro!(v) },
+        _ => return Err(Error::Runtime("invalid cast source".into())),
+    })
+}
+
 /// Compile and execute a source unit. `print` output is returned line by line.
 pub fn execute(source: &str) -> Result<Vec<String>, Error> { let (program, strings) = Parser::new(lex(source)?).into_program()?; let code = Compiler::default().with_strings(strings).compile(program)?; let mut vm = Vm::default(); Ok(vm.run(&code)?.to_vec()) }
 /// Compile and execute a source unit with deterministic input lines.  This is
@@ -2766,7 +2826,6 @@ mod immediate_regression_tests {
         assert_eq!(ids[0], ids[2]);
         assert_eq!(lexed.strings.resolve(ids[0]), "repeated");
     }
-
     #[test]
     fn executable_bytecode_is_a_flat_u32_stream() {
         let (program, strings) = Parser::new(lex("let answer: i32 = 42; print(answer)").unwrap()).into_program().unwrap();
@@ -2775,7 +2834,6 @@ mod immediate_regression_tests {
         assert_eq!(code.words.len() % 4, 0);
         assert_eq!(Vm::default().run(&code).unwrap(), ["42"]);
     }
-
     #[test]
     fn concat_allocates_exact_payload_capacity() {
         let mut vm = Vm::default();
@@ -2783,6 +2841,11 @@ mod immediate_regression_tests {
         let Value::String(reference) = vm.locals[2] else { panic!("joined local is not a string") };
         let HeapObject::String(joined) = vm.heap_ref().get(reference).unwrap() else { panic!("joined value is not a heap string") };
         assert_eq!(joined.capacity(), joined.len());
+    fn numeric_casts_work_correctly() {
+        let source = "let a: i8 = 10; let b: i32 = a as i32; print(b)";
+        assert_eq!(execute(source).unwrap(), vec!["10".to_owned()]);
+        let source_float = "let f: f32 = 42.5; let i: i32 = f as i32; print(i)";
+        assert_eq!(execute(source_float).unwrap(), vec!["42".to_owned()]);
     }
     #[test]
     fn elseif_chain_evaluates_correctly() {
@@ -2799,5 +2862,55 @@ mod immediate_regression_tests {
             end
         ";
         assert_eq!(execute(source).unwrap(), vec!["20".to_owned()]);
+    }
+    #[test]
+    fn cast_various_numeric_types_and_chains() {
+        let source = r#"
+            -- знаковое в беззнаковое с циклическим переносом (-1 -> 255)
+            let neg: i32 = -1;
+            let u: u8 = neg as u8;
+            print(u);
+            -- усечение старших битов (300 % 256 = 44)
+            let big: i32 = 300;
+            let wrapped: u8 = big as u8;
+            print(wrapped);
+            -- усечение дробной части к нулю (-3.7 -> -3)
+            let f_neg: f64 = -3.7;
+            let i_trunc: i32 = f_neg as i32;
+            print(i_trunc);
+            -- конвертация с участием f16 (binary16)
+            let orig_f32: f32 = 2.5;
+            let half: f16 = orig_f32 as f16;
+            let back_f64: f64 = half as f64;
+            print(back_f64);
+            -- цепочки приведений
+            let chained: i32 = 123.75 as f32 as i32;
+            print(chained);
+            -- приведение результата выражения в скобках
+            let expr_cast: f64 = (10 + 5) as f64 / 2.0;
+            print(expr_cast);
+        "#;
+        assert_eq!(
+            execute(source).unwrap(),
+            vec!["255", "44", "-3", "2.5", "123", "7.5"]
+        );
+    }
+    #[test]
+    fn cast_rejects_non_numeric_types() {
+        // bool нельзя приводить к числовым типам (используем 1 == 1 вместо true)
+        assert!(matches!(
+            execute("let b: bool = 1 == 1; let i: i32 = b as i32"),
+            Err(Error::Located { source, .. }) if matches!(*source, Error::Type(ref msg) if msg.contains("cannot cast bool to i32"))
+        ));
+        // string нельзя приводить через cast
+        assert!(matches!(
+            execute("let s: string = \"hello\"; let i: i32 = s as i32"),
+            Err(Error::Located { source, .. }) if matches!(*source, Error::Type(ref msg) if msg.contains("cannot cast string to i32"))
+        ));
+        // числа нельзя приводить к bool
+        assert!(matches!(
+            execute("let i: i32 = 42; let b: bool = i as bool"),
+            Err(Error::Located { source, .. }) if matches!(*source, Error::Type(ref msg) if msg.contains("cannot cast i32 to bool"))
+        ));
     }
 }
