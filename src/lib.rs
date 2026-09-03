@@ -1627,7 +1627,7 @@ impl Compiler {
         },
         Statement::ForIn { name, iterable, body } => {
             if self.names.contains_key(&name) { return Err(Error::Type(format!("loop variable '{name}' is already defined"))); }
-            
+
             // 1. Validate the iterable type
             let iterable_ty = self.expr(iterable, None)?;
             let element_ty = match &iterable_ty {
@@ -1658,7 +1658,7 @@ impl Compiler {
             self.names.insert(name.clone(), (item_slot, element_ty.clone()));
 
             let loop_start = self.code.len();
-            
+
             // Condition: if !(index < len) jump to end
             self.code.push(Op::Load(index_slot));
             self.code.push(Op::Load(len_slot));
@@ -3418,7 +3418,7 @@ mod immediate_regression_tests {
             let d_t: dTensor = t
             print(len(d_t))
         "#;
-        
+
         assert_eq!(
             execute(source).unwrap(),
             vec!["4".to_owned(), "6".to_owned()]
@@ -3443,12 +3443,12 @@ mod immediate_regression_tests {
     #[test]
     fn dynamic_types_ffi_passing() {
         let mut vm = Vm::default();
-        
+
         // Регистрируем внешнюю функцию, которая ожидает динамический массив
         vm.register_rust_function(
-            "is_dynamic_array", 
-            vec![Type::DArray], 
-            Type::Bool, 
+            "is_dynamic_array",
+            vec![Type::DArray],
+            Type::Bool,
             |args, _| {
                 // На уровне Rust проверяем, что в рантайме действительно пришел Array
                 match args[0] {
@@ -3460,9 +3460,9 @@ mod immediate_regression_tests {
 
         // Регистрируем функцию, ожидающую динамический тензор
         vm.register_rust_function(
-            "is_dynamic_tensor", 
-            vec![Type::DTensor], 
-            Type::Bool, 
+            "is_dynamic_tensor",
+            vec![Type::DTensor],
+            Type::Bool,
             |args, _| {
                 match args[0] {
                     Value::Tensor(_, _) => Ok(Value::Bool(true)),
@@ -3474,12 +3474,12 @@ mod immediate_regression_tests {
         let source = r#"
             let vec: vector<f64> = [1.0, 2.0]
             let t: tensor<u8, 1> = zeros<u8>([5])
-            
+
             -- Передаем строгие типы во внешнюю функцию без явного приведения
             print(is_dynamic_array(vec))
             print(is_dynamic_tensor(t))
         "#;
-        
+
         assert_eq!(
             vm.execute(source).unwrap(),
             vec!["true".to_owned(), "true".to_owned()]

@@ -1,29 +1,31 @@
 -- profiler.l0
-
--- 1. Структура для математики над 1D массивами (замена numpy для 1D)
 struct Math1D {
-    -- Аналог np.abs(np.diff(arr, n=2)) с np.pad(mode="edge")
-    function diff2_abs_pad(arr: vector<f32>, result: vector<f32>)
+    arr: tensor<f32, 1>;
+    result: tensor<f32, 1>;
+    start_idx: i32;
+    end_idx: i32;
+
+    -- Поле для возврата результата из argmax
+    best_idx: i32;
+
+    function diff2_abs_pad()
         let n: i32 = len(arr)
-        if n < 3 then return end
+        -- Вместо return используем if для управления потоком выполнения
+        if n >= 3 then
+            let i: i32 = 1
+            while i < n - 1 do
+                let d: f32 = arr[i + 1] - (2.0 * arr[i]) + arr[i - 1]
+                result[i] = abs(d)
+                i = i + 1
+            end
 
-        -- Считаем вторую производную для внутренних элементов
-        let i: i32 = 1
-        while i < n - 1 do
-            -- diff2 = arr[i+1] - 2*arr[i] + arr[i-1]
-            let d: f32 = arr[i + 1] - (2.0 * arr[i]) + arr[i - 1]
-            result[i] = abs(d)
-            i = i + 1
+            result[0] = result[1]
+            result[n - 1] = result[n - 2]
         end
-
-        -- Аналог np.pad(..., (1, 1), mode="edge")
-        result[0] = result[1]
-        result[n - 1] = result[n - 2]
     end
 
-    -- Упрощенный аналог np.argmax
-    function argmax(arr: vector<f32>, start_idx: i32, end_idx: i32): i32
-        let best_idx: i32 = start_idx
+    function argmax()
+        best_idx = start_idx
         let max_val: f32 = arr[start_idx]
         let i: i32 = start_idx + 1
 
@@ -34,75 +36,96 @@ struct Math1D {
             end
             i = i + 1
         end
-        return best_idx
     end
 }
 
--- 2. Основная структура поиска слоев (аналог find_integration_layers)
 struct ProfilerConfig {
     min_separation: i32;
     min_curvature: f32;
-
-    -- Найденные индексы слоев
     l_mem: i32;
     l_comm: i32;
 
-    function select_peak(curvature: vector<f32>, start_idx: i32, end_idx: i32): i32
-        let math: Math1D = Math1D {}
-        let candidate: i32 = math.argmax(curvature, start_idx, end_idx)
+    entropies: tensor<f32, 1>;
+    curvature: tensor<f32, 1>;
+    start_idx: i32;
+    end_idx: i32;
+
+    -- Поле для сохранения найденного пика
+    selected_peak: i32;
+
+    function select_peak()
+        let math: Math1D = Math1D {
+            arr = curvature,
+            result = curvature, -- В argmax не используется, передаем как заглушку
+            start_idx = start_idx,
+            end_idx = end_idx,
+            best_idx = 0
+        }
+        math.argmax()
+        let candidate: i32 = math.best_idx
 
         if curvature[candidate] >= min_curvature then
-            return candidate
+            selected_peak = candidate
+        else
+            printf("Warning: No pronounced entropy elbow; using window midpoint\n")
+            selected_peak = (start_idx + end_idx - 1) / 2
         end
-
-        printf("Warning: No pronounced entropy elbow; using window midpoint\n")
-        return (start_idx + end_idx - 1) / 2
     end
 
-    function find_layers(entropies: vector<f32>)
+    function find_layers()
         let num_layers: i32 = len(entropies)
+	curvature = zeros<f32>([num_layers as u64])
+        let math: Math1D = Math1D {
+            arr = entropies,
+            result = curvature,
+            start_idx = 0,
+            end_idx = 0,
+            best_idx = 0
+        }
+        math.diff2_abs_pad()
 
-        -- В данной реализации мы пропускаем _smoothed для краткости
-        -- (либо вы можете реализовать скользящее среднее циклом)
-
-        -- Создаем вектор нужной длины для кривизны
-        let curvature: vector<f32> = zeros<f32>([num_layers])
-        let math: Math1D = Math1D {}
-        math.diff2_abs_pad(entropies, curvature)
-
-        -- Границы окон поиска (int(0.20 * N), int(0.45 * N) и т.д.)
         let mem_start: i32 = (20 * num_layers) / 100
         let mem_end: i32 = (45 * num_layers) / 100
-
         let comm_start: i32 = (55 * num_layers) / 100
         let comm_end: i32 = (80 * num_layers) / 100
 
-        -- Ищем пик для памяти
-        l_mem = this.select_peak(curvature, mem_start, mem_end)
+        start_idx = mem_start
+        end_idx = mem_end
+        this.select_peak()
+        l_mem = selected_peak
 
-        -- Сдвигаем окно для коммуникации, если оно слишком близко
         let safe_comm_start: i32 = l_mem + min_separation + 1
         if safe_comm_start > comm_start then
             comm_start = safe_comm_start
         end
 
-        -- Ищем пик для коммуникации
-        l_comm = this.select_peak(curvature, comm_start, comm_end)
+        start_idx = comm_start
+        end_idx = comm_end
+        this.select_peak()
+        l_comm = selected_peak
 
         printf("Selected Memory Layer (l_mem): {}\n", l_mem)
         printf("Selected Comm Layer (l_comm): {}\n", l_comm)
     end
 }
--- Имитируем список посчитанных энтропий (результаты EntropyProfiler для каждого из 32 слоев)
-let mock_entropies: vector<f32> = zeros<f32>([32])
-mock_entropies[8] = 0.5  -- Искусственный пик 1
-mock_entropies[20] = 0.8 -- Искусственный пик 2
 
--- Запускаем поиск интеграционных слоев
+-- Имитируем список посчитанных энтропий через 1D-тензор
+let mock_entropies: tensor<f32, 1> = zeros<f32>([32])
+mock_entropies[8] = 0.5
+mock_entropies[20] = 0.8
+
+-- Создаем тензор-заглушку, так как структура требует обязательной инициализации полей
+let dummy_curvature: tensor<f32, 1> = zeros<f32>([1])
+
 let layer_finder: ProfilerConfig = ProfilerConfig {
     min_separation = 2,
     min_curvature = 0.001,
     l_mem = 0,
-    l_comm = 0
+    l_comm = 0,
+    entropies = mock_entropies,
+    curvature = dummy_curvature,
+    start_idx = 0,
+    end_idx = 0,
+    selected_peak = 0
 }
-layer_finder.find_layers(mock_entropies)
+layer_finder.find_layers()
