@@ -99,3 +99,5 @@ The C ABI provides the same path for `i32` functions: call `l0_register_i32_func
 3. **Later stage:** add a tensor FFI registration and backend interface for CPU vector processors and GPU devices, then extend the C callback helpers beyond `i32`, add richer module interfaces, cross-module struct method dispatch, parameter and return-value design, and standard libraries.
 
 The GC stage must preserve the observable semantics above and collect cyclic tables and structures only when they become unreachable from all roots.
+
+cargo test --release -- --ignored --nocapture
