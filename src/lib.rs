@@ -74,9 +74,10 @@ pub enum Value {
     F16(u16), F32(f32), F64(f64), Bool(bool), String(HeapRef),
     /// A handle to homogeneous scalar values packed in canonical little-endian form.
     Array(HeapRef, Box<Type>),
-    /// An opaque handle to CPU tensor storage.  The rank is static; dimensions live
-    /// in the heap object so future hardware backends can replace the storage.
-    Tensor(HeapRef, Box<Type>, usize),
+    /// An opaque tensor handle plus its compiler-owned complete static type.
+    /// Keeping a shared `Type::Tensor` replaces the former `(Box<Type>, usize)`
+    /// payload and keeps each stack slot within three machine words.
+    Tensor(HeapRef, Rc<Type>),
     Table(HeapRef, Box<Type>),
     /// `TableKey::Index(i128)` has 16-byte alignment; boxing it prevents that
     /// uncommon key representation from raising the alignment of every stack
@@ -106,7 +107,7 @@ impl Value {
             Self::F32(_) => Type::F32, Self::F64(_) => Type::F64, Self::Bool(_) => Type::Bool,
             Self::String(_) => Type::String,
             Self::Array(_, element) => Type::Array(element.clone()),
-            Self::Tensor(_, element, rank) => Type::Tensor(element.clone(), *rank),
+            Self::Tensor(_, ty) => ty.as_ref().clone(),
             Self::Table(_, element) => Type::Table(element.clone()),
             Self::TableKey(_) => Type::TableKey,
             Self::TableKeys(_) => Type::TableKeys,
@@ -210,7 +211,7 @@ impl Heap {
 
     fn heap_ref(value: &Value) -> Option<HeapRef> {
         match value {
-            Value::Array(reference, _) | Value::Tensor(reference, _, _) | Value::String(reference)
+            Value::Array(reference, _) | Value::Tensor(reference, _) | Value::String(reference)
             | Value::Table(reference, _) | Value::TableKeys(reference) | Value::Struct(reference, _) => Some(*reference),
             _ => None,
         }
@@ -369,7 +370,7 @@ impl fmt::Display for Value {
             Self::F16(v) => write!(f, "{}", f16_to_f32(*v)), Self::F32(v) => write!(f, "{v}"),
             Self::F64(v) => write!(f, "{v}"), Self::Bool(v) => write!(f, "{v}"),
             Self::String(reference) => write!(f, "string@{}", reference.0),
-            Self::Array(reference, element) => write!(f, "vector<{}>@{}", element, reference.0), Self::Tensor(reference, element, rank) => write!(f, "tensor<{}, {}>@{}", element, rank, reference.0), Self::Table(reference, element) => write!(f, "table<{}>@{}", element, reference.0), Self::TableKey(key) => write!(f, "{}", table_key_display(key)), Self::TableKeys(reference) => write!(f, "table_keys@{}", reference.0), Self::Struct(reference, layout) => write!(f, "{}@{}", layout.name, reference.0), Self::Module(id) => write!(f, "module({id})")
+            Self::Array(reference, element) => write!(f, "vector<{}>@{}", element, reference.0), Self::Tensor(reference, ty) => write!(f, "{}@{}", ty, reference.0), Self::Table(reference, element) => write!(f, "table<{}>@{}", element, reference.0), Self::TableKey(key) => write!(f, "{}", table_key_display(key)), Self::TableKeys(reference) => write!(f, "table_keys@{}", reference.0), Self::Struct(reference, layout) => write!(f, "{}@{}", layout.name, reference.0), Self::Module(id) => write!(f, "module({id})")
         }
     }
 }
@@ -1003,16 +1004,16 @@ impl Opcode {
 }
 
 enum DecodedOp<'a> {
-    AddI32, AddF32, AddF64, Push(&'a Value), MakeString(&'a str), Input(&'a Type), Require(&'a ModuleArtifact), Load(usize), LoadCurrentReceiver,
-    LoadCurrentField(&'a StructField), Store(usize), StoreIndex(usize, &'a Type), StoreTableIndex(usize, &'a Type),
-    StoreTensorIndex(usize, &'a Type, usize), StoreTensorIndexF32(usize, usize),
-    StoreField(usize, &'a StructField), StoreFieldIndex(usize, &'a StructField, &'a Type), StoreTableField(usize, &'a str, &'a Type),
-    StoreCurrentField(&'a StructField), MakeArray(usize, &'a Type), MakeTable(&'a [TableEntry], &'a Type), MakeStruct(&'a StructLayout),
-    MakeTensor(TensorInit, &'a Type, usize), Index, TensorIndex(&'a Type, usize), TensorIndexF32(usize), TableIndex, TableKeys, TableKeysIndex, TableRemove, Field(&'a StructField), TableField(&'a str), ModuleField(&'a str),
-    Binary(&'a BinaryOp), Unary(&'a UnOp, &'a Type), Len, ConcatString, Cast(&'a Type),
-    Builtin1(BuiltinFn, &'a Type), Builtin2(BuiltinFn, &'a Type), CallExternal(&'a str, usize),
+    AddI32, AddF32, AddF64, Push(&'a Value), MakeString(&'a Rc<str>), Input(&'a Rc<Type>), Require(&'a Rc<ModuleArtifact>), Load(usize), LoadCurrentReceiver,
+    LoadCurrentField(&'a Rc<StructField>), Store(usize), StoreIndex(usize, &'a Rc<Type>), StoreTableIndex(usize, &'a Rc<Type>),
+    StoreTensorIndex(usize, &'a Rc<Type>, usize), StoreTensorIndexF32(usize, usize),
+    StoreField(usize, &'a Rc<StructField>), StoreFieldIndex(usize, &'a Rc<StructField>, &'a Rc<Type>), StoreTableField(usize, &'a Rc<str>, &'a Rc<Type>),
+    StoreCurrentField(&'a Rc<StructField>), MakeArray(usize, &'a Rc<Type>), MakeTable(&'a Rc<[TableEntry]>, &'a Rc<Type>), MakeStruct(&'a Rc<StructLayout>),
+    MakeTensor(TensorInit, &'a Rc<Type>, usize), Index, TensorIndex(&'a Rc<Type>, usize), TensorIndexF32(usize), TableIndex, TableKeys, TableKeysIndex, TableRemove, Field(&'a Rc<StructField>), TableField(&'a Rc<str>), ModuleField(&'a Rc<str>),
+    Binary(&'a BinaryOp), Unary(&'a UnOp, &'a Rc<Type>), Len, ConcatString, Cast(&'a Rc<Type>),
+    Builtin1(BuiltinFn, &'a Rc<Type>), Builtin2(BuiltinFn, &'a Rc<Type>), CallExternal(&'a Rc<str>, usize),
     JumpIfFalse(usize), Jump(usize), JumpIfFalseKeep(usize), JumpIfTrueKeep(usize),
-    CallMethod(usize, usize), CallCurrentMethod(usize), CallModule(usize, &'a str),
+    CallMethod(usize, usize), CallCurrentMethod(usize), CallModule(usize, &'a Rc<str>),
     Return, Print, Printf(usize), Putc,
 }
 
@@ -1054,6 +1055,9 @@ impl FlatBytecode {
             IrOp::Return => out.op(Opcode::Return), IrOp::Print => out.op(Opcode::Print), IrOp::Printf(v) => { out.op(Opcode::Printf); out.word(v); }, IrOp::Putc => out.op(Opcode::Putc),
         } while out.words.len() % 4 != 0 { out.words.push(0); } } out
     }
+    /// Decode by borrowing words and constant-pool entries.  This is inlined
+    /// into `Vm::run_from`; it never reconstructs compiler IR or allocates.
+    #[inline(always)]
     fn decode(&self, mut pc: usize) -> Result<(DecodedOp<'_>, usize), Error> {
         let instruction_start = pc;
         let opcode=Opcode::from_word(*self.words.get(pc).ok_or_else(|| Error::Runtime("truncated bytecode".into()))?)?; pc+=1;
@@ -1082,19 +1086,6 @@ impl FlatBytecode {
         }; Ok((decoded,instruction_start + 4))
     }
 
-    fn decode_ir(&self, pc: usize) -> Result<(IrOp, usize), Error> {
-        let (op, next_pc) = self.decode(pc)?;
-        let op = match op {
-            DecodedOp::AddI32 => IrOp::AddI32, DecodedOp::AddF32 => IrOp::AddF32, DecodedOp::AddF64 => IrOp::AddF64,
-            DecodedOp::Push(v) => IrOp::Push(v.clone()), DecodedOp::MakeString(v) => IrOp::MakeString(Rc::from(v)), DecodedOp::Input(v) => IrOp::Input(Rc::new(v.clone())), DecodedOp::Require(v) => IrOp::Require(Rc::new(v.clone())), DecodedOp::Load(v) => IrOp::Load(v), DecodedOp::LoadCurrentReceiver => IrOp::LoadCurrentReceiver,
-            DecodedOp::LoadCurrentField(v) => IrOp::LoadCurrentField(Rc::new(v.clone())), DecodedOp::Store(v) => IrOp::Store(v), DecodedOp::StoreIndex(a,b) => IrOp::StoreIndex(a,Rc::new(b.clone())), DecodedOp::StoreTableIndex(a,b) => IrOp::StoreTableIndex(a,Rc::new(b.clone())), DecodedOp::StoreTensorIndex(a,b,c) => IrOp::StoreTensorIndex(a,Rc::new(b.clone()),c), DecodedOp::StoreTensorIndexF32(a,b) => IrOp::StoreTensorIndexF32(a,b),
-            DecodedOp::StoreField(a,b) => IrOp::StoreField(a,Rc::new(b.clone())), DecodedOp::StoreFieldIndex(a,b,c) => IrOp::StoreFieldIndex(a,Rc::new(b.clone()),Rc::new(c.clone())), DecodedOp::StoreTableField(a,b,c) => IrOp::StoreTableField(a,Rc::from(b),Rc::new(c.clone())), DecodedOp::StoreCurrentField(v) => IrOp::StoreCurrentField(Rc::new(v.clone())),
-            DecodedOp::MakeArray(a,b) => IrOp::MakeArray(a,Rc::new(b.clone())), DecodedOp::MakeTable(a,b) => IrOp::MakeTable(Rc::from(a),Rc::new(b.clone())), DecodedOp::MakeStruct(v) => IrOp::MakeStruct(Rc::new(v.clone())), DecodedOp::MakeTensor(a,b,c) => IrOp::MakeTensor(a,Rc::new(b.clone()),c),
-            DecodedOp::Index => IrOp::Index, DecodedOp::TensorIndex(a,b) => IrOp::TensorIndex(Rc::new(a.clone()),b), DecodedOp::TensorIndexF32(v) => IrOp::TensorIndexF32(v), DecodedOp::TableIndex => IrOp::TableIndex, DecodedOp::TableKeys => IrOp::TableKeys, DecodedOp::TableKeysIndex => IrOp::TableKeysIndex, DecodedOp::TableRemove => IrOp::TableRemove, DecodedOp::Field(v) => IrOp::Field(Rc::new(v.clone())), DecodedOp::TableField(v) => IrOp::TableField(Rc::from(v)), DecodedOp::ModuleField(v) => IrOp::ModuleField(Rc::from(v)),
-            DecodedOp::Binary(v) => IrOp::Binary(v.clone()), DecodedOp::Unary(a,b) => IrOp::Unary(a.clone(),Rc::new(b.clone())), DecodedOp::Len => IrOp::Len, DecodedOp::ConcatString => IrOp::ConcatString, DecodedOp::Cast(v) => IrOp::Cast(Rc::new(v.clone())), DecodedOp::Builtin1(a,b) => IrOp::Builtin1(a,Rc::new(b.clone())), DecodedOp::Builtin2(a,b) => IrOp::Builtin2(a,Rc::new(b.clone())), DecodedOp::CallExternal(a,b) => IrOp::CallExternal(Rc::from(a),b),
-            DecodedOp::JumpIfFalse(v) => IrOp::JumpIfFalse(v), DecodedOp::Jump(v) => IrOp::Jump(v), DecodedOp::JumpIfFalseKeep(v) => IrOp::JumpIfFalseKeep(v), DecodedOp::JumpIfTrueKeep(v) => IrOp::JumpIfTrueKeep(v), DecodedOp::CallMethod(a,b) => IrOp::CallMethod(a,b), DecodedOp::CallCurrentMethod(v) => IrOp::CallCurrentMethod(v), DecodedOp::CallModule(a,b) => IrOp::CallModule(a,Rc::from(b)), DecodedOp::Return => IrOp::Return, DecodedOp::Print => IrOp::Print, DecodedOp::Printf(v) => IrOp::Printf(v), DecodedOp::Putc => IrOp::Putc,
-        }; Ok((op, next_pc))
-    }
 }
 
 /// Built-ins are resolved during compilation. Keeping their identity in the
@@ -1964,8 +1955,8 @@ impl Vm {
                 },
                 _ => Err(Error::Runtime("array heap invariant broken".into())),
             },
-            Value::Tensor(reference, element, rank) => match self.heap_ref().get(*reference)? {
-                HeapObject::Tensor { element: stored_element, shape, .. } if stored_element == element.as_ref() && shape.len() == *rank => Ok(format!("tensor<{}, {}>[{}]", element, rank, shape.iter().map(usize::to_string).collect::<Vec<_>>().join(", "))),
+            Value::Tensor(reference, ty) => match self.heap_ref().get(*reference)? {
+                HeapObject::Tensor { shape, .. } => Ok(format!("{}[{}]", ty, shape.iter().map(usize::to_string).collect::<Vec<_>>().join(", "))),
                 _ => Err(Error::Runtime("tensor heap invariant broken".into())),
             },
             Value::String(reference) => match self.heap_ref().get(*reference)? { HeapObject::String(text) => Ok(text.clone()), _ => Err(Error::Runtime("string heap invariant broken".into())) },
@@ -2014,9 +2005,9 @@ impl Vm {
         let mut current_receiver: Option<usize> = None;
 
         while pc < code.words.len() {
-            let (instruction, next_pc) = code.decode_ir(pc)?;
-            match &instruction {
-            Op::AddI32 => {
+            let (instruction, next_pc) = code.decode(pc)?;
+            match instruction {
+            DecodedOp::AddI32 => {
                 // The compiler emits two operands for every arithmetic opcode.
                 // Keep the diagnostic in debug builds, but do not branch twice
                 // per instruction in the production arithmetic hot path.
@@ -2029,7 +2020,7 @@ impl Vm {
                     .ok_or_else(|| Error::Runtime("addition overflow".into()))?;
                 self.push(Value::I32(result));
             },
-            Op::AddF32 => {
+            DecodedOp::AddF32 => {
                 let right = self.pop_compiled();
                 let left = self.pop_compiled();
                 let (Value::F32(left), Value::F32(right)) = (left, right) else {
@@ -2037,7 +2028,7 @@ impl Vm {
                 };
                 self.push(Value::F32(left + right));
             },
-            Op::AddF64 => {
+            DecodedOp::AddF64 => {
                 let right = self.pop_compiled();
                 let left = self.pop_compiled();
                 let (Value::F64(left), Value::F64(right)) = (left, right) else {
@@ -2045,53 +2036,49 @@ impl Vm {
                 };
                 self.push(Value::F64(left + right));
             },
-            Op::Push(v) => self.push(v.clone()),
-            Op::MakeString(s) => { let reference = self.allocate(HeapObject::String(s.to_string())); self.push(Value::String(reference)); self.collect_if_needed(); },
-            Op::Input(ty) => { let val = self.read_input(ty)?; self.push(val); self.collect_if_needed(); },
-            Op::Require(module) => self.load_module((**module).clone())?,
-            Op::Load(slot) => self.push(self.locals.get(*slot).cloned().ok_or_else(|| Error::Runtime("invalid local slot".into()))?),
-            Op::LoadCurrentReceiver => { let receiver = current_receiver.ok_or_else(|| Error::Runtime("this is available only inside a method".into()))?; self.push(self.locals.get(receiver).cloned().ok_or_else(|| Error::Runtime("invalid method receiver".into()))?); },
-            Op::LoadCurrentField(field) => { let receiver = current_receiver.ok_or_else(|| Error::Runtime("field access outside method".into()))?; let Value::Struct(reference, _) = self.locals.get(receiver).ok_or_else(|| Error::Runtime("invalid method receiver".into()))? else { return Err(Error::Runtime("VM method receiver invariant broken".into())); }; let value = match self.heap_ref().get(*reference)? { HeapObject::Struct { values, .. } => values.get(field.index).cloned().ok_or_else(|| Error::Runtime("invalid struct field index".into()))?, _ => return Err(Error::Runtime("struct heap invariant broken".into())) }; self.push(value); },
-            Op::Store(slot) => {
+            DecodedOp::Push(v) => self.push(v.clone()),
+            DecodedOp::MakeString(s) => { let reference = self.allocate(HeapObject::String(s.to_string())); self.push(Value::String(reference)); self.collect_if_needed(); },
+            DecodedOp::Input(ty) => { let val = self.read_input(ty)?; self.push(val); self.collect_if_needed(); },
+            DecodedOp::Require(module) => self.load_module((**module).clone())?,
+            DecodedOp::Load(slot) => self.push(self.locals.get(slot).cloned().ok_or_else(|| Error::Runtime("invalid local slot".into()))?),
+            DecodedOp::LoadCurrentReceiver => { let receiver = current_receiver.ok_or_else(|| Error::Runtime("this is available only inside a method".into()))?; self.push(self.locals.get(receiver).cloned().ok_or_else(|| Error::Runtime("invalid method receiver".into()))?); },
+            DecodedOp::LoadCurrentField(field) => { let receiver = current_receiver.ok_or_else(|| Error::Runtime("field access outside method".into()))?; let Value::Struct(reference, _) = self.locals.get(receiver).ok_or_else(|| Error::Runtime("invalid method receiver".into()))? else { return Err(Error::Runtime("VM method receiver invariant broken".into())); }; let value = match self.heap_ref().get(*reference)? { HeapObject::Struct { values, .. } => values.get(field.index).cloned().ok_or_else(|| Error::Runtime("invalid struct field index".into()))?, _ => return Err(Error::Runtime("struct heap invariant broken".into())) }; self.push(value); },
+            DecodedOp::Store(slot) => {
                 let v = self.pop()?;
-                if *slot >= self.locals.len() { self.locals.resize(*slot + 1, Value::Bool(false)); }
-                self.locals[*slot] = v;
+                if slot >= self.locals.len() { self.locals.resize(slot + 1, Value::Bool(false)); }
+                self.locals[slot] = v;
             },
-            Op::StoreIndex(slot, element) => {
+            DecodedOp::StoreIndex(slot, element) => {
                 let value = self.pop()?;
-                if &value.ty() != element.as_ref() { return Err(Error::Runtime("VM type invariant broken".into())); }
                 let index = integer_to_usize(&self.pop()?)?;
-                let reference = match self.locals.get(*slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? {
+                let reference = match self.locals.get(slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? {
                     Value::Array(reference, _) => *reference,
                     _ => return Err(Error::Runtime("VM array slot invariant broken".into())),
                 };
                 match self.heap_mut().get_mut(reference)? {
-                    HeapObject::Array { bytes, element: stored_element } if stored_element == element.as_ref() => {
+                    HeapObject::Array { bytes, .. } => {
                         write_scalar(bytes, index, &value, element.as_ref())?;
                     },
                     _ => return Err(Error::Runtime("array heap invariant broken".into())),
                 }
             },
-            Op::StoreTableIndex(slot, element) => { let value = self.pop()?; if &value.ty() != element.as_ref() { return Err(Error::Runtime("VM table type invariant broken".into())); } let key_value = self.pop()?; let key = table_key_from_value(self.heap_ref(), &key_value)?; let reference = match self.locals.get(*slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? { Value::Table(reference, _) => *reference, _ => return Err(Error::Runtime("VM table slot invariant broken".into())), }; match self.heap_mut().get_mut(reference)? { HeapObject::Table { entries, element: stored_element } if stored_element == element.as_ref() => { entries.insert(key, value); }, _ => return Err(Error::Runtime("table heap invariant broken".into())), } },
-            Op::StoreTensorIndex(slot, element, rank) => {
+            DecodedOp::StoreTableIndex(slot, _element) => { let value = self.pop()?; let key_value = self.pop()?; let key = table_key_from_value(self.heap_ref(), &key_value)?; let reference = match self.locals.get(slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? { Value::Table(reference, _) => *reference, _ => return Err(Error::Runtime("VM table slot invariant broken".into())), }; match self.heap_mut().get_mut(reference)? { HeapObject::Table { entries, .. } => { entries.insert(key, value); }, _ => return Err(Error::Runtime("table heap invariant broken".into())), } },
+            DecodedOp::StoreTensorIndex(slot, element, rank) => {
                 let value = self.pop()?;
-                if &value.ty() != element.as_ref() { return Err(Error::Runtime("VM tensor type invariant broken".into())); }
-                let indices = self.pop_tensor_indices(*rank)?;
-                let Value::Tensor(reference, stored_element, stored_rank) = self.locals.get(*slot).cloned().ok_or_else(|| Error::Runtime("invalid local slot".into()))? else { return Err(Error::Runtime("VM tensor slot invariant broken".into())); };
-                if stored_element.as_ref() != element.as_ref() || stored_rank != *rank { return Err(Error::Runtime("VM tensor slot type invariant broken".into())); }
+                let indices = self.pop_tensor_indices(rank)?;
+                let Value::Tensor(reference, _) = self.locals.get(slot).cloned().ok_or_else(|| Error::Runtime("invalid local slot".into()))? else { return Err(Error::Runtime("VM tensor slot invariant broken".into())); };
                 match self.heap_mut().get_mut(reference)? {
-                    HeapObject::Tensor { bytes, element: stored_element, shape } if stored_element == element.as_ref() && shape.len() == *rank => {
+                    HeapObject::Tensor { bytes, shape, .. } if shape.len() == rank => {
                         let offset = Self::tensor_offset(shape, &indices)?;
                         write_scalar(bytes, offset, &value, element.as_ref())?;
                     },
                     _ => return Err(Error::Runtime("tensor heap invariant broken".into())),
                 }
             },
-            Op::StoreTensorIndexF32(slot, rank) => {
+            DecodedOp::StoreTensorIndexF32(slot, rank) => {
                 let value = self.pop()?;
-                if value.ty() != Type::F32 { return Err(Error::Runtime("VM tensor type invariant broken".into())); }
-                let indices = self.pop_tensor_indices(*rank)?;
-                let Value::Tensor(reference, _, _) = self.locals.get(*slot).cloned().ok_or_else(|| Error::Runtime("invalid local slot".into()))? else { return Err(Error::Runtime("VM tensor slot invariant broken".into())); };
+                let indices = self.pop_tensor_indices(rank)?;
+                let Value::Tensor(reference, _) = self.locals.get(slot).cloned().ok_or_else(|| Error::Runtime("invalid local slot".into()))? else { return Err(Error::Runtime("VM tensor slot invariant broken".into())); };
                 match self.heap_mut().get_mut(reference)? {
                     HeapObject::Tensor { bytes, shape, .. } => {
                         let offset = Self::tensor_offset(shape, &indices)?;
@@ -2104,38 +2091,37 @@ impl Vm {
                     _ => return Err(Error::Runtime("tensor heap invariant broken".into())),
                 }
             },
-            Op::StoreField(slot, field) => { let new_value = self.pop()?; if &new_value.ty() != &field.ty { return Err(Error::Runtime("VM type invariant broken".into())); } let reference = match self.locals.get(*slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? { Value::Struct(reference, _) => *reference, _ => return Err(Error::Runtime("VM struct slot invariant broken".into())), }; match self.heap_mut().get_mut(reference)? { HeapObject::Struct { values, .. } => { *values.get_mut(field.index).ok_or_else(|| Error::Runtime("invalid struct field index".into()))? = new_value; }, _ => return Err(Error::Runtime("struct heap invariant broken".into())), } },
-            Op::StoreFieldIndex(slot, field, element) => { let value = self.pop()?; if &value.ty() != element.as_ref() { return Err(Error::Runtime("VM vector type invariant broken".into())); } let index = integer_to_usize(&self.pop()?)?; let Value::Struct(struct_reference, _) = self.locals.get(*slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? else { return Err(Error::Runtime("VM struct slot invariant broken".into())); }; let array_reference = match self.heap_ref().get(*struct_reference)? { HeapObject::Struct { values, .. } => match values.get(field.index) { Some(Value::Array(reference, _)) => *reference, _ => return Err(Error::Runtime("VM struct vector field invariant broken".into())), }, _ => return Err(Error::Runtime("struct heap invariant broken".into())), }; match self.heap_mut().get_mut(array_reference)? { HeapObject::Array { bytes, element: stored_element } if stored_element == element.as_ref() => write_scalar(bytes, index, &value, element.as_ref())?, _ => return Err(Error::Runtime("array heap invariant broken".into())), } },
-            Op::StoreTableField(slot, name, element) => { let value = self.pop()?; if &value.ty() != element.as_ref() { return Err(Error::Runtime("VM table type invariant broken".into())); } let reference = match self.locals.get(*slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? { Value::Table(reference, _) => *reference, _ => return Err(Error::Runtime("VM table slot invariant broken".into())), }; match self.heap_mut().get_mut(reference)? { HeapObject::Table { entries, element: stored_element } if stored_element == element.as_ref() => { entries.insert(TableKey::Name(name.clone()), value); }, _ => return Err(Error::Runtime("table heap invariant broken".into())), } },
-            Op::StoreCurrentField(field) => { let new_value = self.pop()?; if &new_value.ty() != &field.ty { return Err(Error::Runtime("VM type invariant broken".into())); } let receiver = current_receiver.ok_or_else(|| Error::Runtime("field assignment outside method".into()))?; let reference = match self.locals.get(receiver).ok_or_else(|| Error::Runtime("invalid method receiver".into()))? { Value::Struct(reference, _) => *reference, _ => return Err(Error::Runtime("VM method receiver invariant broken".into())), }; match self.heap_mut().get_mut(reference)? { HeapObject::Struct { values, .. } => { *values.get_mut(field.index).ok_or_else(|| Error::Runtime("invalid struct field index".into()))? = new_value; }, _ => return Err(Error::Runtime("struct heap invariant broken".into())), } },
-            Op::MakeArray(len, ty) => { if self.stack_ptr < *len { return Err(Error::Runtime("stack underflow".into())); } let at = self.stack_ptr - len; let values = self.stack[at..self.stack_ptr].to_vec(); self.stack_ptr = at; let bytes = Value::pack_array(values, ty.as_ref())?; let reference = self.allocate(HeapObject::Array { bytes, element: ty.as_ref().clone() }); self.push(Value::Array(reference, Box::new(ty.as_ref().clone()))); self.collect_if_needed(); },
-            Op::MakeTensor(init, element, rank) => {
+            DecodedOp::StoreField(slot, field) => { let new_value = self.pop()?; let reference = match self.locals.get(slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? { Value::Struct(reference, _) => *reference, _ => return Err(Error::Runtime("VM struct slot invariant broken".into())), }; match self.heap_mut().get_mut(reference)? { HeapObject::Struct { values, .. } => { *values.get_mut(field.index).ok_or_else(|| Error::Runtime("invalid struct field index".into()))? = new_value; }, _ => return Err(Error::Runtime("struct heap invariant broken".into())), } },
+            DecodedOp::StoreFieldIndex(slot, field, element) => { let value = self.pop()?; let index = integer_to_usize(&self.pop()?)?; let Value::Struct(struct_reference, _) = self.locals.get(slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? else { return Err(Error::Runtime("VM struct slot invariant broken".into())); }; let array_reference = match self.heap_ref().get(*struct_reference)? { HeapObject::Struct { values, .. } => match values.get(field.index) { Some(Value::Array(reference, _)) => *reference, _ => return Err(Error::Runtime("VM struct vector field invariant broken".into())), }, _ => return Err(Error::Runtime("struct heap invariant broken".into())), }; match self.heap_mut().get_mut(array_reference)? { HeapObject::Array { bytes, .. } => write_scalar(bytes, index, &value, element.as_ref())?, _ => return Err(Error::Runtime("array heap invariant broken".into())), } },
+            DecodedOp::StoreTableField(slot, name, _element) => { let value = self.pop()?; let reference = match self.locals.get(slot).ok_or_else(|| Error::Runtime("invalid local slot".into()))? { Value::Table(reference, _) => *reference, _ => return Err(Error::Runtime("VM table slot invariant broken".into())), }; match self.heap_mut().get_mut(reference)? { HeapObject::Table { entries, .. } => { entries.insert(TableKey::Name(name.clone()), value); }, _ => return Err(Error::Runtime("table heap invariant broken".into())), } },
+            DecodedOp::StoreCurrentField(field) => { let new_value = self.pop()?; let receiver = current_receiver.ok_or_else(|| Error::Runtime("field assignment outside method".into()))?; let reference = match self.locals.get(receiver).ok_or_else(|| Error::Runtime("invalid method receiver".into()))? { Value::Struct(reference, _) => *reference, _ => return Err(Error::Runtime("VM method receiver invariant broken".into())), }; match self.heap_mut().get_mut(reference)? { HeapObject::Struct { values, .. } => { *values.get_mut(field.index).ok_or_else(|| Error::Runtime("invalid struct field index".into()))? = new_value; }, _ => return Err(Error::Runtime("struct heap invariant broken".into())), } },
+            DecodedOp::MakeArray(len, ty) => { if self.stack_ptr < len { return Err(Error::Runtime("stack underflow".into())); } let at = self.stack_ptr - len; let values = self.stack[at..self.stack_ptr].to_vec(); self.stack_ptr = at; let bytes = Value::pack_array(values, ty.as_ref())?; let reference = self.allocate(HeapObject::Array { bytes, element: ty.as_ref().clone() }); self.push(Value::Array(reference, Box::new(ty.as_ref().clone()))); self.collect_if_needed(); },
+            DecodedOp::MakeTensor(init, element, rank) => {
                 let shape_value = self.pop()?;
                 let shape = self.tensor_shape_from_value(&shape_value)?;
-                if shape.len() != *rank { return Err(Error::Runtime(format!("tensor rank {rank} requires {rank} dimensions, got {}", shape.len()))); }
-                let bytes = self.make_tensor_bytes(*init, element.as_ref(), &shape)?;
+                if shape.len() != rank { return Err(Error::Runtime(format!("tensor rank {rank} requires {rank} dimensions, got {}", shape.len()))); }
+                let bytes = self.make_tensor_bytes(init, element.as_ref(), &shape)?;
                 let reference = self.allocate(HeapObject::Tensor { bytes, element: element.as_ref().clone(), shape });
-                self.push(Value::Tensor(reference, Box::new(element.as_ref().clone()), *rank));
+                self.push(Value::Tensor(reference, Rc::new(Type::Tensor(Box::new(element.as_ref().clone()), rank))));
                 self.collect_if_needed();
             },
-            Op::MakeTable(entries, element) => { let value_count = entries.iter().map(|entry| match entry { TableEntry::Index => 2usize, TableEntry::Name(_) => 1usize }).sum(); if self.stack_ptr < value_count { return Err(Error::Runtime("stack underflow".into())); } let at = self.stack_ptr - value_count; let values = self.stack[at..self.stack_ptr].to_vec(); self.stack_ptr = at; let mut cursor = 0; let mut table = HashMap::with_capacity(entries.len()); for entry in entries.iter() { let key = match entry { TableEntry::Index => { let key = table_key_from_value(self.heap_ref(), values.get(cursor).ok_or_else(|| Error::Runtime("stack underflow".into()))?)?; cursor += 1; key }, TableEntry::Name(name) => TableKey::Name(name.clone()), }; let value = values.get(cursor).cloned().ok_or_else(|| Error::Runtime("stack underflow".into()))?; cursor += 1; if &value.ty() != element.as_ref() { return Err(Error::Runtime("VM table type invariant broken".into())); } if table.insert(key.clone(), value).is_some() { return Err(Error::Runtime(format!("table key {} is declared more than once", table_key_display(&key)))); } } let reference = self.allocate(HeapObject::Table { entries: table, element: element.as_ref().clone() }); self.push(Value::Table(reference, Box::new(element.as_ref().clone()))); self.collect_if_needed(); },
-            Op::MakeStruct(layout) => { if self.stack_ptr < layout.fields.len() { return Err(Error::Runtime("stack underflow".into())); } let at = self.stack_ptr - layout.fields.len(); let values = self.stack[at..self.stack_ptr].to_vec(); self.stack_ptr = at; for (field, value) in layout.fields.iter().zip(values.iter()) { if value.ty() != field.ty { return Err(Error::Runtime("VM struct type invariant broken".into())); } } let reference = self.allocate(HeapObject::Struct { values, layout: layout.clone() }); self.push(Value::Struct(reference, layout.clone())); self.collect_if_needed(); },
-            Op::Index => { let index = integer_to_usize(&self.pop()?)?; let object = self.pop()?; let Value::Array(reference, element) = object else { return Err(Error::Runtime("VM array invariant broken".into())); }; let value = match self.heap_ref().get(reference)? { HeapObject::Array { bytes, element: stored_element } if stored_element == element.as_ref() => decode_scalar(bytes, index, &element)?, _ => return Err(Error::Runtime("array heap invariant broken".into())) }; self.push(value); },
-            Op::TensorIndex(element, rank) => {
-                let indices = self.pop_tensor_indices(*rank)?;
+            DecodedOp::MakeTable(entries, element) => { let value_count = entries.iter().map(|entry| match entry { TableEntry::Index => 2usize, TableEntry::Name(_) => 1usize }).sum(); if self.stack_ptr < value_count { return Err(Error::Runtime("stack underflow".into())); } let at = self.stack_ptr - value_count; let values = self.stack[at..self.stack_ptr].to_vec(); self.stack_ptr = at; let mut cursor = 0; let mut table = HashMap::with_capacity(entries.len()); for entry in entries.iter() { let key = match entry { TableEntry::Index => { let key = table_key_from_value(self.heap_ref(), values.get(cursor).ok_or_else(|| Error::Runtime("stack underflow".into()))?)?; cursor += 1; key }, TableEntry::Name(name) => TableKey::Name(name.clone()), }; let value = values.get(cursor).cloned().ok_or_else(|| Error::Runtime("stack underflow".into()))?; cursor += 1; if table.insert(key.clone(), value).is_some() { return Err(Error::Runtime(format!("table key {} is declared more than once", table_key_display(&key)))); } } let reference = self.allocate(HeapObject::Table { entries: table, element: element.as_ref().clone() }); self.push(Value::Table(reference, Box::new(element.as_ref().clone()))); self.collect_if_needed(); },
+            DecodedOp::MakeStruct(layout) => { if self.stack_ptr < layout.fields.len() { return Err(Error::Runtime("stack underflow".into())); } let at = self.stack_ptr - layout.fields.len(); let values = self.stack[at..self.stack_ptr].to_vec(); self.stack_ptr = at; let reference = self.allocate(HeapObject::Struct { values, layout: layout.clone() }); self.push(Value::Struct(reference, layout.clone())); self.collect_if_needed(); },
+            DecodedOp::Index => { let index = integer_to_usize(&self.pop()?)?; let object = self.pop()?; let Value::Array(reference, element) = object else { return Err(Error::Runtime("VM array invariant broken".into())); }; let value = match self.heap_ref().get(reference)? { HeapObject::Array { bytes, element: stored_element } if stored_element == element.as_ref() => decode_scalar(bytes, index, &element)?, _ => return Err(Error::Runtime("array heap invariant broken".into())) }; self.push(value); },
+            DecodedOp::TensorIndex(element, rank) => {
+                let indices = self.pop_tensor_indices(rank)?;
                 let object = self.pop()?;
-                let Value::Tensor(reference, stored_element, stored_rank) = object else { return Err(Error::Runtime("VM tensor invariant broken".into())); };
-                if stored_element.as_ref() != element.as_ref() || stored_rank != *rank { return Err(Error::Runtime("VM tensor type invariant broken".into())); }
+                let Value::Tensor(reference, _) = object else { return Err(Error::Runtime("VM tensor invariant broken".into())); };
                 let value = match self.heap_ref().get(reference)? {
-                    HeapObject::Tensor { bytes, element: stored_element, shape } if stored_element == element.as_ref() && shape.len() == *rank => decode_scalar(bytes, Self::tensor_offset(shape, &indices)?, element.as_ref())?,
+                    HeapObject::Tensor { bytes, element: stored_element, shape } if stored_element == element.as_ref() && shape.len() == rank => decode_scalar(bytes, Self::tensor_offset(shape, &indices)?, element.as_ref())?,
                     _ => return Err(Error::Runtime("tensor heap invariant broken".into())),
                 };
                 self.push(value);
             },
-            Op::TensorIndexF32(rank) => {
-                let indices = self.pop_tensor_indices(*rank)?;
+            DecodedOp::TensorIndexF32(rank) => {
+                let indices = self.pop_tensor_indices(rank)?;
                 let object = self.pop()?;
-                let Value::Tensor(reference, _, _) = object else { return Err(Error::Runtime("VM tensor invariant broken".into())); };
+                let Value::Tensor(reference, _) = object else { return Err(Error::Runtime("VM tensor invariant broken".into())); };
                 let value = match self.heap_ref().get(reference)? {
                     HeapObject::Tensor { bytes, shape, .. } => {
                         let offset = Self::tensor_offset(shape, &indices)?;
@@ -2147,14 +2133,14 @@ impl Vm {
                 };
                 self.push(value);
             },
-            Op::TableIndex => { let key_value = self.pop()?; let key = table_key_from_value(self.heap_ref(), &key_value)?; let object = self.pop()?; let Value::Table(reference, _) = object else { return Err(Error::Runtime("VM table invariant broken".into())); }; let value = match self.heap_ref().get(reference)? { HeapObject::Table { entries, .. } => entries.get(&key).cloned().ok_or_else(|| Error::Runtime(format!("table has no key {}", table_key_display(&key))))?, _ => return Err(Error::Runtime("table heap invariant broken".into())) }; self.push(value); },
-            Op::TableKeys => { let object = self.pop()?; let Value::Table(reference, _) = object else { return Err(Error::Runtime("VM table invariant broken".into())); }; let mut keys = match self.heap_ref().get(reference)? { HeapObject::Table { entries, .. } => entries.keys().cloned().collect::<Vec<_>>(), _ => return Err(Error::Runtime("table heap invariant broken".into())) }; keys.sort_by(|left, right| match (left, right) { (TableKey::Index(a), TableKey::Index(b)) => a.cmp(b), (TableKey::Name(a), TableKey::Name(b)) => a.cmp(b), (TableKey::Index(_), TableKey::Name(_)) => std::cmp::Ordering::Less, (TableKey::Name(_), TableKey::Index(_)) => std::cmp::Ordering::Greater, }); let reference = self.allocate(HeapObject::TableKeys(keys)); self.push(Value::TableKeys(reference)); self.collect_if_needed(); },
-            Op::TableKeysIndex => { let index = integer_to_usize(&self.pop()?)?; let object = self.pop()?; let Value::TableKeys(reference) = object else { return Err(Error::Runtime("VM table_keys invariant broken".into())); }; let key = match self.heap_ref().get(reference)? { HeapObject::TableKeys(keys) => keys.get(index).cloned().ok_or_else(|| Error::Runtime(format!("table key index {index} is out of bounds")))?, _ => return Err(Error::Runtime("table_keys heap invariant broken".into())) }; self.push(Value::TableKey(Rc::new(key))); },
-            Op::TableRemove => { let key_value = self.pop()?; let key = table_key_from_value(self.heap_ref(), &key_value)?; let object = self.pop()?; let Value::Table(reference, _) = object else { return Err(Error::Runtime("VM table invariant broken".into())); }; let removed = match self.heap_mut().get_mut(reference)? { HeapObject::Table { entries, .. } => entries.remove(&key).is_some(), _ => return Err(Error::Runtime("table heap invariant broken".into())) }; self.push(Value::Bool(removed)); },
-            Op::Field(field) => { let object = self.pop()?; let Value::Struct(reference, _) = object else { return Err(Error::Runtime("VM struct invariant broken".into())); }; let value = match self.heap_ref().get(reference)? { HeapObject::Struct { values, .. } => values.get(field.index).cloned().ok_or_else(|| Error::Runtime("invalid struct field index".into()))?, _ => return Err(Error::Runtime("struct heap invariant broken".into())) }; self.push(value); },
-            Op::TableField(name) => { let object = self.pop()?; let Value::Table(reference, _) = object else { return Err(Error::Runtime("VM table invariant broken".into())); }; let value = match self.heap_ref().get(reference)? { HeapObject::Table { entries, .. } => entries.get(&TableKey::Name(name.clone())).cloned().ok_or_else(|| Error::Runtime(format!("table has no key {name}")))?, _ => return Err(Error::Runtime("table heap invariant broken".into())) }; self.push(value); },
-            Op::ModuleField(name) => { let Value::Module(id) = self.pop()? else { return Err(Error::Runtime("VM module invariant broken".into())); }; let value = { let instance = self.modules.get(&id).ok_or_else(|| Error::Runtime("loaded module is missing".into()))?; let ModuleExport::Value { slot, .. } = instance.artifact.exports.get(name.as_ref()).ok_or_else(|| Error::Runtime(format!("module has no exported value '{name}'")))? else { return Err(Error::Runtime(format!("'{name}' is not an exported module value"))); }; instance.vm.locals.get(*slot).cloned().ok_or_else(|| Error::Runtime("invalid module export slot".into()))? }; self.push(value); },
-            Op::Binary(op) => {
+            DecodedOp::TableIndex => { let key_value = self.pop()?; let key = table_key_from_value(self.heap_ref(), &key_value)?; let object = self.pop()?; let Value::Table(reference, _) = object else { return Err(Error::Runtime("VM table invariant broken".into())); }; let value = match self.heap_ref().get(reference)? { HeapObject::Table { entries, .. } => entries.get(&key).cloned().ok_or_else(|| Error::Runtime(format!("table has no key {}", table_key_display(&key))))?, _ => return Err(Error::Runtime("table heap invariant broken".into())) }; self.push(value); },
+            DecodedOp::TableKeys => { let object = self.pop()?; let Value::Table(reference, _) = object else { return Err(Error::Runtime("VM table invariant broken".into())); }; let mut keys = match self.heap_ref().get(reference)? { HeapObject::Table { entries, .. } => entries.keys().cloned().collect::<Vec<_>>(), _ => return Err(Error::Runtime("table heap invariant broken".into())) }; keys.sort_by(|left, right| match (left, right) { (TableKey::Index(a), TableKey::Index(b)) => a.cmp(b), (TableKey::Name(a), TableKey::Name(b)) => a.cmp(b), (TableKey::Index(_), TableKey::Name(_)) => std::cmp::Ordering::Less, (TableKey::Name(_), TableKey::Index(_)) => std::cmp::Ordering::Greater, }); let reference = self.allocate(HeapObject::TableKeys(keys)); self.push(Value::TableKeys(reference)); self.collect_if_needed(); },
+            DecodedOp::TableKeysIndex => { let index = integer_to_usize(&self.pop()?)?; let object = self.pop()?; let Value::TableKeys(reference) = object else { return Err(Error::Runtime("VM table_keys invariant broken".into())); }; let key = match self.heap_ref().get(reference)? { HeapObject::TableKeys(keys) => keys.get(index).cloned().ok_or_else(|| Error::Runtime(format!("table key index {index} is out of bounds")))?, _ => return Err(Error::Runtime("table_keys heap invariant broken".into())) }; self.push(Value::TableKey(Rc::new(key))); },
+            DecodedOp::TableRemove => { let key_value = self.pop()?; let key = table_key_from_value(self.heap_ref(), &key_value)?; let object = self.pop()?; let Value::Table(reference, _) = object else { return Err(Error::Runtime("VM table invariant broken".into())); }; let removed = match self.heap_mut().get_mut(reference)? { HeapObject::Table { entries, .. } => entries.remove(&key).is_some(), _ => return Err(Error::Runtime("table heap invariant broken".into())) }; self.push(Value::Bool(removed)); },
+            DecodedOp::Field(field) => { let object = self.pop()?; let Value::Struct(reference, _) = object else { return Err(Error::Runtime("VM struct invariant broken".into())); }; let value = match self.heap_ref().get(reference)? { HeapObject::Struct { values, .. } => values.get(field.index).cloned().ok_or_else(|| Error::Runtime("invalid struct field index".into()))?, _ => return Err(Error::Runtime("struct heap invariant broken".into())) }; self.push(value); },
+            DecodedOp::TableField(name) => { let object = self.pop()?; let Value::Table(reference, _) = object else { return Err(Error::Runtime("VM table invariant broken".into())); }; let value = match self.heap_ref().get(reference)? { HeapObject::Table { entries, .. } => entries.get(&TableKey::Name(name.clone())).cloned().ok_or_else(|| Error::Runtime(format!("table has no key {name}")))?, _ => return Err(Error::Runtime("table heap invariant broken".into())) }; self.push(value); },
+            DecodedOp::ModuleField(name) => { let Value::Module(id) = self.pop()? else { return Err(Error::Runtime("VM module invariant broken".into())); }; let value = { let instance = self.modules.get(&id).ok_or_else(|| Error::Runtime("loaded module is missing".into()))?; let ModuleExport::Value { slot, .. } = instance.artifact.exports.get(name.as_ref()).ok_or_else(|| Error::Runtime(format!("module has no exported value '{name}'")))? else { return Err(Error::Runtime(format!("'{name}' is not an exported module value"))); }; instance.vm.locals.get(*slot).cloned().ok_or_else(|| Error::Runtime("invalid module export slot".into()))? }; self.push(value); },
+            DecodedOp::Binary(op) => {
                 let right = self.pop_compiled();
                 let left = self.pop_compiled();
                 let result = {
@@ -2163,12 +2149,12 @@ impl Vm {
                 };
                 self.push(result);
             },
-            Op::Unary(op, ty) => { let val = self.pop()?; self.push(evaluate_unary(val, op, ty.as_ref())?); },
-            Op::Cast(target_ty) => {
+            DecodedOp::Unary(op, ty) => { let val = self.pop()?; self.push(evaluate_unary(val, op, ty.as_ref())?); },
+            DecodedOp::Cast(target_ty) => {
                 let val = self.pop()?;
                 self.push(cast_numeric(val, target_ty.as_ref())?);
             },
-            Op::Len => {
+            DecodedOp::Len => {
                 let value = self.pop()?;
                 let length = match value {
                     Value::Array(reference, element) => match self.heap_ref().get(reference)? {
@@ -2187,7 +2173,7 @@ impl Vm {
                         HeapObject::TableKeys(keys) => keys.len(),
                         _ => return Err(Error::Runtime("table_keys heap invariant broken".into())),
                     },
-                    Value::Tensor(reference, _, _) => match self.heap_ref().get(reference)? {
+                    Value::Tensor(reference, _) => match self.heap_ref().get(reference)? {
                         HeapObject::Tensor { shape, .. } => shape.iter().try_fold(1usize, |total, dimension| total.checked_mul(*dimension)).ok_or_else(|| Error::Runtime("tensor is too large".into()))?,
                         _ => return Err(Error::Runtime("tensor heap invariant broken".into())),
                     },
@@ -2196,7 +2182,7 @@ impl Vm {
                 let length = i32::try_from(length).map_err(|_| Error::Runtime("vector length exceeds i32".into()))?;
                 self.push(Value::I32(length));
             },
-            Op::ConcatString => {
+            DecodedOp::ConcatString => {
                 let right = self.pop()?;
                 let left = self.pop()?;
                 let Value::String(left_ref) = left else { return Err(Error::Runtime("VM string invariant broken".into())); };
@@ -2221,42 +2207,42 @@ impl Vm {
                 self.push(Value::String(reference));
                 self.collect_if_needed();
             },
-            Op::Builtin1(name, _ty) => { let arg = self.pop()?; self.push(evaluate_builtin1(*name, arg)?); },
-            Op::Builtin2(name, ty) => { let arg2 = self.pop_compiled(); let arg1 = self.pop_compiled(); self.push(evaluate_builtin2(*name, arg1, arg2, ty.as_ref())?); },
-            Op::CallExternal(name, argument_count) => self.call_external(name.as_ref(), *argument_count)?,
-            Op::JumpIfFalse(target) => { match self.pop()? { Value::Bool(false) => { pc = *target; continue; }, Value::Bool(true) => {}, _ => return Err(Error::Runtime("VM condition invariant broken".into())), } },
-            Op::Jump(target) => { pc = *target; continue; },
-            Op::JumpIfFalseKeep(target) => {
+            DecodedOp::Builtin1(name, _ty) => { let arg = self.pop()?; self.push(evaluate_builtin1(name, arg)?); },
+            DecodedOp::Builtin2(name, ty) => { let arg2 = self.pop_compiled(); let arg1 = self.pop_compiled(); self.push(evaluate_builtin2(name, arg1, arg2, ty.as_ref())?); },
+            DecodedOp::CallExternal(name, argument_count) => self.call_external(name.as_ref(), argument_count)?,
+            DecodedOp::JumpIfFalse(target) => { match self.pop()? { Value::Bool(false) => { pc = target; continue; }, Value::Bool(true) => {}, _ => return Err(Error::Runtime("VM condition invariant broken".into())), } },
+            DecodedOp::Jump(target) => { pc = target; continue; },
+            DecodedOp::JumpIfFalseKeep(target) => {
                 if self.stack_ptr == 0 { return Err(Error::Runtime("stack underflow".into())); }
                 let val = &self.stack[self.stack_ptr - 1];
                 if let Value::Bool(false) = val {
-                    pc = *target; continue;
+                    pc = target; continue;
                 } else if let Value::Bool(true) = val {
                     self.pop()?;
                 } else {
                     return Err(Error::Runtime("VM condition invariant broken".into()));
                 }
             },
-            Op::JumpIfTrueKeep(target) => {
+            DecodedOp::JumpIfTrueKeep(target) => {
                 if self.stack_ptr == 0 { return Err(Error::Runtime("stack underflow".into())); }
                 let val = &self.stack[self.stack_ptr - 1];
                 if let Value::Bool(true) = val {
-                    pc = *target; continue;
+                    pc = target; continue;
                 } else if let Value::Bool(false) = val {
                     self.pop()?;
                 } else {
                     return Err(Error::Runtime("VM condition invariant broken".into()));
                 }
             },
-            Op::CallMethod(receiver, target) => { call_stack.push((next_pc, current_receiver)); current_receiver = Some(*receiver); pc = *target; continue; },
-            Op::CallCurrentMethod(target) => { let receiver = current_receiver.ok_or_else(|| Error::Runtime("this is available only inside a method".into()))?; call_stack.push((next_pc, current_receiver)); current_receiver = Some(receiver); pc = *target; continue; },
-            Op::CallModule(slot, name) => { self.call_module_function(*slot, name.as_ref())?; },
-            Op::Return => { if let Some((return_pc, previous_receiver)) = call_stack.pop() { current_receiver = previous_receiver; pc = return_pc; continue; } if terminal_return { return Ok(&self.output); } return Err(Error::Runtime("return outside method".into())); },
-            Op::Print => { let value = self.pop()?; let text = self.format_value(&value)?; self.emit(text); },
-            Op::Printf(num_args) => {
+            DecodedOp::CallMethod(receiver, target) => { call_stack.push((next_pc, current_receiver)); current_receiver = Some(receiver); pc = target; continue; },
+            DecodedOp::CallCurrentMethod(target) => { let receiver = current_receiver.ok_or_else(|| Error::Runtime("this is available only inside a method".into()))?; call_stack.push((next_pc, current_receiver)); current_receiver = Some(receiver); pc = target; continue; },
+            DecodedOp::CallModule(slot, name) => { self.call_module_function(slot, name.as_ref())?; },
+            DecodedOp::Return => { if let Some((return_pc, previous_receiver)) = call_stack.pop() { current_receiver = previous_receiver; pc = return_pc; continue; } if terminal_return { return Ok(&self.output); } return Err(Error::Runtime("return outside method".into())); },
+            DecodedOp::Print => { let value = self.pop()?; let text = self.format_value(&value)?; self.emit(text); },
+            DecodedOp::Printf(num_args) => {
                 let format_val = self.pop()?;
-                let mut arg_vals = Vec::with_capacity(*num_args);
-                for _ in 0..*num_args { arg_vals.push(self.pop()?); }
+                let mut arg_vals = Vec::with_capacity(num_args);
+                for _ in 0..num_args { arg_vals.push(self.pop()?); }
                 arg_vals.reverse();
                 let format_str = if let Value::String(reference) = format_val { match self.heap_ref().get(reference)? { HeapObject::String(text) => text.clone(), _ => return Err(Error::Runtime("string heap invariant broken".into())) } } else { return Err(Error::Runtime("printf format is not a string".into())); };
 
@@ -2286,7 +2272,7 @@ impl Vm {
                 if self.interactive { print!("{}", result); let _ = io::stdout().flush(); }
                 self.output.push(result);
             },
-            Op::Putc => {
+            DecodedOp::Putc => {
                 let value = self.pop()?;
                 let codepoint = u32::try_from(integer_to_usize(&value)?)
                     .map_err(|_| Error::Runtime("putc code point exceeds u32".into()))?;
@@ -2921,10 +2907,16 @@ mod immediate_regression_tests {
     }
 
     #[test]
-    fn stack_value_stays_within_four_machine_words() {
+    fn stack_value_stays_within_three_machine_words() {
         // This protects the VM stack from a future metadata-bearing variant
         // accidentally turning every stack slot into a cache-line fragment.
-        assert!(std::mem::size_of::<Value>() <= 4 * std::mem::size_of::<usize>());
+        assert!(std::mem::size_of::<Value>() <= 3 * std::mem::size_of::<usize>());
+    }
+    #[test]
+    fn tensor_value_keeps_its_complete_static_type() {
+        let ty = Rc::new(Type::Tensor(Box::new(Type::F32), 2));
+        let value = Value::Tensor(HeapRef(0), ty);
+        assert_eq!(value.ty(), Type::Tensor(Box::new(Type::F32), 2));
     }
     #[test]
     fn garbage_collection_tracks_payload_bytes() {
@@ -2942,7 +2934,6 @@ mod immediate_regression_tests {
             entries: HashMap::from([(TableKey::Name(Rc::from("child")), Value::String(child))]),
             element: Type::String,
         });
-
         assert_eq!(heap.collect([parent]), 0);
         assert!(matches!(heap.get(child), Ok(HeapObject::String(text)) if text == "reachable"));
     }
@@ -2971,6 +2962,24 @@ mod immediate_regression_tests {
         assert!(code.words.iter().all(|word| *word <= u32::MAX));
         assert_eq!(code.words.len() % 4, 0);
         assert_eq!(Vm::default().run(&code).unwrap(), ["42"]);
+    }
+    #[test]
+    #[ignore = "manual performance benchmark; run with cargo test --release -- --ignored"]
+    fn benchmark_flat_bytecode_hot_loop() {
+        use std::time::Instant;
+
+        const RUNS: usize = 100;
+        let source = "let total: i32 = 0; for i = 1, 10000 do total = total + i end print(total)";
+        let started = Instant::now();
+        for _ in 0..RUNS {
+            assert_eq!(execute(source).unwrap(), ["50005000"]);
+        }
+        let elapsed = started.elapsed();
+        eprintln!(
+            "flat-bytecode hot loop: {RUNS} runs in {:?} ({:.2} ns/run)",
+            elapsed,
+            elapsed.as_nanos() as f64 / RUNS as f64,
+        );
     }
     #[test]
     fn concat_allocates_exact_payload_capacity() {
