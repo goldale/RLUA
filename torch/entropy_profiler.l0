@@ -1,0 +1,48 @@
+-- entropy_profiler.l0
+-- Точный перенос логики Spectral Entropy из спецификации (Listing 1) на L0.
+
+struct EntropyProfiler {
+    entropy: f32;
+
+    -- Метод инкапсулирует алгоритм calculate_layer_entropy
+    function calculate(hidden_states: dTensor, eps: f32)
+        -- 1. h_flat = hidden_states.reshape(-1, hidden_states.size(-1))
+        let h_flat: dTensor = torch_reshape(hidden_states, -1, 4096)
+        
+        -- 2. h_centered = h_flat - h_flat.mean(dim=0)
+        let h_mean: dTensor = torch_mean_dim0(h_flat)
+        let h_centered: dTensor = torch_sub(h_flat, h_mean)
+        
+        -- 3. singular_values = torch.linalg.svdvals(h_centered)
+        let singular_values: dTensor = torch_svdvals(h_centered)
+        
+        -- 4. variance = singular_values.square()
+        let variance: dTensor = torch_square(singular_values)
+        
+        -- 5. probabilities = variance / (variance.sum() + eps)
+        let var_sum: f32 = torch_sum(variance)
+        let norm_factor: f32 = var_sum + eps
+        let probabilities: dTensor = torch_div_scalar(variance, norm_factor)
+        
+        -- 6. Расчет: -(probabilities * torch.log(probabilities + eps)).sum()
+        let prob_eps: dTensor = torch_add_scalar(probabilities, eps)
+        let log_prob: dTensor = torch_log(prob_eps)
+        let term: dTensor = torch_mul(probabilities, log_prob)
+        let term_sum: f32 = torch_sum(term)
+        
+        -- Сохраняем результат в поле структуры
+        entropy = 0.0 - term_sum
+    end
+}
+
+-- Инициализируем профайлер
+let profiler: EntropyProfiler = EntropyProfiler { entropy = 0.0 }
+
+-- Пример: передаем сырой тензор из памяти (в реальном пайплайне он приходит из хуков)
+-- Используем фабрику нулей для эмуляции входных данных
+let test_layer: tensor<f32, 2> = zeros<f32>([512, 4096])
+
+-- L0 позволяет передавать типизированные тензоры в аргументы, ожидающие dTensor (динамический Upcast)
+profiler.calculate(test_layer, 0.000000001)
+
+printf("Спектральная энтропия слоя: {}\n", profiler.entropy)

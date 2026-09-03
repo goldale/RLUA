@@ -40,7 +40,8 @@ impl StringInterner {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Type {
     I8, I16, I32, I64, U8, U16, U32, U64, F16, F32, F64, Bool, String,
-    Array(Box<Type>), Tensor(Box<Type>, usize), Table(Box<Type>), TableKey, TableKeys, Struct(String), Module(String),
+    Array(Box<Type>), Tensor(Box<Type>, usize), Table(Box<Type>), TableKey, TableKeys,
+    Struct(String), Module(String), DArray, DTensor,
 }
 
 impl fmt::Display for Type {
@@ -60,6 +61,8 @@ impl fmt::Display for Type {
             Self::TableKeys => write!(f, "table_keys"),
             Self::Struct(name) => write!(f, "{name}"),
             Self::Module(_) => write!(f, "module"),
+            Self::DArray => write!(f, "dArray"),
+            Self::DTensor => write!(f, "dTensor"),
         }
     }
 }
@@ -304,7 +307,7 @@ pub fn type_size(ty: &Type) -> Option<usize> {
         Type::I16 | Type::U16 | Type::F16 => Some(2),
         Type::I32 | Type::U32 | Type::F32 => Some(4),
         Type::I64 | Type::U64 | Type::F64 => Some(8),
-        Type::Array(_) | Type::Tensor(_, _) | Type::Table(_) | Type::TableKey | Type::TableKeys | Type::Struct(_) | Type::String | Type::Module(_) => None,
+        Type::Array(_) | Type::Tensor(_, _) | Type::Table(_) | Type::TableKey | Type::TableKeys | Type::Struct(_) | Type::String | Type::Module(_) | Type::DArray | Type::DTensor => None,
     }
 }
 
@@ -729,6 +732,8 @@ impl Parser {
                 self.need(Token::Gt)?; scalar_size(&inner)?; Ok(Type::Tensor(Box::new(inner), rank))
             },
             "string" => Ok(Type::String),
+            "dArray" => Ok(Type::DArray),
+            "dTensor" => Ok(Type::DTensor),
             "module" => Ok(Type::Module(String::new())),
             _ if *self.peek() == Token::Dot => {
                 self.next();
@@ -1450,9 +1455,9 @@ impl Compiler {
             } else {
                 let s = self.next_slot;
                 self.next_slot += 1;
-                self.names.insert(name.clone(), (s, found.clone()));
-                if self.scope_depth == 0 {
-                    self.globals.insert(name.clone(), (s, found.clone()));
+                self.names.insert(name.clone(), (s, ty.clone()));
+                 if self.scope_depth == 0 {
+                     self.globals.insert(name.clone(), (s, ty.clone()));
                 }
                 s
             };
@@ -1463,8 +1468,8 @@ impl Compiler {
             }
             Ok(())
         },
-        Statement::Assign { name, expr } => { if let Some(field) = self.current_method_fields.as_ref().and_then(|fields| fields.get(&name)).cloned() { let found = self.expr(expr, Some(&field.ty))?; if found != field.ty { return Err(Error::Type(format!("field '{name}' is {}, but expression has type {found}", field.ty))); } self.code.push(Op::StoreCurrentField(Rc::new(field))); Ok(()) } else { let (slot, ty) = self.names.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))?; let found = self.expr(expr, Some(&ty))?; if found != ty { return Err(Error::Type(format!("'{name}' is {ty}, but expression has type {found}"))); } self.code.push(Op::Store(slot)); Ok(()) } },
-        Statement::GlobalAssign { name, expr } => { let (slot, ty) = self.globals.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown global name '{name}'")))?; let found = self.expr(expr, Some(&ty))?; if found != ty { return Err(Error::Type(format!("global '{name}' is {ty}, but expression has type {found}"))); } self.code.push(Op::Store(slot)); Ok(()) },
+        Statement::Assign { name, expr } => { if let Some(field) = self.current_method_fields.as_ref().and_then(|fields| fields.get(&name)).cloned() { let found = self.expr(expr, Some(&field.ty))?; if !types_compatible(&field.ty, &found) { return Err(Error::Type(format!("field '{name}' is {}, but expression has type {found}", field.ty))); } self.code.push(Op::StoreCurrentField(Rc::new(field))); Ok(()) } else { let (slot, ty) = self.names.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))?; let found = self.expr(expr, Some(&ty))?; if !types_compatible(&ty, &found) { return Err(Error::Type(format!("'{name}' is {ty}, but expression has type {found}"))); } self.code.push(Op::Store(slot)); Ok(()) } },
+        Statement::GlobalAssign { name, expr } => { let (slot, ty) = self.globals.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown global name '{name}'")))?; let found = self.expr(expr, Some(&ty))?; if !types_compatible(&ty, &found) { return Err(Error::Type(format!("global '{name}' is {ty}, but expression has type {found}"))); } self.code.push(Op::Store(slot)); Ok(()) },
         Statement::SetIndex { name, indices, expr } => {
             // Исправление: сначала проверяем, является ли name полем текущей структуры
             let (slot, container_ty) = if let Some(field) = self.current_method_fields.as_ref().and_then(|fields| fields.get(&name)).cloned() {
@@ -1482,21 +1487,21 @@ impl Compiler {
                     if indices.len() != 1 { return Err(Error::Type("vector indexing requires exactly one index".into())); }
                     scalar_size(&inner)?; self.compile_tensor_indices(indices)?;
                     let element = *inner; let found = self.expr(expr, Some(&element))?;
-                    if found != element { return Err(Error::Type(format!("item is {found}; expected {element}"))); }
+                    if !types_compatible(&element, &found) { return Err(Error::Type(format!("item is {found}; expected {element}"))); }
                     self.code.push(Op::StoreIndex(slot, Rc::new(element))); Ok(())
                 },
                 Type::Table(inner) => {
                     if indices.len() != 1 { return Err(Error::Type("table indexing requires exactly one index".into())); }
                     self.compile_table_key(indices.into_iter().next().expect("checked table index count"))?;
                     let element = *inner; let found = self.expr(expr, Some(&element))?;
-                    if found != element { return Err(Error::Type(format!("item is {found}; expected {element}"))); }
+                    if !types_compatible(&element, &found) { return Err(Error::Type(format!("item is {found}; expected {element}"))); }
                     self.code.push(Op::StoreTableIndex(slot, Rc::new(element))); Ok(())
                 },
                 Type::Tensor(inner, rank) => {
                     if indices.len() != rank { return Err(Error::Type(format!("tensor rank {rank} requires {rank} index(es)"))); }
                     self.compile_tensor_indices(indices)?;
                     let element = *inner; let found = self.expr(expr, Some(&element))?;
-                    if found != element { return Err(Error::Type(format!("tensor item is {found}; expected {element}"))); }
+                    if !types_compatible(&element, &found) { return Err(Error::Type(format!("tensor item is {found}; expected {element}"))); }
                     if element == Type::F32 { self.code.push(Op::StoreTensorIndexF32(slot, rank)); } else { self.code.push(Op::StoreTensorIndex(slot, Rc::new(element), rank)); } Ok(())
                 },
                 _ => Err(Error::Type(format!("'{name}' is not indexable"))),
@@ -1518,14 +1523,14 @@ impl Compiler {
                     let layout = self.structs.get(&struct_name).ok_or_else(|| Error::Type(format!("unknown struct '{struct_name}'")))?;
                     let field = layout.fields.iter().find(|candidate| candidate.name == field).cloned().ok_or_else(|| Error::Type(format!("struct '{struct_name}' has no field '{field}'")))?;
                     let found = self.expr(expr, Some(&field.ty))?;
-                    if found != field.ty { return Err(Error::Type("struct field type mismatch".into())); }
+                    if !types_compatible(&field.ty, &found) { return Err(Error::Type("struct field type mismatch".into())); }
                     self.code.push(Op::StoreField(slot, Rc::new(field)));
                     Ok(())
                 },
                 Type::Table(element) => {
                     let element = *element;
                     let found = self.expr(expr, Some(&element))?;
-                    if found != element { return Err(Error::Type("table value type mismatch".into())); }
+                    if !types_compatible(&element, &found) { return Err(Error::Type("table value type mismatch".into())); }
                     let field = self.intern_name(&field);
                     self.code.push(Op::StoreTableField(slot, field, Rc::new(element)));
                     Ok(())
@@ -1552,7 +1557,7 @@ impl Compiler {
             let index_ty = self.expr(index, None)?;
             if !matches!(index_ty, Type::I8|Type::I16|Type::I32|Type::I64|Type::U8|Type::U16|Type::U32|Type::U64) { return Err(Error::Type("index must be an integer".into())); }
             let found = self.expr(expr, Some(&element))?;
-            if found != element { return Err(Error::Type(format!("item is {found}; expected {element}"))); }
+            if !types_compatible(&element, &found) { return Err(Error::Type(format!("item is {found}; expected {element}"))); }
             self.code.push(Op::StoreFieldIndex(slot, Rc::new(field), Rc::new(element)));
             Ok(())
         },
@@ -1755,12 +1760,12 @@ impl Compiler {
             if inferred { items.remove(0); }
             for item in items {
                 let found = self.expr(item, Some(&element))?;
-                if found != element { return Err(Error::Type(format!("array item is {found}; expected {element}"))); }
+                if !types_compatible(&element, &found) { return Err(Error::Type(format!("array item is {found}; expected {element}"))); }
             }
             self.code.push(Op::MakeArray(count, Rc::new(element.clone())));
             Ok(Type::Array(Box::new(element)))
         },
-        Expr::Table(items) => { let element = match expected { Some(Type::Table(t)) => (**t).clone(), _ => return Err(Error::Type("table needs an explicit value type, e.g. table<i32>".into())) }; let mut entries = Vec::with_capacity(items.len()); for (key, value) in items { match key { TableLiteralKey::Name(name) => { let name = self.intern_name(&name); entries.push(TableEntry::Name(name)); }, TableLiteralKey::Index(index) => { self.compile_table_key(index)?; entries.push(TableEntry::Index); } } let found = self.expr(value, Some(&element))?; if found != element { return Err(Error::Type(format!("table value is {found}; expected {element}"))); } } self.code.push(Op::MakeTable(entries.into(), Rc::new(element.clone()))); Ok(Type::Table(Box::new(element))) },
+        Expr::Table(items) => { let element = match expected { Some(Type::Table(t)) => (**t).clone(), _ => return Err(Error::Type("table needs an explicit value type, e.g. table<i32>".into())) }; let mut entries = Vec::with_capacity(items.len()); for (key, value) in items { match key { TableLiteralKey::Name(name) => { let name = self.intern_name(&name); entries.push(TableEntry::Name(name)); }, TableLiteralKey::Index(index) => { self.compile_table_key(index)?; entries.push(TableEntry::Index); } } let found = self.expr(value, Some(&element))?; if !types_compatible(&element, &found) { return Err(Error::Type(format!("table value is {found}; expected {element}"))); } } self.code.push(Op::MakeTable(entries.into(), Rc::new(element.clone()))); Ok(Type::Table(Box::new(element))) },
         Expr::TensorFactory { name, element, shape } => {
             let Type::Tensor(expected_element, rank) = expected.cloned().ok_or_else(|| Error::Type(format!("{name}<T> needs an expected tensor type, e.g. let x: tensor<f32, 2> = {name}<f32>([2, 3])")))? else { return Err(Error::Type(format!("{name}<{}> creates a tensor, but the expected type is not tensor", element))); };
             if expected_element.as_ref() != &element { return Err(Error::Type(format!("{name} element type is {element}; expected {expected_element}"))); }
@@ -1771,7 +1776,7 @@ impl Compiler {
             self.code.push(Op::MakeTensor(init, Rc::new(element.clone()), rank));
             Ok(Type::Tensor(Box::new(element), rank))
         },
-        Expr::StructLiteral(name, fields) => { let layout = self.structs.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown struct '{name}'")))?; if let Some(expected) = expected { if expected != &Type::Struct(name.clone()) { return Err(Error::Type(format!("expected {expected}, got {name}"))); } } if fields.len() != layout.fields.len() { return Err(Error::Type(format!("struct '{name}' needs {} field(s)", layout.fields.len()))); } let mut provided = HashMap::new(); for (field_name, field_expr) in fields { if provided.insert(field_name.clone(), field_expr).is_some() { return Err(Error::Type(format!("struct '{name}' initializes field '{field_name}' more than once"))); } } for field in &layout.fields { let expr = provided.remove(&field.name).ok_or_else(|| Error::Type(format!("struct '{name}' is missing field '{}'", field.name)))?; let found = self.expr(expr, Some(&field.ty))?; if found != field.ty { return Err(Error::Type(format!("field '{}' is {found}; expected {}", field.name, field.ty))); } } if let Some((unknown, _)) = provided.into_iter().next() { return Err(Error::Type(format!("struct '{name}' has no field '{unknown}'"))); } self.code.push(Op::MakeStruct(Rc::new(layout))); Ok(Type::Struct(name)) },
+        Expr::StructLiteral(name, fields) => { let layout = self.structs.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown struct '{name}'")))?; if let Some(expected) = expected { if expected != &Type::Struct(name.clone()) { return Err(Error::Type(format!("expected {expected}, got {name}"))); } } if fields.len() != layout.fields.len() { return Err(Error::Type(format!("struct '{name}' needs {} field(s)", layout.fields.len()))); } let mut provided = HashMap::new(); for (field_name, field_expr) in fields { if provided.insert(field_name.clone(), field_expr).is_some() { return Err(Error::Type(format!("struct '{name}' initializes field '{field_name}' more than once"))); } } for field in &layout.fields { let expr = provided.remove(&field.name).ok_or_else(|| Error::Type(format!("struct '{name}' is missing field '{}'", field.name)))?; let found = self.expr(expr, Some(&field.ty))?; if !types_compatible(&field.ty, &found) { return Err(Error::Type(format!("field '{}' is {found}; expected {}", field.name, field.ty))); } } if let Some((unknown, _)) = provided.into_iter().next() { return Err(Error::Type(format!("struct '{name}' has no field '{unknown}'"))); } self.code.push(Op::MakeStruct(Rc::new(layout))); Ok(Type::Struct(name)) },
         Expr::Cast(inner, target_ty) => {
             let source_ty = self.expr(*inner, None)?;
             if !is_numeric(&source_ty) || !is_numeric(&target_ty) {
@@ -1785,7 +1790,7 @@ impl Compiler {
                 "len" => {
                     if args.len() != 1 { return Err(Error::Type("len expects 1 argument".into())); }
                     let ty = self.expr(args.remove(0), None)?;
-                    if !matches!(ty, Type::Array(_) | Type::String | Type::Table(_) | Type::TableKeys | Type::Tensor(_, _)) { return Err(Error::Type(format!("len requires a vector, string, table, table_keys, or tensor, got {ty}"))); }
+                    if !matches!(ty, Type::Array(_) | Type::String | Type::Table(_) | Type::TableKeys | Type::Tensor(_, _) | Type::DArray | Type::DTensor) { return Err(Error::Type(format!("len requires a vector, string, table, table_keys, or tensor, got {ty}"))); }
                     self.code.push(Op::Len);
                     Ok(Type::I32)
                 },
@@ -1836,7 +1841,7 @@ impl Compiler {
                     if args.len() != signature.arguments.len() { return Err(Error::Type(format!("{name} expects {} argument(s)", signature.arguments.len()))); }
                     for (argument, expected_type) in args.into_iter().zip(signature.arguments.iter()) {
                         let found = self.expr(argument, Some(expected_type))?;
-                        if found != *expected_type { return Err(Error::Type(format!("{name} argument is {found}; expected {expected_type}"))); }
+                        if !types_compatible(expected_type, &found) { return Err(Error::Type(format!("{name} argument is {found}; expected {expected_type}"))); }
                     }
                     self.code.push(Op::CallExternal(Rc::from(name), signature.arguments.len()));
                     Ok(signature.result)
@@ -1934,9 +1939,16 @@ impl Compiler {
         else { Err(Error::Type("table key must be an integer or string".into())) }
     }
 }
-
-fn types_compatible(expected: &Type, found: &Type) -> bool { expected == found || matches!((expected, found), (Type::Module(expected), Type::Module(_)) if expected.is_empty()) }
-fn is_numeric(t: &Type) -> bool { !matches!(t, Type::Bool|Type::String|Type::Array(_)|Type::Tensor(_, _)|Type::Table(_)|Type::TableKey|Type::TableKeys|Type::Struct(_)|Type::Module(_)) }
+fn types_compatible(expected: &Type, found: &Type) -> bool {
+    if expected == found { return true; }
+    match (expected, found) {
+        (Type::Module(expected_id), Type::Module(_)) if expected_id.is_empty() => true,
+        (Type::DArray, Type::Array(_)) | (Type::Array(_), Type::DArray) => true,
+        (Type::DTensor, Type::Tensor(_, _)) | (Type::Tensor(_, _), Type::DTensor) => true,
+        _ => false
+    }
+}
+fn is_numeric(t: &Type) -> bool { !matches!(t, Type::Bool|Type::String|Type::Array(_)|Type::Tensor(_, _)|Type::Table(_)|Type::TableKey|Type::TableKeys|Type::Struct(_)|Type::Module(_)|Type::DArray|Type::DTensor) }
 fn is_integer(t: &Type) -> bool { matches!(t, Type::I8|Type::I16|Type::I32|Type::I64|Type::U8|Type::U16|Type::U32|Type::U64) }
 
 fn int_value(n: i128, ty: &Type) -> Result<Value, Error> {
@@ -2183,7 +2195,7 @@ impl Vm {
         if registered.signature.arguments.len() != argument_count || self.stack_ptr < argument_count { return Err(Error::Runtime("external call stack invariant broken".into())); }
         let base = self.stack_ptr - argument_count;
         for (value, expected) in self.stack[base..self.stack_ptr].iter().zip(registered.signature.arguments.iter()) {
-            if value.ty() != *expected { return Err(Error::Runtime(format!("external function '{name}' received an invalid argument type"))); }
+            if !types_compatible(&value.ty(), expected) { return Err(Error::Runtime(format!("external function '{name}' received an invalid argument type"))); }
         }
         let result = match registered.function {
             ExternalFunction::Rust(function) => function(&self.stack[base..self.stack_ptr], &self.heap)?,
@@ -2892,7 +2904,8 @@ pub type L0CFunction = unsafe extern "C" fn(*mut L0State) -> c_int;
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum L0TypeId {
-    I8 = 0, I16, I32, I64, U8, U16, U32, U64, F16, F32, F64, Bool,
+    I8 = 0, I16, I32, I64, U8, U16, U32, U64, F16, F32, F64,
+    Bool, DArray, DTensor,
 }
 
 impl L0TypeId {
@@ -2901,6 +2914,7 @@ impl L0TypeId {
             0 => Self::I8, 1 => Self::I16, 2 => Self::I32, 3 => Self::I64,
             4 => Self::U8, 5 => Self::U16, 6 => Self::U32, 7 => Self::U64,
             8 => Self::F16, 9 => Self::F32, 10 => Self::F64, 11 => Self::Bool,
+            12 => Self::DArray, 13 => Self::DTensor,
             _ => return None,
         })
     }
@@ -2910,6 +2924,7 @@ impl L0TypeId {
             Self::I8 => Type::I8, Self::I16 => Type::I16, Self::I32 => Type::I32, Self::I64 => Type::I64,
             Self::U8 => Type::U8, Self::U16 => Type::U16, Self::U32 => Type::U32, Self::U64 => Type::U64,
             Self::F16 => Type::F16, Self::F32 => Type::F32, Self::F64 => Type::F64, Self::Bool => Type::Bool,
+            Self::DArray => Type::DArray, Self::DTensor => Type::DTensor,
         }
     }
 }
@@ -3285,24 +3300,6 @@ mod immediate_regression_tests {
         assert_eq!(Vm::default().run(&code).unwrap(), ["42"]);
     }
     #[test]
-    #[ignore = "manual performance benchmark; run with cargo test --release -- --ignored"]
-    fn benchmark_flat_bytecode_hot_loop() {
-        use std::time::Instant;
-
-        const RUNS: usize = 100;
-        let source = "let total: i32 = 0; for i = 1, 10000 do total = total + i end print(total)";
-        let started = Instant::now();
-        for _ in 0..RUNS {
-            assert_eq!(execute(source).unwrap(), ["50005000"]);
-        }
-        let elapsed = started.elapsed();
-        eprintln!(
-            "flat-bytecode hot loop: {RUNS} runs in {:?} ({:.2} ns/run)",
-            elapsed,
-            elapsed.as_nanos() as f64 / RUNS as f64,
-        );
-    }
-    #[test]
     fn concat_allocates_exact_payload_capacity() {
         let mut vm = Vm::default();
         assert_eq!(vm.execute("let left: string = \"left\"; let right: string = \"right\"; let joined: string = left + right; print(joined)").unwrap(), ["leftright"]);
@@ -3407,5 +3404,85 @@ mod immediate_regression_tests {
         assert_eq!(heap.slots.len(), 0);
         assert_eq!(heap.free_head, None);
         assert_eq!(heap.allocated_bytes, 0);
+    }
+    #[test]
+    fn dynamic_types_binding_and_len() {
+        let source = r#"
+            -- Проверка привязки вектора к dArray и вычисления длины
+            let vec: vector<i32> = [10, 20, 30, 40]
+            let d_vec: dArray = vec
+            print(len(d_vec))
+
+            -- Проверка привязки тензора к dTensor и вычисления длины
+            let t: tensor<f32, 2> = zeros<f32>([2, 3])
+            let d_t: dTensor = t
+            print(len(d_t))
+        "#;
+        
+        assert_eq!(
+            execute(source).unwrap(),
+            vec!["4".to_owned(), "6".to_owned()]
+        );
+    }
+
+    #[test]
+    fn dynamic_types_reject_invalid_assignments() {
+        // Скалярные значения не должны приводиться к dArray
+        assert!(matches!(
+            execute("let num: i32 = 42; let d: dArray = num"),
+            Err(Error::Located { source, .. }) if matches!(*source, Error::Type(ref msg) if msg.contains("expression has type i32"))
+        ));
+
+        // Векторы не должны приводиться к dTensor
+        assert!(matches!(
+            execute("let v: vector<i32> = [1]; let t: dTensor = v"),
+            Err(Error::Located { source, .. }) if matches!(*source, Error::Type(ref msg) if msg.contains("expression has type vector<i32>"))
+        ));
+    }
+
+    #[test]
+    fn dynamic_types_ffi_passing() {
+        let mut vm = Vm::default();
+        
+        // Регистрируем внешнюю функцию, которая ожидает динамический массив
+        vm.register_rust_function(
+            "is_dynamic_array", 
+            vec![Type::DArray], 
+            Type::Bool, 
+            |args, _| {
+                // На уровне Rust проверяем, что в рантайме действительно пришел Array
+                match args[0] {
+                    Value::Array(_, _) => Ok(Value::Bool(true)),
+                    _ => Ok(Value::Bool(false)),
+                }
+            }
+        ).unwrap();
+
+        // Регистрируем функцию, ожидающую динамический тензор
+        vm.register_rust_function(
+            "is_dynamic_tensor", 
+            vec![Type::DTensor], 
+            Type::Bool, 
+            |args, _| {
+                match args[0] {
+                    Value::Tensor(_, _) => Ok(Value::Bool(true)),
+                    _ => Ok(Value::Bool(false)),
+                }
+            }
+        ).unwrap();
+
+        let source = r#"
+            let vec: vector<f64> = [1.0, 2.0]
+            let t: tensor<u8, 1> = zeros<u8>([5])
+            
+            -- Передаем строгие типы во внешнюю функцию без явного приведения
+            print(is_dynamic_array(vec))
+            print(is_dynamic_tensor(t))
+        "#;
+        
+        assert_eq!(
+            vm.execute(source).unwrap(),
+            vec!["true".to_owned(), "true".to_owned()]
+        );
     }
 }

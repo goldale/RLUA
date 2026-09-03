@@ -22,6 +22,10 @@ codegen-units = 1
 [dependencies]
 half = "2.7.1"
 md-5 = "0.10.6"
+# Новые зависимости для линейной алгебры и работы с тензорами
+ndarray = "0.15.6"
+ndarray-linalg = { version = "0.16.0", features = ["openblas-system"] }
+openblas-src = { version = "0.10", features = ["system", "rustls"] }
 
 [[example]]
 name = "md5_host"
