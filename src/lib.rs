@@ -395,13 +395,12 @@ pub enum UnOp { Neg, Not }
 
 #[derive(Clone, Debug, PartialEq)]
 enum Token {
-    Let, Print, Printf, Putc, Input, This, Function, Export, Require, If, Then, Else, ElseIf, While, For, Do, Break, Continue, Struct, Table, End,
-    As, Ident(StringId), Integer(i128), Float(f64), StringLit(StringId), Colon, DoubleColon,
-    Equal, EqualEqual, Bang, BangEq, Plus, Minus, Star, Slash, Percent,
-    Ampersand, Pipe, Caret, Shl, Shr, AndAnd, OrOr,
-    Dot, Lt, Le, Gt, Ge, LParen, RParen, LBracket, RBracket, LBrace, RBrace, Comma, Semi, Eof
+    Let, Print, Printf, Putc, Input, This, Function, Export, Require, If, Then, Else, ElseIf,
+    While, For, Do, Break, Continue, Struct, Table, End, As, In, Ident(StringId), Integer(i128),
+    Float(f64), StringLit(StringId), Colon, DoubleColon, Equal, EqualEqual, Bang, BangEq, Plus,
+    Minus, Star, Slash, Percent, Ampersand, Pipe, Caret, Shl, Shr, AndAnd, OrOr, Dot, Lt, Le,
+    Gt, Ge, LParen, RParen, LBracket, RBracket, LBrace, RBrace, Comma, Semi, Eof
 }
-
 #[derive(Clone, Debug)]
 struct SpannedToken { kind: Token, location: SourceLocation }
 struct TokenBuffer { tokens: Vec<SpannedToken>, location: SourceLocation }
@@ -492,7 +491,7 @@ fn lex(source: &str) -> Result<LexedTokens, Error> {
                     "if" => Token::If, "then" => Token::Then, "else" => Token::Else, "elseif" => Token::ElseIf,
                     "while" => Token::While, "for" => Token::For, "do" => Token::Do,
                     "break" => Token::Break, "continue" => Token::Continue, "struct" => Token::Struct,
-                    "table" => Token::Table, "end" => Token::End, "as" => Token::As, _ => Token::Ident(strings.intern(&word))
+                    "table" => Token::Table, "end" => Token::End, "as" => Token::As, "in" => Token::In, _ => Token::Ident(strings.intern(&word))
                 });
             }
             c if c.is_ascii_digit() => {
@@ -531,6 +530,7 @@ enum Statement {
     If { condition: Expr, then_body: Vec<Statement>, else_body: Vec<Statement> },
     While { condition: Expr, body: Vec<Statement> },
     For { name: String, start: Expr, end: Expr, body: Vec<Statement> },
+    ForIn { name: String, iterable: Expr, body: Vec<Statement> },
     Break,
     Continue,
     Located { node: Box<Statement>, location: SourceLocation },
@@ -670,14 +670,27 @@ impl Parser {
         Token::While => { let condition = self.expr()?; self.need(Token::Do)?; let body = self.block()?; self.need(Token::End)?; Ok(Statement::While { condition, body }) },
         Token::For => {
             let name = match self.next() { Token::Ident(name) => self.string(name), token => return Err(Error::Parse(format!("expected loop variable, got {token:?}"))) };
-            self.need(Token::Equal)?;
-            let start = self.expr()?;
-            self.need(Token::Comma)?;
-            let end = self.expr()?;
-            self.need(Token::Do)?;
-            let body = self.block()?;
-            self.need(Token::End)?;
-            Ok(Statement::For { name, start, end, body })
+            match self.peek() {
+                Token::Equal => {
+                    self.next(); // Consume '='
+                    let start = self.expr()?;
+                    self.need(Token::Comma)?;
+                    let end = self.expr()?;
+                    self.need(Token::Do)?;
+                    let body = self.block()?;
+                    self.need(Token::End)?;
+                    Ok(Statement::For { name, start, end, body })
+                }
+                Token::In => {
+                    self.next(); // Consume 'in'
+                    let iterable = self.expr()?;
+                    self.need(Token::Do)?;
+                    let body = self.block()?;
+                    self.need(Token::End)?;
+                    Ok(Statement::ForIn { name, iterable, body })
+                }
+                token => return Err(Error::Parse(format!("expected '=' or 'in' after loop variable, got {token:?}")))
+            }
         },
         Token::Break => Ok(Statement::Break),
         Token::Continue => Ok(Statement::Continue),
@@ -1605,6 +1618,89 @@ impl Compiler {
             for jump in context.continue_jumps { self.code[jump] = Op::Jump(context.continue_target); }
             self.names.remove(&name);
             self.next_slot = index_slot;
+            Ok(())
+        },
+        Statement::ForIn { name, iterable, body } => {
+            if self.names.contains_key(&name) { return Err(Error::Type(format!("loop variable '{name}' is already defined"))); }
+            
+            // 1. Validate the iterable type
+            let iterable_ty = self.expr(iterable, None)?;
+            let element_ty = match &iterable_ty {
+                Type::Array(inner) => (**inner).clone(),
+                Type::TableKeys => Type::TableKey,
+                Type::Tensor(inner, 1) => (**inner).clone(),
+                _ => return Err(Error::Type(format!("cannot iterate over {iterable_ty}; 'for ... in' requires a vector, 1D tensor, or table_keys"))),
+            };
+            // 2. Allocate 4 internal slots (iterable, length, index, and the loop variable itself)
+            let iterable_slot = self.next_slot; self.next_slot += 1;
+            let len_slot      = self.next_slot; self.next_slot += 1;
+            let index_slot    = self.next_slot; self.next_slot += 1;
+            let item_slot     = self.next_slot; self.next_slot += 1;
+
+            // Store iterable object to ensure it is only evaluated once
+            self.code.push(Op::Store(iterable_slot));
+
+            // len(iterable)
+            self.code.push(Op::Load(iterable_slot));
+            self.code.push(Op::Len);
+            self.code.push(Op::Store(len_slot));
+
+            // index = 0
+            self.code.push(Op::Push(Value::I32(0)));
+            self.code.push(Op::Store(index_slot));
+
+            // Register loop variable bindings for the inner block
+            self.names.insert(name.clone(), (item_slot, element_ty.clone()));
+
+            let loop_start = self.code.len();
+            
+            // Condition: if !(index < len) jump to end
+            self.code.push(Op::Load(index_slot));
+            self.code.push(Op::Load(len_slot));
+            self.code.push(Op::Binary(BinaryOp::I32(BinOp::Lt)));
+            let exit_jump = self.code.len();
+            self.code.push(Op::JumpIfFalse(usize::MAX));
+
+            // Fetch item: item = iterable[index]
+            self.code.push(Op::Load(iterable_slot));
+            self.code.push(Op::Load(index_slot));
+            match &iterable_ty {
+                Type::Array(_) => self.code.push(Op::Index),
+                Type::TableKeys => self.code.push(Op::TableKeysIndex),
+                Type::Tensor(inner, 1) => {
+                    if **inner == Type::F32 {
+                        self.code.push(Op::TensorIndexF32(1));
+                    } else {
+                        self.code.push(Op::TensorIndex(Rc::new((**inner).clone()), 1));
+                    }
+                },
+                _ => unreachable!(),
+            }
+            self.code.push(Op::Store(item_slot));
+            // Execute user block
+            self.loops.push(LoopContext { break_jumps: Vec::new(), continue_jumps: Vec::new(), continue_target: usize::MAX, scope_base: self.scope_stack.len() });
+            self.scoped_block(body)?;
+
+            // Increment: index = index + 1
+            let increment_start = self.code.len();
+            self.code.push(Op::Load(index_slot));
+            self.code.push(Op::Push(Value::I32(1)));
+            self.code.push(Op::Binary(BinaryOp::I32(BinOp::Add)));
+            self.code.push(Op::Store(index_slot));
+            self.code.push(Op::Jump(loop_start));
+
+            // Patch jump offsets
+            let loop_end = self.code.len();
+            self.code[exit_jump] = Op::JumpIfFalse(loop_end);
+
+            let mut context = self.loops.pop().expect("loop context");
+            context.continue_target = increment_start;
+            for jump in context.break_jumps { self.code[jump] = Op::Jump(loop_end); }
+            for jump in context.continue_jumps { self.code[jump] = Op::Jump(context.continue_target); }
+
+            // Cleanup
+            self.names.remove(&name);
+            self.next_slot = iterable_slot; // Rewind the 4 temporary slots so they can be reused
             Ok(())
         },
         Statement::Break => {
