@@ -8,7 +8,13 @@ while i < 999999 do
     -- Операция сложения строк аллоцирует новый объект HeapObject::String 
     -- в куче на каждой итерации. Старые объекты будут автоматически 
     -- собираться сборщиком мусора при превышении threshold_bytes.
-    dummy_string = "mem-Chunk-partA-" + "partB" + int2str(i)
+    let j: i64 = 0
+    let k: i64 = 5487534 * i % 13
+    dummy_string = "mem-Chunk-partA-" + "partB" + int2str(k)
+    while  j < k do
+        dummy_string =  dummy_string + "part" + int2str(j)
+	j = j +1
+    end
     i = i + 1
 end
 
