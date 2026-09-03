@@ -1,35 +1,146 @@
--- Интерактивная игра Судоку на языке L0 с поддержкой ввода (input).
--- 0 означает пустую ячейку; доска представляет собой плоский массив 9 x 9 (81 ячейка), проиндексированный с нуля.
--- Игрок указывает строку (0-8), колонку (0-8) и значение (1-9).
+-- Интерактивная игра Судоку на языке L0
+-- Используем структуру для хранения состояния и реализации методов
 
-let board: vector<i8> = [
-    0, 0, 0, 0, 0, 0, 0, 7, 5,
-    1, 6, 0, 5, 0, 0, 0, 8, 0,
-    0, 0, 3, 0, 0, 9, 0, 0, 1,
-    5, 3, 0, 7, 0, 4, 2, 9, 0,
-    0, 4, 8, 0, 9, 0, 6, 5, 0,
-    0, 9, 6, 3, 0, 5, 0, 4, 7,
-    6, 0, 0, 4, 0, 0, 5, 0, 0,
-    0, 1, 0, 0, 0, 8, 0, 2, 6,
-    9, 7, 0, 0, 0, 0, 0, 0, 0
-]
+struct Sudoku {
+    board: vector<i8>;
+    active: bool;
 
-let active: bool = 1 == 1
-
-while active do
-    -- Вывод текущего состояния доски
-    sudoku_show(board)
-    
-    -- Получение хода от игрока (интерактивный ввод строки, столбца и числа)
-    board = sudoku_human_move(board)
-
-    -- Проверка, решена ли головоломка
-    let solved: bool = sudoku_is_solved(board)
-    if solved then
-        active = 1 == 0
+    function show() end
+    function human_move() end
+    function check_solved() end
+}
+-- Метод отрисовки доски
+function Sudoku::show()
+    printf("\n=== СУДОКУ ===\n")
+    let r: i32 = 0
+    while r < 9 do
+        let c: i32 = 0
+        while c < 9 do
+            let val: i8 = board[r * 9 + c]
+            if val == 0 then
+                printf(". ")
+            else
+                printf("{} ", val)
+            end
+            
+            if c == 2 || c == 5 then 
+                printf("| ") 
+            end
+            c = c + 1
+        end
+        printf("\n")
+        if r == 2 || r == 5 then 
+            printf("---------------------\n") 
+        end
+        r = r + 1
     end
 end
 
--- Финальный вывод и поздравление
-sudoku_show(board)
-print("Поздравляем! Судоку успешно решено!")
+-- Метод обработки хода игрока
+function Sudoku::human_move()
+    printf("\nСтрока (0-8): ")
+    let r: i32 = input
+    printf("Колонка (0-8): ")
+    let c: i32 = input
+    printf("Число (1-9, или 0 для очистки): ")
+    let v: i8 = input
+
+    if r >= 0 && r <= 8 && c >= 0 && c <= 8 && v >= 0 && v <= 9 then
+        board[r * 9 + c] = v
+    else
+        printf("Ошибка: неверные координаты или значение!\n")
+    end
+end
+
+-- Метод проверки правильности решения
+function Sudoku::check_solved()
+    let complete: bool = 1 == 1
+    let valid: bool = 1 == 1
+    let i: i32 = 0
+    
+    -- Сначала проверяем, остались ли пустые ячейки
+    while i < 81 do
+        if board[i] == 0 then 
+            complete = 1 == 0 
+        end
+        i = i + 1
+    end
+    
+    -- Если доска заполнена, валидируем строки, колонки и квадраты 3x3
+    if complete then
+        let r: i32 = 0
+        while r < 9 do
+            let c: i32 = 0
+            while c < 9 do
+                let val: i8 = board[r * 9 + c]
+                
+                -- Проверка конфликтов в строке
+                let c2: i32 = c + 1
+                while c2 < 9 do
+                    if board[r * 9 + c2] == val then valid = 1 == 0 end
+                    c2 = c2 + 1
+                end
+                
+                -- Проверка конфликтов в колонке
+                let r2: i32 = r + 1
+                while r2 < 9 do
+                    if board[r2 * 9 + c] == val then valid = 1 == 0 end
+                    r2 = r2 + 1
+                end
+                
+                -- Проверка конфликтов в квадрате 3x3
+                let r0: i32 = (r / 3) * 3
+                let c0: i32 = (c / 3) * 3
+                let mr: i32 = 0
+                while mr < 3 do
+                    let mc: i32 = 0
+                    while mc < 3 do
+                        let tr: i32 = r0 + mr
+                        let tc: i32 = c0 + mc
+                        if tr != r || tc != c then
+                            if board[tr * 9 + tc] == val then 
+                                valid = 1 == 0 
+                            end
+                        end
+                        mc = mc + 1
+                    end
+                    mr = mr + 1
+                end
+                c = c + 1
+            end
+            r = r + 1
+        end
+        
+        if valid then
+            active = 1 == 0
+        else
+            printf("\nДоска заполнена, но есть ошибки! Исправьте их (введите 0 для очистки ячейки).\n")
+        end
+    end
+end
+
+-- Инициализация игры
+let game: Sudoku = Sudoku {
+    board = [
+        0, 0, 0, 0, 0, 0, 0, 7, 5,
+        1, 6, 0, 5, 0, 0, 0, 8, 0,
+        0, 0, 3, 0, 0, 9, 0, 0, 1,
+        5, 3, 0, 7, 0, 4, 2, 9, 0,
+        0, 4, 8, 0, 9, 0, 6, 5, 0,
+        0, 9, 6, 3, 0, 5, 0, 4, 7,
+        6, 0, 0, 4, 0, 0, 5, 0, 0,
+        0, 1, 0, 0, 0, 8, 0, 2, 6,
+        9, 7, 0, 0, 0, 0, 0, 0, 0
+    ],
+    active = 1 == 1
+}
+
+-- Игровой цикл (вызов методов реализован через объект game)
+while game.active do
+    game.show()
+    game.human_move()
+    game.check_solved()
+end
+
+game.show()
+printf("\nПоздравляем! Судоку успешно решено!\n")

@@ -415,6 +415,7 @@ impl TokenBuffer {
 #[derive(Clone, Debug)]
 enum Expr {
     Integer(i128), Float(f64), String(StringId), Input, This, Require(String), Name(StringId),
+    GlobalName(StringId),
     Array(Vec<Expr>), Table(Vec<(TableLiteralKey, Expr)>), StructLiteral(String, Vec<(String, Expr)>),
     Cast(Box<Expr>, Type),
     Binary(Box<Expr>, BinOp, Box<Expr>), Unary(UnOp, Box<Expr>),
@@ -521,6 +522,7 @@ enum Statement {
     CallMethod { receiver: MethodReceiver, method: String },
     Let { name: StringId, ty: Type, expr: Expr },
     Assign { name: String, expr: Expr },
+    GlobalAssign { name: String, expr: Expr },
     SetIndex { name: String, indices: Vec<Expr>, expr: Expr },
     SetField { name: String, field: String, expr: Expr },
     SetFieldIndex { name: String, field: String, index: Expr, expr: Expr },
@@ -679,6 +681,11 @@ impl Parser {
         Token::Break => Ok(Statement::Break),
         Token::Continue => Ok(Statement::Continue),
         Token::This => { self.need(Token::Dot)?; let method = match self.next() { Token::Ident(method) => self.string(method), token => return Err(Error::Parse(format!("expected method name, got {token:?}"))) }; self.need(Token::LParen)?; self.need(Token::RParen)?; Ok(Statement::CallMethod { receiver: MethodReceiver::This, method }) },
+        Token::DoubleColon => {
+            let name = match self.next() { Token::Ident(name) => self.string(name), token => return Err(Error::Parse(format!("expected global variable name after '::', got {token:?}"))) };
+            self.need(Token::Equal)?;
+            Ok(Statement::GlobalAssign { name, expr: self.expr()? })
+        },
         Token::Ident(name) => { let name = self.string(name); match self.next() {
             Token::Equal => Ok(Statement::Assign { name, expr: self.expr()? }),
             Token::LBracket => { let indices = self.indices()?; self.need(Token::Equal)?; Ok(Statement::SetIndex { name, indices, expr: self.expr()? }) },
@@ -824,6 +831,10 @@ impl Parser {
             Token::StringLit(s) => Expr::String(s),
             Token::Input => Expr::Input,
             Token::This => Expr::This,
+            Token::DoubleColon => match self.next() {
+                Token::Ident(name) => Expr::GlobalName(name),
+                token => return Err(Error::Parse(format!("expected global variable name after '::', got {token:?}"))),
+            },
             Token::Require => {
                 self.need(Token::LParen)?;
                 let path = match self.next() { Token::StringLit(path) => path, token => return Err(Error::Parse(format!("require expects a string literal, got {token:?}"))) };
@@ -1122,6 +1133,7 @@ struct LoopContext { break_jumps: Vec<usize>, continue_jumps: Vec<usize>, contin
 
 struct Compiler {
     names: HashMap<String, (usize, Type)>, structs: HashMap<String, StructLayout>,
+    globals: HashMap<String, (usize, Type)>,
     methods: HashMap<(String, String), Option<usize>>, pending_method_calls: Vec<(usize, String, String)>,
     current_method_fields: Option<HashMap<String, StructField>>, current_method_struct: Option<String>,
     module_root: Option<PathBuf>, module_artifacts: HashMap<String, ModuleArtifact>,
@@ -1129,10 +1141,10 @@ struct Compiler {
     exports: HashMap<String, ModuleExport>, extern_functions: HashMap<String, HostSignature>, code: Vec<Op>,
     interned_names: HashMap<String, Rc<str>>,
     strings: StringInterner,
-    next_slot: usize, loops: Vec<LoopContext>
+    next_slot: usize, scope_depth: usize, loops: Vec<LoopContext>
 }
 
-impl Default for Compiler { fn default() -> Self { Self { names: HashMap::new(), structs: HashMap::new(), methods: HashMap::new(), pending_method_calls: Vec::new(), current_method_fields: None, current_method_struct: None, module_root: None, module_artifacts: HashMap::new(), compiling_modules: Rc::new(RefCell::new(HashSet::new())), exports: HashMap::new(), extern_functions: HashMap::new(), code: Vec::new(), interned_names: HashMap::new(), strings: StringInterner::new(), next_slot: 0, loops: Vec::new() } } }
+impl Default for Compiler { fn default() -> Self { Self { names: HashMap::new(), structs: HashMap::new(), globals: HashMap::new(), methods: HashMap::new(), pending_method_calls: Vec::new(), current_method_fields: None, current_method_struct: None, module_root: None, module_artifacts: HashMap::new(), compiling_modules: Rc::new(RefCell::new(HashSet::new())), exports: HashMap::new(), extern_functions: HashMap::new(), code: Vec::new(), interned_names: HashMap::new(), strings: StringInterner::new(), next_slot: 0, scope_depth: 0, loops: Vec::new() } } }
 
 impl Compiler {
     fn with_module_root(module_root: PathBuf) -> Self { Self { module_root: Some(module_root), ..Self::default() } }
@@ -1152,7 +1164,9 @@ impl Compiler {
     fn scoped_block(&mut self, body: Vec<Statement>) -> Result<(), Error> {
         let saved_names = self.names.clone();
         let saved_next_slot = self.next_slot;
+        self.scope_depth += 1;
         let result = body.into_iter().try_for_each(|statement| self.statement(statement));
+        self.scope_depth -= 1;
         self.names = saved_names;
         self.next_slot = saved_next_slot;
         result
@@ -1252,8 +1266,9 @@ impl Compiler {
         let method_fields = layout.fields.iter().cloned().map(|field| (field.name.clone(), field)).collect();
         let previous_fields = self.current_method_fields.replace(method_fields);
         let previous_struct = self.current_method_struct.replace(struct_name.to_owned());
-        let saved_names = self.names.clone();
-        let saved_next_slot = self.next_slot;
+        let saved_names = std::mem::take(&mut self.names);
+        let saved_scope_depth = self.scope_depth;
+        self.scope_depth += 1;
         // Read the arguments and bind them to local variable slots
         for (arg_name, arg_ty) in args.into_iter().rev() {
             let slot = self.next_slot;
@@ -1265,7 +1280,10 @@ impl Compiler {
         self.current_method_fields = previous_fields;
         self.current_method_struct = previous_struct;
         self.names = saved_names;
-        self.next_slot = saved_next_slot;
+        // Method-local slots remain reserved in the VM's shared local store.
+        // Reusing them for subsequently declared globals can overwrite a
+        // method receiver or one of its locals during a call.
+        self.scope_depth = saved_scope_depth;
         body_result?;
         self.code.push(Op::Return);
         let after_body = self.code.len();
@@ -1341,6 +1359,9 @@ impl Compiler {
                 let s = self.next_slot;
                 self.next_slot += 1;
                 self.names.insert(name.clone(), (s, found.clone()));
+                if self.scope_depth == 0 {
+                    self.globals.insert(name.clone(), (s, found.clone()));
+                }
                 s
             };
             if let Type::Module(module_id) = &found { self.import_exported_structs(&name, module_id)?; }
@@ -1348,8 +1369,19 @@ impl Compiler {
             Ok(())
         },
         Statement::Assign { name, expr } => { if let Some(field) = self.current_method_fields.as_ref().and_then(|fields| fields.get(&name)).cloned() { let found = self.expr(expr, Some(&field.ty))?; if found != field.ty { return Err(Error::Type(format!("field '{name}' is {}, but expression has type {found}", field.ty))); } self.code.push(Op::StoreCurrentField(Rc::new(field))); Ok(()) } else { let (slot, ty) = self.names.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))?; let found = self.expr(expr, Some(&ty))?; if found != ty { return Err(Error::Type(format!("'{name}' is {ty}, but expression has type {found}"))); } self.code.push(Op::Store(slot)); Ok(()) } },
+        Statement::GlobalAssign { name, expr } => { let (slot, ty) = self.globals.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown global name '{name}'")))?; let found = self.expr(expr, Some(&ty))?; if found != ty { return Err(Error::Type(format!("global '{name}' is {ty}, but expression has type {found}"))); } self.code.push(Op::Store(slot)); Ok(()) },
         Statement::SetIndex { name, indices, expr } => {
-            let (slot, container_ty) = self.names.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))?;
+            // Исправление: сначала проверяем, является ли name полем текущей структуры
+            let (slot, container_ty) = if let Some(field) = self.current_method_fields.as_ref().and_then(|fields| fields.get(&name)).cloned() {
+                let temp_slot = self.next_slot;
+                self.next_slot += 1;
+                self.code.push(Op::LoadCurrentField(Rc::new(field.clone())));
+                self.code.push(Op::Store(temp_slot));
+                (temp_slot, field.ty)
+            } else {
+                self.names.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))?
+            };
+            
             match container_ty {
                 Type::Array(inner) => {
                     if indices.len() != 1 { return Err(Error::Type("vector indexing requires exactly one index".into())); }
@@ -1375,8 +1407,60 @@ impl Compiler {
                 _ => Err(Error::Type(format!("'{name}' is not indexable"))),
             }
         },
-        Statement::SetField { name, field, expr } => { let (slot, ty) = self.names.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))?; match ty { Type::Struct(struct_name) => { let layout = self.structs.get(&struct_name).ok_or_else(|| Error::Type(format!("unknown struct '{struct_name}'")))?; let field = layout.fields.iter().find(|candidate| candidate.name == field).cloned().ok_or_else(|| Error::Type(format!("struct '{struct_name}' has no field '{field}'")))?; let found = self.expr(expr, Some(&field.ty))?; if found != field.ty { return Err(Error::Type("struct field type mismatch".into())); } self.code.push(Op::StoreField(slot, Rc::new(field))); Ok(()) }, Type::Table(element) => { let element = *element; let found = self.expr(expr, Some(&element))?; if found != element { return Err(Error::Type("table value type mismatch".into())); } let field = self.intern_name(&field); self.code.push(Op::StoreTableField(slot, field, Rc::new(element))); Ok(()) }, _ => Err(Error::Type(format!("'{name}' has no named keys"))), } },
-        Statement::SetFieldIndex { name, field, index, expr } => { let (slot, Type::Struct(struct_name)) = self.names.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))? else { return Err(Error::Type(format!("'{name}' is not a struct"))); }; let layout = self.structs.get(&struct_name).ok_or_else(|| Error::Type(format!("unknown struct '{struct_name}'")))?; let field = layout.fields.iter().find(|candidate| candidate.name == field).cloned().ok_or_else(|| Error::Type(format!("struct '{struct_name}' has no field '{field}'")))?; let Type::Array(element) = field.ty.clone() else { return Err(Error::Type(format!("field '{}' is not a vector", field.name))); }; let element = *element; scalar_size(&element)?; let index_ty = self.expr(index, None)?; if !matches!(index_ty, Type::I8|Type::I16|Type::I32|Type::I64|Type::U8|Type::U16|Type::U32|Type::U64) { return Err(Error::Type("index must be an integer".into())); } let found = self.expr(expr, Some(&element))?; if found != element { return Err(Error::Type(format!("item is {found}; expected {element}"))); } self.code.push(Op::StoreFieldIndex(slot, Rc::new(field), Rc::new(element))); Ok(()) },
+        Statement::SetField { name, field, expr } => { 
+            let (slot, ty) = if let Some(method_field) = self.current_method_fields.as_ref().and_then(|fields| fields.get(&name)).cloned() {
+                let temp_slot = self.next_slot;
+                self.next_slot += 1;
+                self.code.push(Op::LoadCurrentField(Rc::new(method_field.clone())));
+                self.code.push(Op::Store(temp_slot));
+                (temp_slot, method_field.ty)
+            } else {
+                self.names.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))?
+            };
+            
+            match ty { 
+                Type::Struct(struct_name) => { 
+                    let layout = self.structs.get(&struct_name).ok_or_else(|| Error::Type(format!("unknown struct '{struct_name}'")))?; 
+                    let field = layout.fields.iter().find(|candidate| candidate.name == field).cloned().ok_or_else(|| Error::Type(format!("struct '{struct_name}' has no field '{field}'")))?; 
+                    let found = self.expr(expr, Some(&field.ty))?; 
+                    if found != field.ty { return Err(Error::Type("struct field type mismatch".into())); } 
+                    self.code.push(Op::StoreField(slot, Rc::new(field))); 
+                    Ok(()) 
+                }, 
+                Type::Table(element) => { 
+                    let element = *element; 
+                    let found = self.expr(expr, Some(&element))?; 
+                    if found != element { return Err(Error::Type("table value type mismatch".into())); } 
+                    let field = self.intern_name(&field); 
+                    self.code.push(Op::StoreTableField(slot, field, Rc::new(element))); 
+                    Ok(()) 
+                }, 
+                _ => Err(Error::Type(format!("'{name}' has no named keys"))), 
+            } 
+        },
+        Statement::SetFieldIndex { name, field, index, expr } => { 
+            let (slot, ty) = if let Some(method_field) = self.current_method_fields.as_ref().and_then(|fields| fields.get(&name)).cloned() {
+                let temp_slot = self.next_slot;
+                self.next_slot += 1;
+                self.code.push(Op::LoadCurrentField(Rc::new(method_field.clone())));
+                self.code.push(Op::Store(temp_slot));
+                (temp_slot, method_field.ty)
+            } else {
+                self.names.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))?
+            };
+            
+            let Type::Struct(struct_name) = ty else { return Err(Error::Type(format!("'{name}' is not a struct"))); }; 
+            let layout = self.structs.get(&struct_name).ok_or_else(|| Error::Type(format!("unknown struct '{struct_name}'")))?; 
+            let field = layout.fields.iter().find(|candidate| candidate.name == field).cloned().ok_or_else(|| Error::Type(format!("struct '{struct_name}' has no field '{field}'")))?; 
+            let Type::Array(element) = field.ty.clone() else { return Err(Error::Type(format!("field '{}' is not a vector", field.name))); }; 
+            let element = *element; scalar_size(&element)?; 
+            let index_ty = self.expr(index, None)?; 
+            if !matches!(index_ty, Type::I8|Type::I16|Type::I32|Type::I64|Type::U8|Type::U16|Type::U32|Type::U64) { return Err(Error::Type("index must be an integer".into())); } 
+            let found = self.expr(expr, Some(&element))?; 
+            if found != element { return Err(Error::Type(format!("item is {found}; expected {element}"))); } 
+            self.code.push(Op::StoreFieldIndex(slot, Rc::new(field), Rc::new(element))); 
+            Ok(()) 
+        },
         Statement::Print(expr) => { self.expr(expr, None)?; self.code.push(Op::Print); Ok(()) },
         Statement::Printf { format, args } => {
             let num_args = args.len();
@@ -1474,6 +1558,7 @@ impl Compiler {
         Expr::Input => { let ty = expected.filter(|t| is_numeric(t) || **t == Type::String).cloned().ok_or_else(|| Error::Type("input needs an expected scalar or string type, e.g. let value: i32 = input".into()))?; self.code.push(Op::Input(Rc::new(ty.clone()))); Ok(ty) },
         Expr::This => { let struct_name = self.current_method_struct.clone().ok_or_else(|| Error::Type("this is available only inside a struct method".into()))?; self.code.push(Op::LoadCurrentReceiver); Ok(Type::Struct(struct_name)) },
         Expr::Require(path) => { let module = self.load_module(&path)?; let id = module.id.clone(); self.code.push(Op::Require(Rc::new(module))); Ok(Type::Module(id)) },
+        Expr::GlobalName(name) => { let name = self.string(name); let (slot, ty) = self.globals.get(name).cloned().ok_or_else(|| Error::Type(format!("unknown global name '{name}'")))?; self.code.push(Op::Load(slot)); Ok(ty) },
         Expr::Name(name) => { let name = self.string(name); if let Some(field) = self.current_method_fields.as_ref().and_then(|fields| fields.get(name)).cloned() { let ty = field.ty.clone(); self.code.push(Op::LoadCurrentField(Rc::new(field))); Ok(ty) } else { let (slot, ty) = self.names.get(name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))?; self.code.push(Op::Load(slot)); Ok(ty) } },
         Expr::Array(mut items) => {
             let inferred = expected.is_none();
@@ -2749,6 +2834,27 @@ mod immediate_regression_tests {
         assert!(matches!(
             execute("for i = 1, 2 do let temporary: i32 = i end print(i)"),
             Err(Error::Located { source, location: SourceLocation { line: 1, column: 50, .. } }) if matches!(&*source, Error::Type(message) if message == "unknown name 'i'")
+        ));
+    }
+    #[test]
+    fn methods_are_isolated_and_can_explicitly_access_globals() {
+        let source = r#"
+            let counter: i32 = 7
+            struct Meter { value: i32; function advance() end }
+            function Meter::advance()
+                let step: i32 = 1
+                ::counter = ::counter + step
+                value = value + ::counter
+            end
+            let meter: Meter = Meter { value = 0 }
+            meter.advance()
+            print(meter.value)
+            print(counter)
+        "#;
+        assert_eq!(execute(source).unwrap(), ["8", "8"]);
+        assert!(matches!(
+            execute("let counter: i32 = 7; struct Meter { value: i32; function read() print(counter) end }"),
+            Err(Error::Located { source, .. }) if matches!(&*source, Error::Type(message) if message == "unknown name 'counter'")
         ));
     }
     #[test]
