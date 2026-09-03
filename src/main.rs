@@ -23,19 +23,16 @@ fn main() {
 
     // Создаем экземпляр виртуальной машины
     let mut vm = Vm::default();
+    vm.set_interactive(true);
 
     // Регистрируем функцию int2str
     if let Err(e) = vm.register_rust_function("int2str", vec![Type::I64], Type::String, int2str) {
         eprintln!("Failed to register host functions: {}", e);
         process::exit(1);
     }
-    // Выполняем скрипт и выводим результат
+    // В интерактивном режиме VM выводит текст сразу, до возможного `input`.
     match vm.execute_file(&path) {
-        Ok(output) => {
-            for line in output {
-                println!("{}", line);
-            }
-        },
+        Ok(_) => {},
         Err(error) => { eprintln!("{path}: {error}"); process::exit(1); }
     }
 }

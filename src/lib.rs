@@ -960,6 +960,7 @@ enum IrOp {
     CallExternal(Rc<str>, usize),
     JumpIfFalse(usize), Jump(usize), JumpIfFalseKeep(usize), JumpIfTrueKeep(usize),
     CallMethod(usize, usize), CallCurrentMethod(usize), CallModule(usize, Rc<str>),
+    TrackDestructor(usize, usize), UntrackDestructor(usize),
     Return, Print, Printf(usize), Putc
 }
 
@@ -992,13 +993,14 @@ enum Opcode {
     JumpIfTrueKeep, CallMethod, CallCurrentMethod, CallModule, Return, Print, Printf, Putc,
     // Appended to preserve the numeric representation of existing opcodes.
     Cast,
+    TrackDestructor, UntrackDestructor,
 }
 
 impl Opcode {
     fn from_word(word: u32) -> Result<Self, Error> {
         // Opcodes are emitted only by this compiler.  Keep malformed external
         // bytecode diagnosable rather than treating it as undefined behaviour.
-        if word > Self::Cast as u32 { return Err(Error::Runtime("invalid bytecode opcode".into())); }
+        if word > Self::UntrackDestructor as u32 { return Err(Error::Runtime("invalid bytecode opcode".into())); }
         Ok(unsafe { std::mem::transmute(word) })
     }
 }
@@ -1014,6 +1016,7 @@ enum DecodedOp<'a> {
     Builtin1(BuiltinFn, &'a Rc<Type>), Builtin2(BuiltinFn, &'a Rc<Type>), CallExternal(&'a Rc<str>, usize),
     JumpIfFalse(usize), Jump(usize), JumpIfFalseKeep(usize), JumpIfTrueKeep(usize),
     CallMethod(usize, usize), CallCurrentMethod(usize), CallModule(usize, &'a Rc<str>),
+    TrackDestructor(usize, usize), UntrackDestructor(usize),
     Return, Print, Printf(usize), Putc,
 }
 
@@ -1052,6 +1055,7 @@ impl FlatBytecode {
             IrOp::CallExternal(a,b) => { out.op(Opcode::CallExternal); let x=out.constant(Constant::String(a)); out.word(x as usize); out.word(b); },
             IrOp::JumpIfFalse(v) => { out.op(Opcode::JumpIfFalse); out.word(v * 4); }, IrOp::Jump(v) => { out.op(Opcode::Jump); out.word(v * 4); }, IrOp::JumpIfFalseKeep(v) => { out.op(Opcode::JumpIfFalseKeep); out.word(v * 4); }, IrOp::JumpIfTrueKeep(v) => { out.op(Opcode::JumpIfTrueKeep); out.word(v * 4); },
             IrOp::CallMethod(a,b) => { out.op(Opcode::CallMethod); out.word(a); out.word(b * 4); }, IrOp::CallCurrentMethod(v) => { out.op(Opcode::CallCurrentMethod); out.word(v * 4); }, IrOp::CallModule(a,b) => { out.op(Opcode::CallModule); out.word(a); let x=out.constant(Constant::String(b)); out.word(x as usize); },
+            IrOp::TrackDestructor(a,b) => { out.op(Opcode::TrackDestructor); out.word(a); out.word(b * 4); }, IrOp::UntrackDestructor(v) => { out.op(Opcode::UntrackDestructor); out.word(v); },
             IrOp::Return => out.op(Opcode::Return), IrOp::Print => out.op(Opcode::Print), IrOp::Printf(v) => { out.op(Opcode::Printf); out.word(v); }, IrOp::Putc => out.op(Opcode::Putc),
         } while out.words.len() % 4 != 0 { out.words.push(0); } } out
     }
@@ -1082,7 +1086,7 @@ impl FlatBytecode {
             Opcode::MakeArray=>{let a=word(&mut pc)?;c!(Constant::Type(b));DecodedOp::MakeArray(a,b)}, Opcode::MakeTable=>{c!(Constant::Entries(a));c!(Constant::Type(b));DecodedOp::MakeTable(a,b)}, Opcode::MakeStruct=>{c!(Constant::Layout(v));DecodedOp::MakeStruct(v)}, Opcode::MakeTensor=>{c!(Constant::TensorInit(a));c!(Constant::Type(b));let c=word(&mut pc)?;DecodedOp::MakeTensor(*a,b,c)},
             Opcode::Index=>DecodedOp::Index, Opcode::TensorIndex=>{c!(Constant::Type(a));let b=word(&mut pc)?;DecodedOp::TensorIndex(a,b)}, Opcode::TensorIndexF32=>DecodedOp::TensorIndexF32(word(&mut pc)?), Opcode::TableIndex=>DecodedOp::TableIndex, Opcode::TableKeys=>DecodedOp::TableKeys, Opcode::TableKeysIndex=>DecodedOp::TableKeysIndex, Opcode::TableRemove=>DecodedOp::TableRemove, Opcode::Field=>{c!(Constant::Field(v));DecodedOp::Field(v)}, Opcode::TableField=>{c!(Constant::String(v));DecodedOp::TableField(v)}, Opcode::ModuleField=>{c!(Constant::String(v));DecodedOp::ModuleField(v)},
             Opcode::Binary=>{c!(Constant::Binary(v));DecodedOp::Binary(v)}, Opcode::Unary=>{c!(Constant::Unary(a));c!(Constant::Type(b));DecodedOp::Unary(a,b)}, Opcode::Len=>DecodedOp::Len, Opcode::ConcatString=>DecodedOp::ConcatString, Opcode::Cast=>{c!(Constant::Type(v));DecodedOp::Cast(v)}, Opcode::Builtin1=>{c!(Constant::Builtin(a));c!(Constant::Type(b));DecodedOp::Builtin1(*a,b)}, Opcode::Builtin2=>{c!(Constant::Builtin(a));c!(Constant::Type(b));DecodedOp::Builtin2(*a,b)}, Opcode::CallExternal=>{c!(Constant::String(a));let b=word(&mut pc)?;DecodedOp::CallExternal(a,b)},
-            Opcode::JumpIfFalse=>DecodedOp::JumpIfFalse(word(&mut pc)?), Opcode::Jump=>DecodedOp::Jump(word(&mut pc)?), Opcode::JumpIfFalseKeep=>DecodedOp::JumpIfFalseKeep(word(&mut pc)?), Opcode::JumpIfTrueKeep=>DecodedOp::JumpIfTrueKeep(word(&mut pc)?), Opcode::CallMethod=>DecodedOp::CallMethod(word(&mut pc)?,word(&mut pc)?), Opcode::CallCurrentMethod=>DecodedOp::CallCurrentMethod(word(&mut pc)?), Opcode::CallModule=>{let a=word(&mut pc)?;c!(Constant::String(b));DecodedOp::CallModule(a,b)}, Opcode::Return=>DecodedOp::Return, Opcode::Print=>DecodedOp::Print, Opcode::Printf=>DecodedOp::Printf(word(&mut pc)?), Opcode::Putc=>DecodedOp::Putc,
+            Opcode::JumpIfFalse=>DecodedOp::JumpIfFalse(word(&mut pc)?), Opcode::Jump=>DecodedOp::Jump(word(&mut pc)?), Opcode::JumpIfFalseKeep=>DecodedOp::JumpIfFalseKeep(word(&mut pc)?), Opcode::JumpIfTrueKeep=>DecodedOp::JumpIfTrueKeep(word(&mut pc)?), Opcode::CallMethod=>DecodedOp::CallMethod(word(&mut pc)?,word(&mut pc)?), Opcode::CallCurrentMethod=>DecodedOp::CallCurrentMethod(word(&mut pc)?), Opcode::CallModule=>{let a=word(&mut pc)?;c!(Constant::String(b));DecodedOp::CallModule(a,b)}, Opcode::TrackDestructor=>DecodedOp::TrackDestructor(word(&mut pc)?,word(&mut pc)?), Opcode::UntrackDestructor=>DecodedOp::UntrackDestructor(word(&mut pc)?), Opcode::Return=>DecodedOp::Return, Opcode::Print=>DecodedOp::Print, Opcode::Printf=>DecodedOp::Printf(word(&mut pc)?), Opcode::Putc=>DecodedOp::Putc,
         }; Ok((decoded,instruction_start + 4))
     }
 
@@ -1120,7 +1124,18 @@ impl BuiltinFn {
 #[derive(Clone, Copy, Debug)]
 enum TensorInit { Zeros, Random }
 
-struct LoopContext { break_jumps: Vec<usize>, continue_jumps: Vec<usize>, continue_target: usize }
+#[derive(Clone, Debug)]
+struct DestructorLocal { slot: usize, struct_name: String }
+
+#[derive(Default)]
+struct ScopeContext { destructors: Vec<DestructorLocal> }
+
+struct LoopContext {
+    break_jumps: Vec<usize>,
+    continue_jumps: Vec<usize>,
+    continue_target: usize,
+    scope_base: usize,
+}
 
 struct Compiler {
     names: HashMap<String, (usize, Type)>, structs: HashMap<String, StructLayout>,
@@ -1132,10 +1147,10 @@ struct Compiler {
     exports: HashMap<String, ModuleExport>, extern_functions: HashMap<String, HostSignature>, code: Vec<Op>,
     interned_names: HashMap<String, Rc<str>>,
     strings: StringInterner,
-    next_slot: usize, scope_depth: usize, loops: Vec<LoopContext>
+    next_slot: usize, scope_depth: usize, scope_stack: Vec<ScopeContext>, loops: Vec<LoopContext>
 }
 
-impl Default for Compiler { fn default() -> Self { Self { names: HashMap::new(), structs: HashMap::new(), globals: HashMap::new(), methods: HashMap::new(), pending_method_calls: Vec::new(), current_method_fields: None, current_method_struct: None, module_root: None, module_artifacts: HashMap::new(), compiling_modules: Rc::new(RefCell::new(HashSet::new())), exports: HashMap::new(), extern_functions: HashMap::new(), code: Vec::new(), interned_names: HashMap::new(), strings: StringInterner::new(), next_slot: 0, scope_depth: 0, loops: Vec::new() } } }
+impl Default for Compiler { fn default() -> Self { Self { names: HashMap::new(), structs: HashMap::new(), globals: HashMap::new(), methods: HashMap::new(), pending_method_calls: Vec::new(), current_method_fields: None, current_method_struct: None, module_root: None, module_artifacts: HashMap::new(), compiling_modules: Rc::new(RefCell::new(HashSet::new())), exports: HashMap::new(), extern_functions: HashMap::new(), code: Vec::new(), interned_names: HashMap::new(), strings: StringInterner::new(), next_slot: 0, scope_depth: 0, scope_stack: Vec::new(), loops: Vec::new() } } }
 
 impl Compiler {
     fn with_module_root(module_root: PathBuf) -> Self { Self { module_root: Some(module_root), ..Self::default() } }
@@ -1156,11 +1171,72 @@ impl Compiler {
         let saved_names = self.names.clone();
         let saved_next_slot = self.next_slot;
         self.scope_depth += 1;
+        self.scope_stack.push(ScopeContext::default());
         let result = body.into_iter().try_for_each(|statement| self.statement(statement));
+        if result.is_ok() { self.emit_current_scope_destructors()?; }
+        self.scope_stack.pop();
         self.scope_depth -= 1;
         self.names = saved_names;
         self.next_slot = saved_next_slot;
         result
+    }
+
+    /// A destructor is an optional zero-argument method with the same name as
+    /// its struct.  Structs without such a method keep their existing value
+    /// semantics and require no cleanup bytecode.
+    fn destructor_target(&self, struct_name: &str) -> Option<usize> {
+        self.methods.get(&(struct_name.to_owned(), struct_name.to_owned())).copied().flatten()
+    }
+
+    fn has_destructor_declaration(&self, struct_name: &str) -> bool {
+        self.methods.contains_key(&(struct_name.to_owned(), struct_name.to_owned()))
+    }
+
+    fn emit_destructor_call(&mut self, destructor: &DestructorLocal) {
+        let target = self.destructor_target(&destructor.struct_name).unwrap_or(usize::MAX);
+        let position = self.code.len();
+        self.code.push(Op::CallMethod(destructor.slot, target));
+        if target == usize::MAX {
+            self.pending_method_calls.push((position, destructor.struct_name.clone(), destructor.struct_name.clone()));
+        }
+    }
+
+    fn emit_destructor_sequence(&mut self, destructors: impl IntoIterator<Item = DestructorLocal>) {
+        for destructor in destructors {
+            self.code.push(Op::UntrackDestructor(destructor.slot));
+            self.emit_destructor_call(&destructor);
+        }
+    }
+
+    fn emit_current_scope_destructors(&mut self) -> Result<(), Error> {
+        let destructors = self.scope_stack.last()
+            .ok_or_else(|| Error::Runtime("missing compiler scope for destructors".into()))?
+            .destructors.iter().cloned().rev().collect::<Vec<_>>();
+        self.emit_destructor_sequence(destructors);
+        Ok(())
+    }
+
+    /// Emit cleanup for all lexical scopes that the control-flow edge leaves.
+    fn emit_destructors_from_scope(&mut self, scope_base: usize) -> Result<(), Error> {
+        let destructors = self.scope_stack.get(scope_base..)
+            .ok_or_else(|| Error::Runtime("invalid loop scope for destructors".into()))?
+            .iter().rev().flat_map(|scope| scope.destructors.iter().rev().cloned()).collect::<Vec<_>>();
+        self.emit_destructor_sequence(destructors);
+        Ok(())
+    }
+
+    fn track_destructor(&mut self, slot: usize, struct_name: &str) -> Result<(), Error> {
+        if !self.has_destructor_declaration(struct_name) { return Ok(()); }
+        let target = self.destructor_target(struct_name).unwrap_or(usize::MAX);
+        let position = self.code.len();
+        self.code.push(Op::TrackDestructor(slot, target));
+        if target == usize::MAX {
+            self.pending_method_calls.push((position, struct_name.to_owned(), struct_name.to_owned()));
+        }
+        self.scope_stack.last_mut()
+            .ok_or_else(|| Error::Runtime("missing compiler scope for destructor".into()))?
+            .destructors.push(DestructorLocal { slot, struct_name: struct_name.to_owned() });
+        Ok(())
     }
 
     fn binary_opcode(op: BinOp, ty: &Type) -> Result<BinaryOp, Error> {
@@ -1197,7 +1273,7 @@ impl Compiler {
         for (position, struct_name, method) in pending_calls {
             let target = self.methods.get(&(struct_name.clone(), method.clone())).copied().flatten().ok_or_else(|| Error::Type(format!("struct '{struct_name}' has no defined method '{method}'")))?;
             match self.code.get_mut(position) {
-                Some(Op::CallMethod(_, call_target)) | Some(Op::CallCurrentMethod(call_target)) => *call_target = target,
+                Some(Op::CallMethod(_, call_target)) | Some(Op::CallCurrentMethod(call_target)) | Some(Op::TrackDestructor(_, call_target)) => *call_target = target,
                 _ => return Err(Error::Runtime("invalid pending method call".into())),
             }
         }
@@ -1243,6 +1319,9 @@ impl Compiler {
         self.exports.insert(name, ModuleExport::Function { entry }); Ok(())
     }
     fn compile_method_body(&mut self, struct_name: &str, method_name: &str, args: Vec<(String, Type)>, body: Vec<Statement>) -> Result<(), Error> {
+        if method_name == struct_name && !args.is_empty() {
+            return Err(Error::Type(format!("destructor '{struct_name}' must not accept arguments")));
+        }
         let key = (struct_name.to_owned(), method_name.to_owned());
         match self.methods.get(&key) {
             Some(None) => {},
@@ -1259,7 +1338,9 @@ impl Compiler {
         let previous_struct = self.current_method_struct.replace(struct_name.to_owned());
         let saved_names = std::mem::take(&mut self.names);
         let saved_scope_depth = self.scope_depth;
+        let saved_scope_stack = std::mem::take(&mut self.scope_stack);
         self.scope_depth += 1;
+        self.scope_stack.push(ScopeContext::default());
         // Read the arguments and bind them to local variable slots
         for (arg_name, arg_ty) in args.into_iter().rev() {
             let slot = self.next_slot;
@@ -1268,9 +1349,12 @@ impl Compiler {
             self.code.push(Op::Store(slot));
         }
         let body_result = body.into_iter().try_for_each(|statement| self.statement(statement));
+        if body_result.is_ok() { self.emit_current_scope_destructors()?; }
+        self.scope_stack.pop();
         self.current_method_fields = previous_fields;
         self.current_method_struct = previous_struct;
         self.names = saved_names;
+        self.scope_stack = saved_scope_stack;
         // Method-local slots remain reserved in the VM's shared local store.
         // Reusing them for subsequently declared globals can overwrite a
         // method receiver or one of its locals during a call.
@@ -1296,6 +1380,9 @@ impl Compiler {
             }
             self.structs.insert(name.clone(), StructLayout { name: name.clone(), fields: layout_fields });
             for method in &methods {
+                if method.name == name && !method.args.is_empty() {
+                    return Err(Error::Type(format!("destructor '{name}' must not accept arguments")));
+                }
                 let key = (name.clone(), method.name.clone());
                 if self.methods.insert(key, None).is_some() {
                     return Err(Error::Type(format!("struct '{name}' defines method '{}' more than once", method.name)));
@@ -1343,6 +1430,7 @@ impl Compiler {
             let found = self.expr(expr, Some(&ty))?;
             if !types_compatible(&ty, &found) { return Err(Error::Type(format!("'{name}' declared {ty}, but expression has type {found}"))); }
 
+            let is_new_binding = !self.names.contains_key(&name);
             let slot = if let Some((existing_slot, existing_ty)) = self.names.get(&name) {
                 if existing_ty != &ty { return Err(Error::Type(format!("cannot redefine '{name}' with a different type"))); }
                 *existing_slot
@@ -1357,6 +1445,9 @@ impl Compiler {
             };
             if let Type::Module(module_id) = &found { self.import_exported_structs(&name, module_id)?; }
             self.code.push(Op::Store(slot));
+            if is_new_binding && self.scope_depth > 0 {
+                if let Type::Struct(struct_name) = found { self.track_destructor(slot, &struct_name)?; }
+            }
             Ok(())
         },
         Statement::Assign { name, expr } => { if let Some(field) = self.current_method_fields.as_ref().and_then(|fields| fields.get(&name)).cloned() { let found = self.expr(expr, Some(&field.ty))?; if found != field.ty { return Err(Error::Type(format!("field '{name}' is {}, but expression has type {found}", field.ty))); } self.code.push(Op::StoreCurrentField(Rc::new(field))); Ok(()) } else { let (slot, ty) = self.names.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))?; let found = self.expr(expr, Some(&ty))?; if found != ty { return Err(Error::Type(format!("'{name}' is {ty}, but expression has type {found}"))); } self.code.push(Op::Store(slot)); Ok(()) } },
@@ -1469,7 +1560,7 @@ impl Compiler {
             if ty != Type::Bool { return Err(Error::Type(format!("while condition must be bool, got {ty}"))); }
             let exit_jump = self.code.len();
             self.code.push(Op::JumpIfFalse(usize::MAX));
-            self.loops.push(LoopContext { break_jumps: Vec::new(), continue_jumps: Vec::new(), continue_target: loop_start });
+            self.loops.push(LoopContext { break_jumps: Vec::new(), continue_jumps: Vec::new(), continue_target: loop_start, scope_base: self.scope_stack.len() });
             self.scoped_block(body)?;
             self.code.push(Op::Jump(loop_start));
             let end = self.code.len();
@@ -1498,7 +1589,7 @@ impl Compiler {
             self.code.push(Op::Binary(BinaryOp::I32(BinOp::Le)));
             let exit_jump = self.code.len();
             self.code.push(Op::JumpIfFalse(usize::MAX));
-            self.loops.push(LoopContext { break_jumps: Vec::new(), continue_jumps: Vec::new(), continue_target: usize::MAX });
+            self.loops.push(LoopContext { break_jumps: Vec::new(), continue_jumps: Vec::new(), continue_target: usize::MAX, scope_base: self.scope_stack.len() });
             self.scoped_block(body)?;
             let increment_start = self.code.len();
             self.code.push(Op::Load(index_slot));
@@ -1517,17 +1608,19 @@ impl Compiler {
             Ok(())
         },
         Statement::Break => {
-            let context = self.loops.last_mut().ok_or_else(|| Error::Type("break is available only inside a loop".into()))?;
+            let scope_base = self.loops.last().ok_or_else(|| Error::Type("break is available only inside a loop".into()))?.scope_base;
+            self.emit_destructors_from_scope(scope_base)?;
             let jump = self.code.len();
             self.code.push(Op::Jump(usize::MAX));
-            context.break_jumps.push(jump);
+            self.loops.last_mut().expect("checked loop context").break_jumps.push(jump);
             Ok(())
         },
         Statement::Continue => {
-            let context = self.loops.last_mut().ok_or_else(|| Error::Type("continue is available only inside a loop".into()))?;
+            let scope_base = self.loops.last().ok_or_else(|| Error::Type("continue is available only inside a loop".into()))?.scope_base;
+            self.emit_destructors_from_scope(scope_base)?;
             let jump = self.code.len();
             self.code.push(Op::Jump(usize::MAX));
-            context.continue_jumps.push(jump);
+            self.loops.last_mut().expect("checked loop context").continue_jumps.push(jump);
             Ok(())
         },
     }
@@ -1779,6 +1872,13 @@ struct RegisteredExternal { signature: HostSignature, function: ExternalFunction
 struct FfiCall { arguments: Vec<Value>, results: Vec<Value> }
 
 struct ModuleInstance { artifact: ModuleArtifact, vm: Vm }
+
+/// A live local that has an L0 destructor.  Entries are added only after the
+/// initializer completed, so unwinding never calls a destructor for a partly
+/// constructed value.
+#[derive(Clone, Copy, Debug)]
+struct ActiveDestructor { slot: usize, target: usize }
+
 pub struct Vm {
     stack: Vec<Value>,
     stack_ptr: usize,
@@ -1792,16 +1892,25 @@ pub struct Vm {
     gc_owner: bool,
     callback_state: Option<*mut L0State>,
     random_state: u64,
+    active_destructors: Vec<ActiveDestructor>,
 }
 
 impl Default for Vm {
     fn default() -> Self {
-        Self { stack: vec![Value::Bool(false); 4096], stack_ptr: 0, locals: Vec::with_capacity(64), output: Vec::new(), interactive: false, input: VecDeque::new(), modules: HashMap::new(), extern_functions: HashMap::new(), heap: Rc::new(RefCell::new(Heap::default())), gc_owner: true, callback_state: None, random_state: 0x5EED_CAFE_D15C_A11E }
+        Self { stack: vec![Value::Bool(false); 4096], stack_ptr: 0, locals: Vec::with_capacity(64), output: Vec::new(), interactive: false, input: VecDeque::new(), modules: HashMap::new(), extern_functions: HashMap::new(), heap: Rc::new(RefCell::new(Heap::default())), gc_owner: true, callback_state: None, random_state: 0x5EED_CAFE_D15C_A11E, active_destructors: Vec::new() }
     }
 }
 
 impl Vm {
     fn with_shared_heap(heap: Rc<RefCell<Heap>>, extern_functions: HashMap<String, RegisteredExternal>, callback_state: Option<*mut L0State>) -> Self { Self { heap, extern_functions, gc_owner: false, callback_state, ..Self::default() } }
+
+    /// Controls whether output is written to stdout as it is produced.
+    ///
+    /// Interactive execution is required for programs that print a prompt and
+    /// then wait for standard input in the same run.
+    pub fn set_interactive(&mut self, interactive: bool) {
+        self.interactive = interactive;
+    }
 
     // A VM is single-threaded and a heap is never accessed re-entrantly by two
     // VMs.  Module VMs share the allocation domain, hence the Rc<RefCell<_>> at
@@ -2000,9 +2109,26 @@ impl Vm {
 
     fn run(&mut self, code: &FlatBytecode) -> Result<&[String], Error> { self.run_from(code, 0, false) }
 
-    fn run_from(&mut self, code: &FlatBytecode, mut pc: usize, terminal_return: bool) -> Result<&[String], Error> {
+    fn run_from(&mut self, code: &FlatBytecode, pc: usize, terminal_return: bool) -> Result<&[String], Error> {
+        match self.run_from_inner(code, pc, terminal_return, None) {
+            Ok(_) => Ok(&self.output),
+            Err(error) => {
+                self.unwind_destructors(code);
+                Err(error)
+            },
+        }
+    }
+
+    /// Best-effort cleanup after a runtime error.  The original runtime error
+    /// is retained even if a destructor itself fails while the VM unwinds.
+    fn unwind_destructors(&mut self, code: &FlatBytecode) {
+        while let Some(destructor) = self.active_destructors.pop() {
+            let _ = self.run_from_inner(code, destructor.target, true, Some(destructor.slot));
+        }
+    }
+
+    fn run_from_inner(&mut self, code: &FlatBytecode, mut pc: usize, terminal_return: bool, mut current_receiver: Option<usize>) -> Result<&[String], Error> {
         let mut call_stack: Vec<(usize, Option<usize>)> = Vec::new();
-        let mut current_receiver: Option<usize> = None;
 
         while pc < code.words.len() {
             let (instruction, next_pc) = code.decode(pc)?;
@@ -2237,6 +2363,17 @@ impl Vm {
             DecodedOp::CallMethod(receiver, target) => { call_stack.push((next_pc, current_receiver)); current_receiver = Some(receiver); pc = target; continue; },
             DecodedOp::CallCurrentMethod(target) => { let receiver = current_receiver.ok_or_else(|| Error::Runtime("this is available only inside a method".into()))?; call_stack.push((next_pc, current_receiver)); current_receiver = Some(receiver); pc = target; continue; },
             DecodedOp::CallModule(slot, name) => { self.call_module_function(slot, name.as_ref())?; },
+            DecodedOp::TrackDestructor(slot, target) => {
+                if !matches!(self.locals.get(slot), Some(Value::Struct(_, _))) {
+                    return Err(Error::Runtime("VM destructor slot invariant broken".into()));
+                }
+                self.active_destructors.push(ActiveDestructor { slot, target });
+            },
+            DecodedOp::UntrackDestructor(slot) => {
+                let position = self.active_destructors.iter().rposition(|destructor| destructor.slot == slot)
+                    .ok_or_else(|| Error::Runtime("VM destructor tracking invariant broken".into()))?;
+                self.active_destructors.remove(position);
+            },
             DecodedOp::Return => { if let Some((return_pc, previous_receiver)) = call_stack.pop() { current_receiver = previous_receiver; pc = return_pc; continue; } if terminal_return { return Ok(&self.output); } return Err(Error::Runtime("return outside method".into())); },
             DecodedOp::Print => { let value = self.pop()?; let text = self.format_value(&value)?; self.emit(text); },
             DecodedOp::Printf(num_args) => {
@@ -2344,7 +2481,10 @@ impl Vm {
         Ok(unsafe { self.pop_unchecked() })
     }
     fn emit(&mut self, s: String) {
-        if self.interactive { println!("{s}"); }
+        if self.interactive {
+            println!("{s}");
+            let _ = io::stdout().flush();
+        }
         self.output.push(s);
     }
 
@@ -2821,6 +2961,91 @@ mod immediate_regression_tests {
             execute("for i = 1, 2 do let temporary: i32 = i end print(i)"),
             Err(Error::Located { source, location: SourceLocation { line: 1, column: 50, .. } }) if matches!(&*source, Error::Type(message) if message == "unknown name 'i'")
         ));
+    }
+    #[test]
+    fn scope_test_covers_all_normal_raii_exit_paths() {
+        let expected = vec![
+            "RAII: declaration order", "block body", "drop 2", "drop 1",
+            "RAII: if then", "drop 3", "RAII: if else", "drop 4",
+            "RAII: nested scopes", "drop 6", "drop 5",
+            "RAII: while fallthrough", "drop 10", "drop 11",
+            "RAII: while continue", "drop 21", "drop 22",
+            "RAII: while break", "drop 30",
+            "RAII: nested break", "drop 41", "drop 40",
+            "RAII: for fallthrough", "drop 51", "drop 52",
+            "RAII: for continue", "drop 61", "drop 62",
+            "RAII: for break", "drop 66",
+            "RAII: method return", "method body", "drop 70",
+            "RAII: no destructor", "80", "RAII scope tests completed",
+        ].into_iter().map(str::to_owned).collect::<Vec<_>>();
+        let output = execute(include_str!("../examples/scope_tst.l0")).unwrap();
+        let raii_start = output.iter().position(|line| line == "RAII: declaration order")
+            .expect("scope test must reach the RAII section");
+        assert_eq!(&output[raii_start..], expected);
+    }
+    #[test]
+    fn runtime_error_unwinds_live_structs_in_reverse_order() {
+        let source = r#"
+            struct CrashGuard {
+                id: i32;
+                function CrashGuard() print(id) end
+            }
+            struct Crasher { function fail() end }
+            function Crasher::fail()
+                let outer: CrashGuard = CrashGuard { id = 90 }
+                if 1 == 1 then
+                    let inner: CrashGuard = CrashGuard { id = 91 }
+                    let zero: i32 = 0
+                    print(1 / zero)
+                end
+            end
+            let crasher: Crasher = Crasher { }
+            crasher.fail()
+        "#;
+        let mut vm = Vm::default();
+        assert!(matches!(vm.execute(source), Err(Error::Runtime(message)) if message.contains("division by zero")));
+        assert_eq!(vm.output, ["91", "90"]);
+        assert!(vm.active_destructors.is_empty());
+    }
+    #[test]
+    fn exported_function_drops_its_local_before_implicit_return() {
+        let source = r#"
+            struct ExportGuard {
+                function ExportGuard() print(100) end
+            }
+            export function work()
+                let guard: ExportGuard = ExportGuard { }
+                print(101)
+            end
+        "#;
+        let (program, strings) = Parser::new(lex(source).unwrap()).into_program().unwrap();
+        let artifact = Compiler::default().with_strings(strings).compile_module("test-module".into(), program).unwrap();
+        let ModuleExport::Function { entry } = artifact.exports.get("work").unwrap() else { panic!("missing exported function") };
+        let mut vm = Vm::default();
+        assert_eq!(vm.run_from(&artifact.code, *entry, true).unwrap(), ["101", "100"]);
+    }
+    #[test]
+    fn destructor_cannot_accept_arguments() {
+        assert!(matches!(
+            execute("struct Invalid { function Invalid(value: i32) end }"),
+            Err(Error::Located { source, .. }) if matches!(&*source, Error::Type(message) if message == "destructor 'Invalid' must not accept arguments")
+        ));
+    }
+    #[test]
+    fn failed_initializer_does_not_register_or_destroy_a_partial_struct() {
+        let source = r#"
+            struct PartialGuard {
+                id: i32;
+                function PartialGuard() print(id) end
+            }
+            if 1 == 1 then
+                let guard: PartialGuard = PartialGuard { id = 1 / 0 }
+            end
+        "#;
+        let mut vm = Vm::default();
+        assert!(matches!(vm.execute(source), Err(Error::Runtime(message)) if message.contains("division by zero")));
+        assert!(vm.output.is_empty());
+        assert!(vm.active_destructors.is_empty());
     }
     #[test]
     fn methods_are_isolated_and_can_explicitly_access_globals() {
