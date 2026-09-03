@@ -1381,7 +1381,7 @@ impl Compiler {
             } else {
                 self.names.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))?
             };
-            
+
             match container_ty {
                 Type::Array(inner) => {
                     if indices.len() != 1 { return Err(Error::Type("vector indexing requires exactly one index".into())); }
@@ -1407,7 +1407,7 @@ impl Compiler {
                 _ => Err(Error::Type(format!("'{name}' is not indexable"))),
             }
         },
-        Statement::SetField { name, field, expr } => { 
+        Statement::SetField { name, field, expr } => {
             let (slot, ty) = if let Some(method_field) = self.current_method_fields.as_ref().and_then(|fields| fields.get(&name)).cloned() {
                 let temp_slot = self.next_slot;
                 self.next_slot += 1;
@@ -1417,28 +1417,28 @@ impl Compiler {
             } else {
                 self.names.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))?
             };
-            
-            match ty { 
-                Type::Struct(struct_name) => { 
-                    let layout = self.structs.get(&struct_name).ok_or_else(|| Error::Type(format!("unknown struct '{struct_name}'")))?; 
-                    let field = layout.fields.iter().find(|candidate| candidate.name == field).cloned().ok_or_else(|| Error::Type(format!("struct '{struct_name}' has no field '{field}'")))?; 
-                    let found = self.expr(expr, Some(&field.ty))?; 
-                    if found != field.ty { return Err(Error::Type("struct field type mismatch".into())); } 
-                    self.code.push(Op::StoreField(slot, Rc::new(field))); 
-                    Ok(()) 
-                }, 
-                Type::Table(element) => { 
-                    let element = *element; 
-                    let found = self.expr(expr, Some(&element))?; 
-                    if found != element { return Err(Error::Type("table value type mismatch".into())); } 
-                    let field = self.intern_name(&field); 
-                    self.code.push(Op::StoreTableField(slot, field, Rc::new(element))); 
-                    Ok(()) 
-                }, 
-                _ => Err(Error::Type(format!("'{name}' has no named keys"))), 
-            } 
+
+            match ty {
+                Type::Struct(struct_name) => {
+                    let layout = self.structs.get(&struct_name).ok_or_else(|| Error::Type(format!("unknown struct '{struct_name}'")))?;
+                    let field = layout.fields.iter().find(|candidate| candidate.name == field).cloned().ok_or_else(|| Error::Type(format!("struct '{struct_name}' has no field '{field}'")))?;
+                    let found = self.expr(expr, Some(&field.ty))?;
+                    if found != field.ty { return Err(Error::Type("struct field type mismatch".into())); }
+                    self.code.push(Op::StoreField(slot, Rc::new(field)));
+                    Ok(())
+                },
+                Type::Table(element) => {
+                    let element = *element;
+                    let found = self.expr(expr, Some(&element))?;
+                    if found != element { return Err(Error::Type("table value type mismatch".into())); }
+                    let field = self.intern_name(&field);
+                    self.code.push(Op::StoreTableField(slot, field, Rc::new(element)));
+                    Ok(())
+                },
+                _ => Err(Error::Type(format!("'{name}' has no named keys"))),
+            }
         },
-        Statement::SetFieldIndex { name, field, index, expr } => { 
+        Statement::SetFieldIndex { name, field, index, expr } => {
             let (slot, ty) = if let Some(method_field) = self.current_method_fields.as_ref().and_then(|fields| fields.get(&name)).cloned() {
                 let temp_slot = self.next_slot;
                 self.next_slot += 1;
@@ -1448,18 +1448,18 @@ impl Compiler {
             } else {
                 self.names.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))?
             };
-            
-            let Type::Struct(struct_name) = ty else { return Err(Error::Type(format!("'{name}' is not a struct"))); }; 
-            let layout = self.structs.get(&struct_name).ok_or_else(|| Error::Type(format!("unknown struct '{struct_name}'")))?; 
-            let field = layout.fields.iter().find(|candidate| candidate.name == field).cloned().ok_or_else(|| Error::Type(format!("struct '{struct_name}' has no field '{field}'")))?; 
-            let Type::Array(element) = field.ty.clone() else { return Err(Error::Type(format!("field '{}' is not a vector", field.name))); }; 
-            let element = *element; scalar_size(&element)?; 
-            let index_ty = self.expr(index, None)?; 
-            if !matches!(index_ty, Type::I8|Type::I16|Type::I32|Type::I64|Type::U8|Type::U16|Type::U32|Type::U64) { return Err(Error::Type("index must be an integer".into())); } 
-            let found = self.expr(expr, Some(&element))?; 
-            if found != element { return Err(Error::Type(format!("item is {found}; expected {element}"))); } 
-            self.code.push(Op::StoreFieldIndex(slot, Rc::new(field), Rc::new(element))); 
-            Ok(()) 
+
+            let Type::Struct(struct_name) = ty else { return Err(Error::Type(format!("'{name}' is not a struct"))); };
+            let layout = self.structs.get(&struct_name).ok_or_else(|| Error::Type(format!("unknown struct '{struct_name}'")))?;
+            let field = layout.fields.iter().find(|candidate| candidate.name == field).cloned().ok_or_else(|| Error::Type(format!("struct '{struct_name}' has no field '{field}'")))?;
+            let Type::Array(element) = field.ty.clone() else { return Err(Error::Type(format!("field '{}' is not a vector", field.name))); };
+            let element = *element; scalar_size(&element)?;
+            let index_ty = self.expr(index, None)?;
+            if !matches!(index_ty, Type::I8|Type::I16|Type::I32|Type::I64|Type::U8|Type::U16|Type::U32|Type::U64) { return Err(Error::Type("index must be an integer".into())); }
+            let found = self.expr(expr, Some(&element))?;
+            if found != element { return Err(Error::Type(format!("item is {found}; expected {element}"))); }
+            self.code.push(Op::StoreFieldIndex(slot, Rc::new(field), Rc::new(element)));
+            Ok(())
         },
         Statement::Print(expr) => { self.expr(expr, None)?; self.code.push(Op::Print); Ok(()) },
         Statement::Printf { format, args } => {

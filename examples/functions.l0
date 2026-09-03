@@ -1,6 +1,6 @@
 struct Board {
     size: i8;
- 
+
     function grow() end
 
     function show_board()

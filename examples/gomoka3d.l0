@@ -42,10 +42,10 @@ printf("Игровое поле замкнуто! Линии проходят с
 while active do
     if player == 1 then
         printf("\n--- ТЕКУЩЕЕ ПОЛЕ (ПРОЗРАЧНЫЙ КАРКАС) ---\n")
-        
+
         -- Слегка уменьшенная высота экрана для лучшего вмещения в терминал
         let screen: tensor<i8, 2> = zeros<i8>([38, 80])
-        
+
         let sr: i32 = 0
         while sr < 38 do
             let sc: i32 = 0
@@ -66,50 +66,50 @@ while active do
                     let is_node_x: bool = vhx % 2 == 0
                     let is_node_y: bool = vhy % 2 == 0
                     let is_node_z: bool = vhz % 2 == 0
-                    
+
                     let nodes_count: i32 = 0
                     if is_node_x then nodes_count = nodes_count + 1 end
                     if is_node_y then nodes_count = nodes_count + 1 end
                     if is_node_z then nodes_count = nodes_count + 1 end
-                    
+
                     let char_to_draw: i8 = 32
                     let draw: bool = 1 == 0
-                    
+
                     if nodes_count == 3 then
                         -- Вычисление физической координаты для текущего узла
                         let px: i32 = (ox + (vhx / 2) * rx + (vhy / 2) * dx_v + (vhz / 2) * fx + 210) % 7
                         let py: i32 = (oy + (vhx / 2) * ry + (vhy / 2) * dy_v + (vhz / 2) * fy + 210) % 7
                         let pz: i32 = (oz + (vhx / 2) * rz + (vhy / 2) * dz_v + (vhz / 2) * fz + 210) % 7
-                        
+
                         let val: i8 = board[pz, py, px]
-                        if val == 1 then 
+                        if val == 1 then
                             char_to_draw = 88 -- 'X'
                             draw = 1 == 1
-                        elseif val == 2 then 
+                        elseif val == 2 then
                             char_to_draw = 79 -- 'O'
                             draw = 1 == 1
                         end
                         -- Пустые узлы остаются прозрачными (char_to_draw = 32)
                     elseif nodes_count == 2 then
-                        if !is_node_x then 
+                        if !is_node_x then
                             char_to_draw = 45 -- '-'
-                            draw = 1 == 1 
-                        elseif !is_node_y then 
+                            draw = 1 == 1
+                        elseif !is_node_y then
                             char_to_draw = 124 -- '|'
-                            draw = 1 == 1 
-                        elseif !is_node_z then 
+                            draw = 1 == 1
+                        elseif !is_node_z then
                             char_to_draw = 47 -- '/'
-                            draw = 1 == 1 
+                            draw = 1 == 1
                         end
                     end
-                    
+
                     if draw then
                         let scr_c: i32 = 4 + vhx * 4 + vhz * 2
                         let scr_r: i32 = 13 + vhy * 2 - vhz * 1
-                        
+
                         if scr_r >= 0 && scr_r < 38 && scr_c >= 0 && scr_c < 80 then
                             screen[scr_r, scr_c] = char_to_draw
-                            
+
                             -- Заполняем пустоты для сплошных линий между узлами
                             if nodes_count == 2 && !is_node_x then
                                 if scr_c - 3 >= 0 then screen[scr_r, scr_c - 3] = 45 end
@@ -140,7 +140,7 @@ while active do
                 putc(screen[sr, sc])
                 sc = sc + 1
             end
-            
+
             -- Выводим элементы меню на конкретных строках (справа от куба)
             if sr == 5 then printf("   --- МЕНЮ (Ваш ход) ---") end
             if sr == 7 then printf("   1 - Сделать ход") end
@@ -150,14 +150,14 @@ while active do
             if sr == 11 then printf("   5 - Наклонить вниз") end
             if sr == 12 then printf("   6 - Прокрутить слои к себе (вглубь)") end
             if sr == 13 then printf("   7 - Прокрутить слои от себя (наружу)") end
-            
+
             putc(10)
             sr = sr + 1
         end
-        
+
         printf("Ваш выбор: ")
         let action: i32 = input
-        
+
         if action == 1 then
             printf("Введите колонку (X, 0 - слева, 6 - справа): ")
             let in_x: i32 = input
@@ -281,7 +281,7 @@ while active do
                     if board[cand_z, cand_y, cand_x] == 0 then
                         let score: i32 = 0
                         let dir: i32 = 0
-                        
+
                         while dir < 13 do
                             -- Симуляция постановки камня ИИ
                             let c_ai: i32 = 1
@@ -363,7 +363,7 @@ while active do
         let found_vx: i32 = -1
         let found_vy: i32 = -1
         let found_vz: i32 = -1
-        
+
         let svz: i32 = 0
         while svz <= 6 do
             let svy: i32 = 0

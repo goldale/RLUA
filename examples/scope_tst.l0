@@ -1,0 +1,114 @@
+-- examples/scope_tst.l0
+-- Тестирование областей видимости (scope), доступа к глобальным переменным,
+-- затенения и работы с методами (передача параметров через поля структуры).
+
+-- 1. Глобальные переменные
+let global_counter: i32 = 10
+let global_factor: f32 = 2.5
+
+-- 2. Структура A
+struct DataPacket {
+    id: i32;
+    payload: f32;
+    is_valid: bool;
+
+    -- Метод без параметров
+    function print_packet() end
+}
+
+-- Реализация метода out-of-line
+function DataPacket::print_packet()
+    printf("Packet [ID: {}, Payload: {}, Valid: {}]\n", id, payload, is_valid)
+end
+
+-- 3. Структура B
+struct Processor {
+    cpu_cores: i32;
+    processed_count: i32;
+
+    -- Поля-аргументы для метода process_packet (заменяют параметры функции)
+    target_id: i32;
+    target_payload: f32;
+    target_valid: bool;
+
+    function process_packet()
+        if target_valid then
+            printf("Processing packet {} on {} cores...\n", target_id, cpu_cores)
+
+            -- Чтение собственного поля и глобальной переменной
+            let factored_payload: f32 = target_payload * ::global_factor
+            printf("Factored payload: {}\n", factored_payload)
+
+            -- Изменение глобальной переменной через оператор ::
+            ::global_counter = ::global_counter + 1
+
+            -- Изменение собственного поля
+            processed_count = processed_count + 1
+        else
+            printf("Packet {} is invalid, skipping.\n", target_id)
+        end
+    end
+
+    function print_stats()
+        printf("Processor stats: Cores = {}, Processed = {}\n", cpu_cores, processed_count)
+        -- Чтение глобальной переменной
+        printf("Global counter is now: {}\n", ::global_counter)
+    end
+}
+
+printf("=== СТРУКТУРЫ И ГЛОБАЛЬНЫЙ SCOPE ===\n")
+
+let packet: DataPacket = DataPacket { id = 101, payload = 10.0, is_valid = 1 == 1 }
+packet.print_packet()
+
+let proc: Processor = Processor {
+    cpu_cores = 4,
+    processed_count = 0,
+    target_id = 0,
+    target_payload = 0.0,
+    target_valid = 1 == 0
+}
+
+-- Имитируем передачу параметров: задаем поля перед вызовом метода
+proc.target_id = packet.id
+proc.target_payload = packet.payload
+proc.target_valid = packet.is_valid
+proc.process_packet()
+
+printf("---\n")
+
+-- Имитируем вызов с другими "параметрами"
+proc.target_id = 102
+proc.target_payload = -5.0
+proc.target_valid = 1 == 0
+proc.process_packet()
+
+printf("---\n")
+proc.print_stats()
+
+printf("\n=== БЛОЧНЫЙ SCOPE (IF) ===\n")
+let block_var: i32 = 999
+
+if 1 == 1 then
+    -- Затенение (shadowing) переменной во вложенном скоупе
+    let block_var: i32 = 111
+    let inner_var: i32 = 222
+    printf("Inside IF: block_var = {}, inner_var = {}\n", block_var, inner_var)
+
+    -- Обращение к глобальной переменной
+    printf("Global counter inside IF = {}\n", ::global_counter)
+end
+
+-- Переменная inner_var здесь недоступна, а block_var восстанавливает своё старое значение
+printf("Outside IF: block_var = {} (expected 999)\n", block_var)
+
+printf("\n=== БЛОЧНЫЙ SCOPE (FOR) ===\n")
+let sum: i32 = 0
+for i = 1, 3 do
+    -- Переменные i и loop_var существуют только внутри области видимости цикла
+    let loop_var: i32 = i * 10
+    sum = sum + loop_var
+    printf("Loop i={}: loop_var={}, sum={}\n", i, loop_var, sum)
+end
+
+printf("\nScope tests completed successfully!\n")
