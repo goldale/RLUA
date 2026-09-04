@@ -1,0 +1,24 @@
+printf("=== ТЕСТ CANDLE: СЛОЙ L0 И УМНОЖЕНИЕ МАТРИЦ ===\n")
+
+-- 1. Создаем веса слоя (матрица 3x4)
+let weights_matrix: tensor<f16, 2> = zeros<f16>([3, 4])
+weights_matrix[0, 0] = 1.0; weights_matrix[0, 1] = 2.0; weights_matrix[0, 2] = 3.0; weights_matrix[0, 3] = 4.0;
+weights_matrix[1, 0] = 2.0; weights_matrix[1, 1] = 0.0; weights_matrix[1, 2] = -1.0; weights_matrix[1, 3] = 1.0;
+weights_matrix[2, 0] = -1.0; weights_matrix[2, 1] = 1.0; weights_matrix[2, 2] = 1.0; weights_matrix[2, 3] = 0.0;
+
+let w_dyn: dTensor = weights_matrix
+
+-- 2. Входной вектор (4 элемента)
+let input_data: vector<f16> = [0.5, 1.0, 1.5, 0.0]
+let in_dyn: dArray = input_data
+
+-- 3. Вызываем наш новый candle_l0_layer
+printf("Вычисляем candle_l0_layer (Weights x Input) на GPU...\n")
+let out_dyn: dArray = candle_l0_layer(w_dyn, in_dyn)
+
+let out_vector: vector<f16> = out_dyn
+
+printf("Результат (вектор из 3 элементов):\n")
+printf("[0]: {}\n", out_vector[0])
+printf("[1]: {}\n", out_vector[1])
+printf("[2]: {}\n", out_vector[2])

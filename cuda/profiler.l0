@@ -1,0 +1,120 @@
+-- profiler.l0
+struct Math1D {
+    arr: tensor<f32, 1>;
+    result: tensor<f32, 1>;
+    start_idx: i32;
+    end_idx: i32;
+    -- Поле для возврата результата из argmax
+    best_idx: i32;
+    function diff2_abs_pad()
+        let n: i32 = len(arr)
+        -- Вместо return используем if для управления потоком выполнения
+        if n >= 3 then
+            let i: i32 = 1
+            while i < n - 1 do
+                let d: f32 = arr[i + 1] - (2.0 * arr[i]) + arr[i - 1]
+                result[i] = abs(d)
+                i = i + 1
+            end
+
+            result[0] = result[1]
+            result[n - 1] = result[n - 2]
+        end
+    end
+    function argmax()
+        best_idx = start_idx
+        let max_val: f32 = arr[start_idx]
+        let i: i32 = start_idx + 1
+        while i < end_idx do
+            if arr[i] > max_val then
+                max_val = arr[i]
+                best_idx = i
+            end
+            i = i + 1
+        end
+    end
+}
+
+struct ProfilerConfig {
+    min_separation: i32;
+    min_curvature: f32;
+    l_mem: i32;
+    l_comm: i32;
+    entropies: tensor<f32, 1>;
+    curvature: tensor<f32, 1>;
+    start_idx: i32;
+    end_idx: i32;
+    -- Поле для сохранения найденного пика
+    selected_peak: i32;
+    function select_peak()
+        let math: Math1D = Math1D {
+            arr = curvature,
+            result = curvature, -- В argmax не используется, передаем как заглушку
+            start_idx = start_idx,
+            end_idx = end_idx,
+            best_idx = 0
+        }
+        math.argmax()
+        let candidate: i32 = math.best_idx
+
+        if curvature[candidate] >= min_curvature then
+            selected_peak = candidate
+        else
+            printf("Warning: No pronounced entropy elbow; using window midpoint\n")
+            selected_peak = (start_idx + end_idx - 1) / 2
+        end
+    end
+    function find_layers()
+        let num_layers: i32 = len(entropies)
+	curvature = zeros<f32>([num_layers as u64])
+        let math: Math1D = Math1D {
+            arr = entropies,
+            result = curvature,
+            start_idx = 0,
+            end_idx = 0,
+            best_idx = 0
+        }
+        math.diff2_abs_pad()
+        let mem_start: i32 = (20 * num_layers) / 100
+        let mem_end: i32 = (45 * num_layers) / 100
+        let comm_start: i32 = (55 * num_layers) / 100
+        let comm_end: i32 = (80 * num_layers) / 100
+
+        start_idx = mem_start
+        end_idx   = mem_end
+        this.select_peak()
+        l_mem = selected_peak
+
+        let safe_comm_start: i32 = l_mem + min_separation + 1
+        if safe_comm_start > comm_start then
+            comm_start = safe_comm_start
+        end
+        start_idx = comm_start
+        end_idx   = comm_end
+        this.select_peak()
+        l_comm = selected_peak
+
+        printf("Selected Memory Layer (l_mem): {}\n", l_mem)
+        printf("Selected Comm Layer (l_comm): {}\n", l_comm)
+    end
+}
+-- Имитируем список посчитанных энтропий через 1D-тензор
+let mock_entropies: tensor<f32, 1> = zeros<f32>([32])
+mock_entropies[8]  = 0.5
+mock_entropies[20] = 0.8
+
+-- Создаем тензор-заглушку, структура требует инициализации полей
+let dummy_curvature: tensor<f32, 1> = zeros<f32>([1])
+
+let layer_finder: ProfilerConfig = ProfilerConfig {
+    min_separation = 2,
+    min_curvature = 0.001,
+    l_mem = 0,
+    l_comm = 0,
+    entropies = mock_entropies,
+    curvature = dummy_curvature,
+    start_idx = 0,
+    end_idx = 0,
+    selected_peak = 0
+}
+layer_finder.find_layers()

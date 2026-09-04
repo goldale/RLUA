@@ -1,5 +1,4 @@
 -- examples/gc_test.l0
-
 printf("Начало стресс-теста сборщика мусора...\n")
 let i: i64 = 0
 let dummy_string: string = "init"

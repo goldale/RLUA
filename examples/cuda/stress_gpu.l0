@@ -1,0 +1,26 @@
+-- cuda/stress_gpu.l0
+printf("========== ТЕСТ 1: МАССИВНЫЕ ТЕНЗОРЫ И ПРОПУСКНАЯ СПОСОБНОСТЬ ==========\n")
+
+let dim: u64 = 12000
+printf("Создаем две случайные матрицы f32 размером {}x{}...\n", dim, dim)
+let a_cpu: tensor<f32, 2> = random<f32>([dim, dim])
+let b_cpu: tensor<f32, 2> = random<f32>([dim, dim])
+
+-- Приводим к динамическому типу для передачи во внешние функции
+let da_cpu: dTensor = a_cpu
+let db_cpu: dTensor = b_cpu
+
+printf("Отправляем тензоры в VRAM (Host-To-Device)...\n")
+let a_gpu: dCudaTensor = to_cuda(da_cpu)
+let b_gpu: dCudaTensor = to_cuda(db_cpu)
+
+printf("Запускаем аппаратное вычитание cuda_sub на GPU...\n")
+let out_gpu: dCudaTensor = cuda_sub(a_gpu, b_gpu)
+
+printf("Забираем результат обратно (Device-To-Host)...\n")
+let out_cpu: dTensor = to_cpu(out_gpu)
+
+printf("Считаем сумму элементов результата на CPU (проверка)...\n")
+let sum_val: f32 = t_sum(out_cpu)
+printf("Итоговая сумма: {}\n", sum_val)
+printf("Успешно!\n\n")

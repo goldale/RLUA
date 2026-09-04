@@ -1,0 +1,29 @@
+-- Тест вычисления SVD на видеокарте для матрицы 10000x10000
+printf("========== SVDVALS CUDA ТЕСТ ==========\n")
+
+let dim: u64 = 10000
+printf("Создаем матрицу f32 размером {}x{} на CPU...\n", dim, dim)
+let cpu_matrix: tensor<f32, 2> = random<f32>([dim, dim])
+let dyn_cpu: dTensor = cpu_matrix
+
+-- 1. Отправляем матрицу в видеопамять (Host-To-Device)[cite: 1]
+-- Передается около 400 Мегабайт данных
+printf("Отправляем тензор в VRAM...\n")
+let gpu_matrix: dCudaTensor = to_cuda(dyn_cpu)
+
+-- 2. Выполняем SVD полностью на GPU
+-- Видеокарте потребуется выделить еще workspace-память, но GC её потом очистит[cite: 1]
+printf("Вычисляем сингулярные числа через cuSOLVER (GPU)...\n")
+let gpu_singular_values: dCudaTensor = svdvals_cuda(gpu_matrix)
+
+-- 3. Возвращаем результат обратно на процессор (Device-To-Host)[cite: 1]
+printf("Забираем результат (10000 чисел) обратно на CPU...\n")
+let cpu_singular_values: dTensor = to_cpu(gpu_singular_values)
+let final_sv: tensor<f32, 1> = cpu_singular_values
+
+let sv_len: i32 = len(final_sv)
+
+printf("Успешно!\n")
+printf("Всего найдено сингулярных чисел: {}\n", sv_len)
+printf("Наибольшее число (индекс 0): {}\n", final_sv[0])
+printf("Число посередине (индекс 5000): {}\n", final_sv[sv_len / 2])

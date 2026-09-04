@@ -1,0 +1,32 @@
+-- cuda/verify_math.l0
+printf("========== ТЕСТ 2: ПРОВЕРКА КОРРЕКТНОСТИ CUDA ЯДРА ==========\n")
+
+let num_elements: u64 = 100000
+let t_zeros: tensor<f32, 1> = zeros<f32>([num_elements])
+
+-- Создаем массив пятерок: 0.0 + 5.0
+let cpu_5: dTensor = t_scalar_add(t_zeros, 5.0)
+-- Создаем массив двоек: 0.0 + 2.0
+let cpu_2: dTensor = t_scalar_add(t_zeros, 2.0)
+
+printf("Данные готовы. Отправка в VRAM...\n")
+let gpu_5: dCudaTensor = to_cuda(cpu_5)
+let gpu_2: dCudaTensor = to_cuda(cpu_2)
+
+printf("GPU вычисляет: 5.0 - 2.0 ...\n")
+let gpu_result: dCudaTensor = cuda_go(gpu_5, gpu_2)
+
+printf("Возвращаем в CPU и приводим к строгому типу vector<f32>...\n")
+let final_dyn: dTensor = to_cpu(gpu_result)
+let final_typed: tensor<f32, 1> = final_dyn
+
+printf("Ожидаемый ответ: 3.0\n")
+printf("Элемент [0]: {}\n", final_typed[0])
+printf("Элемент [50000]: {}\n", final_typed[50000])
+printf("Элемент [99999]: {}\n", final_typed[99999])
+
+if final_typed[0] == 3.0 && final_typed[99999] == 3.0 then
+    printf("МАТЕМАТИКА НА GPU РАБОТАЕТ ИДЕАЛЬНО!\n\n")
+else
+    printf("ОШИБКА В ВЫЧИСЛЕНИЯХ!\n\n")
+end

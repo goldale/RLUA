@@ -1,0 +1,29 @@
+-- Тест функции svdvals для большой матрицы 10000x10000
+printf("Начинаем аллокацию памяти для тензора 10000x10000...\n")
+
+-- 1. Создаем матрицу случайных чисел f32 с помощью фабрики random
+let dim: u64 = 8000
+let large_matrix: tensor<f32, 2> = random<f32>([dim, dim])
+
+-- 2. Приводим матрицу к динамическому типу dTensor (Upcast)
+-- Это необходимо, так как Rust-функция svdvals ожидает аргумент типа dTensor.
+let dyn_matrix: dTensor = large_matrix
+
+printf("Матрица успешно создана в куче. Запускаем svdvals (это может занять много времени)...\n")
+
+-- 3. Вызываем функцию svdvals, которая вычисляет сингулярные числа в Rust и возвращает dTensor
+let dyn_singular_values: dTensor = svdvals(dyn_matrix)
+
+-- 4. Приводим результат обратно к строгому типу 1D-тензора (Downcast) для чтения
+let singular_values: tensor<f32, 1> = dyn_singular_values
+
+-- 5. Извлекаем размер результата с помощью встроенной функции len[cite: 1]
+let sv_len: i32 = len(singular_values)
+
+printf("Вычисление SVD успешно завершено!\n")
+printf("Всего найдено сингулярных чисел: {}\n", sv_len)
+
+-- Выводим несколько значений для проверки
+printf("Наибольшее сингулярное число: {}\n", singular_values[0])
+printf("Сингулярное число в середине: {}\n", singular_values[sv_len / 2])
+printf("Наименьшее сингулярное число: {}\n", singular_values[sv_len - 1])
