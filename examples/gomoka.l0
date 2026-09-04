@@ -7,16 +7,21 @@ let player: i8 = 1
 let last_r: i32 = 10
 let last_c: i32 = 10
 
--- Направления для проверки выигрыша и эвристики ИИ (горизонталь, вертикаль, диагональ 1, диагональ 2)
+-- Направления для проверки выигрыша и эвристики ИИ
 let chk_dr: vector<i32> = [0, 1, 1, 1]
 let chk_dc: vector<i32> = [1, 0, 1, -1]
+
+-- Смещения для визуального центрирования (прокрутки) доски
+let view_r: i32 = 0
+let view_c: i32 = 0
 
 while active do
     putc(10)
     putc(32) putc(32)
     let ch: i32 = 0
     while ch < 21 do
-        putc(labels[ch])
+        let actual_c: i32 = (ch + view_c) % 21
+        putc(labels[actual_c])
         putc(32)
         ch = ch + 1
     end
@@ -24,11 +29,13 @@ while active do
 
     let r_p: i32 = 0
     while r_p < 21 do
-        putc(labels[r_p])
+        let actual_r: i32 = (r_p + view_r) % 21
+        putc(labels[actual_r])
         putc(32)
         let c_p: i32 = 0
         while c_p < 21 do
-            let val: i8 = board[r_p, c_p]
+            let actual_c: i32 = (c_p + view_c) % 21
+            let val: i8 = board[actual_r, actual_c]
             if val == 0 then putc(46) end
             if val == 1 then putc(88) end
             if val == 2 then putc(79) end
@@ -41,56 +48,80 @@ while active do
     putc(10)
 
     if player == 1 then
-        putc(80) putc(49) putc(32) putc(82) putc(58) putc(32)
-        let row: i32 = input
-        putc(67) putc(58) putc(32)
-        let col: i32 = input
+        printf("\n--- МЕНЮ ---\n")
+        printf("1 - Сделать ход\n")
+        printf("8 - Сдвинуть вверх   (на 1)\n")
+        printf("2 - Сдвинуть вниз    (на 1)\n")
+        printf("4 - Сдвинуть влево   (на 1)\n")
+        printf("6 - Сдвинуть вправо  (на 1)\n")
+        printf("Действие: ")
+        let action: i32 = input
 
-        -- Тороидальное замыкание координат для игрока
-        row = (row % 21 + 21) % 21
-        col = (col % 21 + 21) % 21
+        if action == 1 then
+            putc(80) putc(49) putc(32) putc(82) putc(58) putc(32)
+            let row: i32 = input
+            putc(67) putc(58) putc(32)
+            let col: i32 = input
 
-        if board[row, col] == 0 then
-            board[row, col] = 1
-            last_r = row
-            last_c = col
+            -- Тороидальное замыкание координат для игрока
+            row = (row % 21 + 21) % 21
+            col = (col % 21 + 21) % 21
 
-            -- Проверка на победу (Игрок 1)
-            let win: bool = 1 == 0
-            let dir: i32 = 0
-            while dir < 4 do
-                let count: i32 = 1
+            if board[row, col] == 0 then
+                board[row, col] = 1
+                last_r = row
+                last_c = col
 
-                let step: i32 = 1
-                let stop: bool = 1 == 0
-                while step <= 4 && stop == (1 == 0) do
-                    let cr: i32 = (last_r + chk_dr[dir] * step + 105) % 21
-                    let cc: i32 = (last_c + chk_dc[dir] * step + 105) % 21
-                    if board[cr, cc] == 1 then count = count + 1 else stop = 1 == 1 end
-                    step = step + 1
+                -- Проверка на победу (Игрок 1)
+                let win: bool = 1 == 0
+                let dir: i32 = 0
+                while dir < 4 do
+                    let count: i32 = 1
+
+                    let step: i32 = 1
+                    let stop: bool = 1 == 0
+                    while step <= 4 && stop == (1 == 0) do
+                        let cr: i32 = (last_r + chk_dr[dir] * step + 105) % 21
+                        let cc: i32 = (last_c + chk_dc[dir] * step + 105) % 21
+                        if board[cr, cc] == 1 then count = count + 1 else stop = 1 == 1 end
+                        step = step + 1
+                    end
+
+                    step = 1
+                    stop = 1 == 0
+                    while step <= 4 && stop == (1 == 0) do
+                        let cr: i32 = (last_r - chk_dr[dir] * step + 105) % 21
+                        let cc: i32 = (last_c - chk_dc[dir] * step + 105) % 21
+                        if board[cr, cc] == 1 then count = count + 1 else stop = 1 == 1 end
+                        step = step + 1
+                    end
+
+                    if count >= 5 then win = 1 == 1 end
+                    dir = dir + 1
                 end
 
-                step = 1
-                stop = 1 == 0
-                while step <= 4 && stop == (1 == 0) do
-                    let cr: i32 = (last_r - chk_dr[dir] * step + 105) % 21
-                    let cc: i32 = (last_c - chk_dc[dir] * step + 105) % 21
-                    if board[cr, cc] == 1 then count = count + 1 else stop = 1 == 1 end
-                    step = step + 1
+                if win then
+                    printf("\n★★★ ВЫ ПОБЕДИЛИ! ★★★\n")
+                    active = 1 == 0
+                else
+                    player = 2
                 end
-
-                if count >= 5 then win = 1 == 1 end
-                dir = dir + 1
-            end
-
-            if win then
-                printf("\n★★★ ВЫ ПОБЕДИЛИ! ★★★\n")
-                active = 1 == 0
             else
-                player = 2
+                putc(88) putc(88) putc(10)
+                printf("Ошибка: эта ячейка уже занята!\n")
             end
+        elseif action == 8 then
+            -- Теперь 8 двигает доску вверх (смещаем окно вниз)
+            view_r = (view_r + 1) % 21
+        elseif action == 2 then
+            -- Теперь 2 двигает доску вниз (смещаем окно вверх)
+            view_r = (view_r - 1 + 21) % 21
+        elseif action == 4 then
+            view_c = (view_c - 1 + 21) % 21
+        elseif action == 6 then
+            view_c = (view_c + 1) % 21
         else
-            putc(88) putc(88) putc(10)
+            printf("Неверная команда!\n")
         end
     else
         putc(65) putc(73) putc(46) putc(46) putc(10)

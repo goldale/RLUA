@@ -75,10 +75,8 @@ fn main() -> Result<(), Error> {
 
     // Регистрация функции для string
     vm.register_rust_function(
-        "md5_string",
-        vec![Type::String],
-        Type::String,
-        md5_string,
+        "md5_string", vec![Type::String],
+        Type::String, md5_string,
     )?;
 
     // Выполнение тестового скрипта L0
@@ -86,17 +84,17 @@ fn main() -> Result<(), Error> {
         -- 1. Хэширование массива байтов (ASCII коды слова "hello")
         let data: vector<u8> = [104, 101, 108, 108, 111]
         let hash1: string = md5_bytes(data)
-        
+
         -- 2. Хэширование строки
         let str_data: string = "hello"
         let hash2: string = md5_string(str_data)
 
         print("MD5 from vector<u8>:")
         print(hash1)
-        
+
         print("MD5 from string:")
         print(hash2)
-        
+
         if hash1 == hash2 then
             print("Hashes match!")
         end

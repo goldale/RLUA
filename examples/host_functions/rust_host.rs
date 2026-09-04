@@ -13,8 +13,7 @@ fn main() -> Result<(), Error> {
     vm.register_rust_function(
         "rust_multiply",
         vec![Type::I32, Type::I32],
-        Type::I32,
-        rust_multiply,
+        Type::I32, rust_multiply,
     )?;
 
     for line in vm.execute(include_str!("rust_host.l0"))? {

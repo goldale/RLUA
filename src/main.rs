@@ -5,8 +5,21 @@ use std::rc::Rc;
 use ndarray::{ArrayView1, ArrayView2, Axis};
 use ndarray_linalg::SVD;
 
-// Вспомогательная функция для извлечения массива f32 из dTensor L0
-fn extract_tensor_f32(heap: &Heap, reference: l0::HeapRef) -> Result<(Vec<f32>, Vec<usize>), Error> {
+fn int2str(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Error> {
+    let [Value::I64(val)] = arguments else {
+        return Err(Error::Runtime("int2str expects exactly one i64 argument".into()));
+    };
+
+    let str_val = val.to_string();
+    let mut h = heap.borrow_mut();
+    let ref_id = h.allocate(HeapObject::String(str_val));
+
+    Ok(Value::String(ref_id))
+}
+
+///////////////////////////////////////////////////////////
+// Help функция для извлечения массива f32 из dTensor L0
+fn getTensor_f32(heap: &Heap, reference: l0::HeapRef) -> Result<(Vec<f32>, Vec<usize>), Error> {
     match heap.get(reference)? {
         HeapObject::Tensor { bytes, element, shape } if *element == Type::F32 => {
             let mut floats = Vec::with_capacity(bytes.len() / 4);
@@ -20,25 +33,20 @@ fn extract_tensor_f32(heap: &Heap, reference: l0::HeapRef) -> Result<(Vec<f32>, 
     }
 }
 
-// 1. Настоящее SVD: torch_svdvals(h_centered: dTensor) -> dTensor
-fn torch_svdvals(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Error> {
+fn svdvals(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Error> {
     let [Value::Tensor(ref_id, _)] = arguments else {
-        return Err(Error::Runtime("torch_svdvals expects 1 dTensor".into()));
+        return Err(Error::Runtime("svdvals expects 1 dTensor".into()));
     };
-
-    let (floats, shape) = extract_tensor_f32(&heap.borrow(), *ref_id)?;
+    let (floats, shape) = getTensor_f32(&heap.borrow(), *ref_id)?;
     if shape.len() != 2 {
         return Err(Error::Runtime("SVD requires a 2D tensor".into()));
     }
-
     // Создаем матрицу ndarray из извлеченных данных
     let matrix = ArrayView2::from_shape((shape[0], shape[1]), &floats)
         .map_err(|_| Error::Runtime("Failed to create matrix view".into()))?;
-
     // Вычисляем сингулярные числа (без вычисления матриц U и VT для ускорения)
     let (_, s, _) = matrix.svd(false, false)
         .map_err(|_| Error::Runtime("SVD computation failed".into()))?;
-
     let svd_result: Vec<f32> = s.to_vec();
     let new_shape = vec![svd_result.len()];
 
@@ -46,7 +54,6 @@ fn torch_svdvals(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Err
     for val in svd_result {
         bytes.extend_from_slice(&val.to_bits().to_le_bytes());
     }
-
     let mut h = heap.borrow_mut();
     let new_ref = h.allocate(HeapObject::Tensor {
         bytes, element: Type::F32, shape: new_shape.clone()
@@ -56,15 +63,14 @@ fn torch_svdvals(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Err
     Ok(Value::Tensor(new_ref, tensor_type))
 }
 
-// 2. Среднее по нулевому измерению: torch_mean_dim0(a: dTensor) -> dTensor
-fn torch_mean_dim0(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Error> {
+// 2. Среднее - mean_dim0(a: dTensor) -> dTensor
+fn mean_dim0(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Error> {
     let [Value::Tensor(ref_id, _)] = arguments else {
-        return Err(Error::Runtime("torch_mean_dim0 expects 1 dTensor".into()));
+        return Err(Error::Runtime("mean_dim0 expects 1 dTensor".into()));
     };
 
-    let (floats, shape) = extract_tensor_f32(&heap.borrow(), *ref_id)?;
+    let (floats, shape) = getTensor_f32(&heap.borrow(), *ref_id)?;
     let matrix = ArrayView2::from_shape((shape[0], shape[1]), &floats).unwrap();
-
     // Считаем среднее по строкам (Axis 0)
     let mean_array = matrix.mean_axis(Axis(0)).unwrap();
 
@@ -72,7 +78,6 @@ fn torch_mean_dim0(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, E
     for val in mean_array.iter() {
         bytes.extend_from_slice(&val.to_bits().to_le_bytes());
     }
-
     let mut h = heap.borrow_mut();
     let new_ref = h.allocate(HeapObject::Tensor {
         bytes, element: Type::F32, shape: vec![shape[1]]
@@ -81,18 +86,16 @@ fn torch_mean_dim0(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, E
     Ok(Value::Tensor(new_ref, tensor_type))
 }
 
-// 3. Вычитание тензора (броадкастинг 1D из 2D): torch_sub(a: dTensor, b: dTensor) -> dTensor
-fn torch_sub(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Error> {
+// 3. Вычитание тензора (броадкастинг 1D из 2D): t_sub(a: dTensor, b: dTensor) -> dTensor
+fn t_sub(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Error> {
     let [Value::Tensor(ref_a, ty), Value::Tensor(ref_b, _)] = arguments else {
-        return Err(Error::Runtime("torch_sub expects 2 dTensor arguments".into()));
+        return Err(Error::Runtime("t_sub expects 2 dTensor arguments".into()));
     };
-
-    let (floats_a, shape_a) = extract_tensor_f32(&heap.borrow(), *ref_a)?;
-    let (floats_b, shape_b) = extract_tensor_f32(&heap.borrow(), *ref_b)?;
+    let (floats_a, shape_a) = getTensor_f32(&heap.borrow(), *ref_a)?;
+    let (floats_b, shape_b) = getTensor_f32(&heap.borrow(), *ref_b)?;
 
     let matrix_a = ArrayView2::from_shape((shape_a[0], shape_a[1]), &floats_a).unwrap();
     let vec_b = ArrayView1::from_shape(shape_b[0], &floats_b).unwrap();
-
     // Броадкастинг и вычитание
     let result = &matrix_a - &vec_b;
 
@@ -100,45 +103,41 @@ fn torch_sub(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Error> 
     for val in result.iter() {
         bytes.extend_from_slice(&val.to_bits().to_le_bytes());
     }
-
     let mut h = heap.borrow_mut();
     let new_ref = h.allocate(HeapObject::Tensor { bytes, element: Type::F32, shape: shape_a });
     Ok(Value::Tensor(new_ref, ty.clone()))
 }
 
-// 2. Поэлементное возведение в квадрат: torch_square(a: dTensor) -> dTensor
-fn torch_square(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Error> {
+// 2. Поэлементное возведение в квадрат: t_square(a: dTensor) -> dTensor
+fn t_square(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Error> {
     let [Value::Tensor(ref_id, ty)] = arguments else {
-        return Err(Error::Runtime("torch_square expects 1 dTensor".into()));
+        return Err(Error::Runtime("t_square expects 1 dTensor".into()));
     };
-
-    let (floats, shape) = extract_tensor_f32(&heap.borrow(), *ref_id)?;
+    let (floats, shape) = getTensor_f32(&heap.borrow(), *ref_id)?;
     let mut bytes       = Vec::with_capacity(floats.len() * 4);
     for val in floats {
         let squared = val * val;
         bytes.extend_from_slice(&squared.to_bits().to_le_bytes());
     }
-
     let mut h = heap.borrow_mut();
     let new_ref = h.allocate(HeapObject::Tensor { bytes, element: Type::F32, shape });
     Ok(Value::Tensor(new_ref, ty.clone()))
 }
 
-// 3. Сумма элементов тензора: torch_sum(a: dTensor) -> f32
-fn torch_sum(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Error> {
+// 3. Сумма элементов тензора: t_sum(a: dTensor) -> f32
+fn t_sum(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Error> {
     let [Value::Tensor(ref_id, _)] = arguments else {
-        return Err(Error::Runtime("torch_sum expects 1 dTensor".into()));
+        return Err(Error::Runtime("t_sum expects 1 dTensor".into()));
     };
-
-    let (floats, _) = extract_tensor_f32(&heap.borrow(), *ref_id)?;
+    let (floats, _) = getTensor_f32(&heap.borrow(), *ref_id)?;
     let sum: f32 = floats.iter().sum();
 
     Ok(Value::F32(sum))
 }
 
-fn torch_reshape(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Error> {
+fn t_reshape(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Error> {
     let [Value::Tensor(ref_id, _ty), Value::I32(dim1), Value::I32(dim2)] = arguments else {
-        return Err(Error::Runtime("torch_reshape expects 1 dTensor and 2 i32 arguments".into()));
+        return Err(Error::Runtime("t_reshape expects 1 dTensor and 2 i32 arguments".into()));
     };
     // Extract existing tensor data from the L0 heap
     let (bytes, element, old_shape) = {
@@ -150,10 +149,8 @@ fn torch_reshape(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Err
     };
     // Calculate total elements to properly resolve the -1 wildcard
     let total_elements: isize = old_shape.iter().product::<usize>() as isize;
-
     let mut d1 = *dim1 as isize;
     let mut d2 = *dim2 as isize;
-
     if d1 == -1 {
         d1 = total_elements / d2;
     } else if d2 == -1 {
@@ -171,12 +168,11 @@ fn torch_reshape(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Err
     Ok(Value::Tensor(new_ref, tensor_type))
 }
 
-fn torch_add_scalar(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Error> {
+fn t_scalarAdd(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Error> {
     // 1. Accept a dTensor and an f32 scalar
     let [Value::Tensor(ref_id, ty), Value::F32(scalar)] = arguments else {
-        return Err(Error::Runtime("torch_add_scalar expects 1 dTensor and 1 f32 argument".into()));
+        return Err(Error::Runtime("t_scalarAdd expects 1 dTensor and 1 f32 argument".into()));
     };
-
     // 2. Extract the raw bytes and shape from the tensor in the heap
     let (floats, shape) = {
         let h = heap.borrow();
@@ -191,31 +187,28 @@ fn torch_add_scalar(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, 
             _ => return Err(Error::Runtime("invalid tensor heap object or element type".into())),
         }
     };
-
     // 3. Add the scalar to each element and pack back into bytes
     let mut new_bytes = Vec::with_capacity(floats.len() * 4);
     for val in floats {
         let add_val = val + scalar;
         new_bytes.extend_from_slice(&add_val.to_bits().to_le_bytes());
     }
-
     // 4. Allocate a new tensor in the VM heap
     let mut h = heap.borrow_mut();
-    let new_ref = h.allocate(HeapObject::Tensor { 
-        bytes: new_bytes, 
+    let new_ref = h.allocate(HeapObject::Tensor {
+        bytes: new_bytes,
         element: Type::F32,
-        shape 
+        shape
     });
     // 5. Return the new dynamic tensor
     Ok(Value::Tensor(new_ref, ty.clone()))
 }
 
-fn torch_div_scalar(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Error> {
+fn t_scalarDiv(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Error> {
     // 1. Accept a dTensor and an f32 scalar
     let [Value::Tensor(ref_id, ty), Value::F32(scalar)] = arguments else {
-        return Err(Error::Runtime("torch_div_scalar expects 1 dTensor and 1 f32 argument".into()));
+        return Err(Error::Runtime("t_scalarDiv expects 1 dTensor and 1 f32 argument".into()));
     };
-
     // 2. Extract the raw bytes and shape from the tensor
     let (floats, shape) = {
         let h = heap.borrow();
@@ -236,7 +229,6 @@ fn torch_div_scalar(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, 
         let div_val = val / scalar;
         new_bytes.extend_from_slice(&div_val.to_bits().to_le_bytes());
     }
-
     // 4. Allocate a new tensor in the VM heap
     let mut h = heap.borrow_mut();
     let new_ref = h.allocate(HeapObject::Tensor {
@@ -248,10 +240,10 @@ fn torch_div_scalar(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, 
     Ok(Value::Tensor(new_ref, ty.clone()))
 }
 
-fn torch_log(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Error> {
+fn t_log(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Error> {
     // 1. Accept a single dTensor argument
     let [Value::Tensor(ref_id, ty)] = arguments else {
-        return Err(Error::Runtime("torch_log expects exactly 1 dTensor argument".into()));
+        return Err(Error::Runtime("t_log expects exactly 1 dTensor argument".into()));
     };
 
     // 2. Extract the raw bytes and shape from the tensor in the heap
@@ -278,19 +270,19 @@ fn torch_log(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Error> 
 
     // 4. Allocate a new tensor in the VM heap
     let mut h = heap.borrow_mut();
-    let new_ref = h.allocate(HeapObject::Tensor { 
-        bytes: new_bytes, 
+    let new_ref = h.allocate(HeapObject::Tensor {
+        bytes: new_bytes,
         element: Type::F32,
-        shape 
+        shape
     });
     // 5. Return the new dynamic tensor
     Ok(Value::Tensor(new_ref, ty.clone()))
 }
 
-fn torch_mul(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Error> {
+fn t_mul(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Error> {
     // 1. Accept two dTensor arguments
     let [Value::Tensor(ref_a, ty_a), Value::Tensor(ref_b, _)] = arguments else {
-        return Err(Error::Runtime("torch_mul expects exactly 2 dTensor arguments".into()));
+        return Err(Error::Runtime("t_mul expects exactly 2 dTensor arguments".into()));
     };
 
     // 2. Extract the raw bytes and shape from the first tensor
@@ -322,40 +314,24 @@ fn torch_mul(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Error> 
             _ => return Err(Error::Runtime("invalid second tensor heap object or element type".into())),
         }
     };
-
     if floats_a.len() != floats_b.len() {
-        return Err(Error::Runtime("torch_mul expects tensors of the same size for element-wise multiplication".into()));
+        return Err(Error::Runtime("t_mul expects tensors of the same size for element-wise multiplication".into()));
     }
-
     // 4. Perform element-wise multiplication and pack back into bytes
     let mut new_bytes = Vec::with_capacity(floats_a.len() * 4);
     for (a, b) in floats_a.iter().zip(floats_b.iter()) {
         let mul_val = a * b;
         new_bytes.extend_from_slice(&mul_val.to_bits().to_le_bytes());
     }
-
     // 5. Allocate a new tensor in the VM heap
     let mut h = heap.borrow_mut();
-    let new_ref = h.allocate(HeapObject::Tensor { 
-        bytes: new_bytes, 
+    let new_ref = h.allocate(HeapObject::Tensor {
+        bytes: new_bytes,
         element: Type::F32,
-        shape: shape_a 
+        shape: shape_a
     });
     // 6. Return the new dynamic tensor
     Ok(Value::Tensor(new_ref, ty_a.clone()))
-}
-
-// Ваша функция-расширение
-fn int2str(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Error> {
-    let [Value::I64(val)] = arguments else {
-        return Err(Error::Runtime("int2str expects exactly one i64 argument".into()));
-    };
-
-    let str_val = val.to_string();
-    let mut h = heap.borrow_mut();
-    let ref_id = h.allocate(HeapObject::String(str_val));
-
-    Ok(Value::String(ref_id))
 }
 
 fn main() {
@@ -369,33 +345,21 @@ fn main() {
     vm.set_interactive(true);
 
     // Регистрация математических оберток для L0
-    vm.register_rust_function("torch_svdvals", vec![Type::DTensor], Type::DTensor, torch_svdvals).unwrap();
-    vm.register_rust_function("torch_square", vec![Type::DTensor], Type::DTensor, torch_square).unwrap();
-    vm.register_rust_function("torch_sum", vec![Type::DTensor], Type::F32, torch_sum).unwrap();
-    vm.register_rust_function("torch_mean_dim0", vec![Type::DTensor], Type::DTensor, torch_mean_dim0).unwrap();
-    vm.register_rust_function("torch_sub", vec![Type::DTensor, Type::DTensor], Type::DTensor, torch_sub).unwrap();
-    vm.register_rust_function("torch_reshape", vec![Type::DTensor, Type::I32, Type::I32],
-                              Type::DTensor, torch_reshape).unwrap();
-    vm.register_rust_function("torch_div_scalar", vec![Type::DTensor, Type::F32], Type::DTensor,
-                              torch_div_scalar).unwrap();
-    vm.register_rust_function(
-        "torch_add_scalar", 
-        vec![Type::DTensor, Type::F32], 
-        Type::DTensor, 
-        torch_add_scalar
-    ).unwrap();
-    vm.register_rust_function(
-        "torch_log", 
-        vec![Type::DTensor], 
-        Type::DTensor, 
-        torch_log
-    ).unwrap();
-    vm.register_rust_function(
-        "torch_mul", 
-        vec![Type::DTensor, Type::DTensor], 
-        Type::DTensor, 
-        torch_mul
-    ).unwrap();
+    vm.register_rust_function("svdvals", vec![Type::DTensor], Type::DTensor, svdvals).unwrap();
+    vm.register_rust_function("t_square", vec![Type::DTensor], Type::DTensor, t_square).unwrap();
+    vm.register_rust_function("t_sum", vec![Type::DTensor], Type::F32, t_sum).unwrap();
+    vm.register_rust_function("mean_dim0", vec![Type::DTensor], Type::DTensor, mean_dim0).unwrap();
+    vm.register_rust_function("t_sub", vec![Type::DTensor, Type::DTensor], Type::DTensor, t_sub).unwrap();
+    vm.register_rust_function("t_reshape", vec![Type::DTensor, Type::I32, Type::I32],
+                              Type::DTensor, t_reshape).unwrap();
+    vm.register_rust_function("t_scalarDiv", vec![Type::DTensor, Type::F32], Type::DTensor,
+                              t_scalarDiv).unwrap();
+    vm.register_rust_function("t_scalarAdd", vec![Type::DTensor, Type::F32],
+        Type::DTensor, t_scalarAdd).unwrap();
+    vm.register_rust_function("t_log", vec![Type::DTensor],
+        Type::DTensor, t_log).unwrap();
+    vm.register_rust_function("t_mul", vec![Type::DTensor, Type::DTensor],
+        Type::DTensor, t_mul).unwrap();
     // ... регистрация остальных функций моста ...
 
     // Регистрируем функцию int2str

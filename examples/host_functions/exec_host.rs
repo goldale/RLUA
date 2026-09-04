@@ -45,7 +45,7 @@ fn host_exec(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Error> 
     // 5. Размещение полученной строки обратно в куче L0[cite: 1]
     let mut h = heap.borrow_mut();
     let ref_id = h.allocate(HeapObject::String(stdout));
-    
+
     Ok(Value::String(ref_id))
 }
 
@@ -55,10 +55,8 @@ fn main() -> Result<(), Error> {
     // 6. Регистрация функции в VM
     // Функция регистрируется с именем "exec", принимает одну строку и возвращает строку[cite: 1]
     vm.register_rust_function(
-        "exec",
-        vec![Type::String],
-        Type::String,
-        host_exec,
+        "exec", vec![Type::String],
+        Type::String, host_exec,
     )?;
 
     // 7. Скрипт на языке L0 для проверки

@@ -7,20 +7,20 @@ struct EntropyProfiler {
 
     -- Метод строго без аргументов
     function calculate()
-        let h_flat: dTensor = torch_reshape(hidden_states, -1, 4096)
-        let h_mean: dTensor = torch_mean_dim0(h_flat)
-        let h_centered: dTensor = torch_sub(h_flat, h_mean)
-        let singular_values: dTensor = torch_svdvals(h_centered)
-        let variance: dTensor = torch_square(singular_values)
+        let h_flat: dTensor = t_reshape(hidden_states, -1, 4096)
+        let h_mean: dTensor = mean_dim0(h_flat)
+        let h_centered: dTensor = t_sub(h_flat, h_mean)
+        let singular_values: dTensor = svdvals(h_centered)
+        let variance: dTensor = t_square(singular_values)
 
-        let var_sum: f32 = torch_sum(variance)
+        let var_sum: f32 = t_sum(variance)
         let norm_factor: f32 = var_sum + eps
-        let probabilities: dTensor = torch_div_scalar(variance, norm_factor)
+        let probabilities: dTensor = t_scalarDiv(variance, norm_factor)
 
-        let prob_eps: dTensor = torch_add_scalar(probabilities, eps)
-        let log_prob: dTensor = torch_log(prob_eps)
-        let term: dTensor = torch_mul(probabilities, log_prob)
-        let term_sum: f32 = torch_sum(term)
+        let prob_eps: dTensor = t_scalarAdd(probabilities, eps)
+        let log_prob: dTensor = t_log(prob_eps)
+        let term: dTensor = t_mul(probabilities, log_prob)
+        let term_sum: f32 = t_sum(term)
 
         entropy = 0.0 - term_sum
     end
