@@ -30,7 +30,7 @@ printf("\nЧат запущен! Введите 'exit' для выхода.\n")
 while chat_active do
     printf("\nВы: ")
     let user_input: string = input
-    
+
     if user_input == "exit" then
         chat_active = 1 == 0
         continue
@@ -44,7 +44,7 @@ while chat_active do
     -- Кодируем сообщение пользователя
     let prompt_tokens: vector<i32> = tokenizer_encode(tokenizer_id, user_input)
     let prompt_len: i32 = len(prompt_tokens)
-    
+
     if prompt_len == 0 then
         continue
     end
@@ -55,7 +55,7 @@ while chat_active do
     let current_token: i32 = prompt_tokens[0]
     let generated_count: i32 = 0
     let response_active: bool = 1 == 1
-    
+
     -- Цикл генерации ответа (пока не встретим EOS или не превысим лимит в 50 токенов)
     while response_active do
         let x: i32 = candle_embedding(w_emb, current_token)
@@ -129,7 +129,7 @@ while chat_active do
         else
             -- Промпт кончился — выводим предсказания модели
             current_token = next_token
-            
+
             -- Проверка на EOS-токены (End of Sequence)
             if current_token == 0 || current_token == 2 || current_token == 151643 || current_token == 151645 then
                 response_active = 1 == 0
@@ -137,7 +137,7 @@ while chat_active do
                 let word: string = tokenizer_decode(tokenizer_id, current_token)
                 printf("{}", word)
                 generated_count = generated_count + 1
-                
+
                 -- Ограничитель на 50 токенов (чтобы не ждать вечно, если модель увлечётся)
                 if generated_count >= 50 then
                     response_active = 1 == 0

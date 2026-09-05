@@ -1006,6 +1006,7 @@ impl Vm {
                     .ok_or_else(|| Error::Runtime("VM destructor tracking invariant broken".into()))?;
                 self.active_destructors.remove(position);
             },
+            DecodedOp::Pop => { self.pop()?; },
             DecodedOp::Return => { if let Some((return_pc, previous_receiver)) = call_stack.pop() { current_receiver = previous_receiver; pc = return_pc; continue; } if terminal_return { return Ok(&self.output); } return Err(Error::Runtime("return outside method".into())); },
             DecodedOp::Print => { let value = self.pop()?; let text = self.format_value(&value)?; self.emit(text); },
             DecodedOp::Printf(num_args) => {

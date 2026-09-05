@@ -1,0 +1,28 @@
+printf("=== УТИЛИТА ПРОВЕРКИ КЛЮЧЕЙ SAFETENSORS ===\n")
+
+-- Берем имя файла из аргументов командной строки (если передано)
+let file_path: string = get_arg(2)
+if len(file_path) == 0 then
+    -- Если не передано, используем имя по умолчанию
+    file_path = "smollm2-1.7b-sae.safetensors"
+end
+
+printf("Открываем файл: {} ...\n", file_path)
+-- Загружаем файл (читаются только метаданные и выделяются указатели)
+let tensors: table<i32> = candle_load_model(file_path)
+
+-- Извлекаем все ключи (имена тензоров) из таблицы
+let tkeys: table_keys = keys(tensors)
+let total_keys: i32 = len(tkeys)
+
+printf("\nФайл успешно прочитан! Найдено тензоров: {}\n", total_keys)
+printf("Список ключей:\n")
+printf("-------------------------------------------\n")
+-- Проходим по каждому ключу и выводим его на экран
+for k in tkeys do
+    -- 'k' имеет тип table_key, который printf умеет конвертировать в строку
+    printf(" - {}", k)
+end
+
+printf("\n-------------------------------------------\n")
+printf("=== ПРОВЕРКА ЗАВЕРШЕНА ===\n")

@@ -1,0 +1,58 @@
+printf("=== ДЕМО: ИНФЕРЕНС SPARSE AUTOENCODER (SAE) ===\n")
+
+-- 1. Загружаем хук (вектор x, который мы выгрузили ранее)
+let hook_data: table<i32> = candle_load_model("hook_layer9_output.safetensors")
+let x_id: i32 = hook_data["layer_09_hidden_state"]
+
+-- 2. Загружаем веса энкодера SAE
+-- (Путь и имена ключей зависят от скачанного файла)
+let sae_path: string = "smollm2-1.7b-sae.safetensors"
+printf("Загрузка весов SAE из: {} ...\n", sae_path)
+let sae_weights: table<i32> = candle_load_model(sae_path)
+
+let w_enc_id: i32 = sae_weights["W_enc"]
+let b_enc_id: i32 = sae_weights["b_enc"]
+
+-- Примечание: функция candle_linear_id ожидает матрицу весов в формате [out_features, in_features].
+-- Если скачанный SAE хранит веса как [in_features, out_features] (например, [2048, 16384]),
+-- раскомментируйте транспонирование:
+-- w_enc_id = candle_transpose_id(w_enc_id, 0, 1)
+
+-- 3. Выполняем математику энкодера SAE в VRAM
+-- Шаг A: Умножение матрицы на вектор (W_enc * x)
+let wx_id: i32 = candle_linear_id(w_enc_id, x_id)
+
+-- Шаг B: Добавление смещения (wx + b_enc)
+let pre_act_id: i32 = candle_add_id(wx_id, b_enc_id)
+
+-- 4. Выгружаем пред-активации в L0 и применяем нелинейность
+let pre_act_dyn: dArray = candle_get_darray(pre_act_id)
+
+-- Шаг C: Активация ReLU (оставляет только положительные "сработавшие" фичи)
+let features_dyn: dArray = candle_vector_relu(pre_act_dyn)
+
+-- Приводим к строгому вектору для прохода циклом
+let features: vector<f32> = features_dyn
+let num_features: i32 = len(features)
+
+printf("\nSAE отработал! Размерность латентного пространства: {}\n", num_features)
+printf("Ищем сработавшие концепции...\n\n")
+
+let i: i32 = 0
+let active_count: i32 = 0
+
+-- 5. Итерация по латентному пространству
+while i < num_features do
+    if features[i] > 0.0 then
+        printf("Концепция #{}: сила активации = {}\n", i, features[i])
+        active_count = active_count + 1
+    end
+    i = i + 1
+end
+
+printf("\nВсего активно {} концепций из {}.\n", active_count, num_features)
+
+-- Очистка VRAM
+candle_free_tensor(x_id)
+candle_free_tensor(wx_id)
+candle_free_tensor(pre_act_id)

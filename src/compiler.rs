@@ -160,8 +160,7 @@ pub enum Statement {
     While { condition: Expr, body: Vec<Statement> },
     For { name: String, start: Expr, end: Expr, body: Vec<Statement> },
     ForIn { name: String, iterable: Expr, body: Vec<Statement> },
-    Break,
-    Continue,
+    Break, Continue, Call { name: String, args: Vec<Expr> },
     Located { node: Box<Statement>, location: SourceLocation },
 }
 
@@ -342,7 +341,20 @@ impl Parser {
                     token => Err(Error::Parse(format!("expected '=', '[', or '(', got {token:?}"))),
                 }
             },
-            token => Err(Error::Parse(format!("expected '=', '[' or '.', got {token:?}")))
+            // Вот наша новая правильная ветка для парсинга вызовов!
+            Token::LParen => {
+                let mut args = Vec::new();
+                if *self.peek() != Token::RParen {
+                    loop {
+                        args.push(self.expr()?);
+                        if *self.peek() != Token::Comma { break; }
+                        self.next();
+                    }
+                }
+                self.need(Token::RParen)?;
+                Ok(Statement::Call { name, args })
+            },
+            token => Err(Error::Parse(format!("expected '=', '[', '.' or '(', got {token:?}")))
         }},
         x => Err(Error::Parse(format!("expected statement, got {x:?}"))), }
     }
@@ -603,7 +615,8 @@ pub enum IrOp {
     JumpIfFalse(usize), Jump(usize), JumpIfFalseKeep(usize), JumpIfTrueKeep(usize),
     CallMethod(usize, usize), CallCurrentMethod(usize), CallModule(usize, Rc<str>),
     TrackDestructor(usize, usize), UntrackDestructor(usize),
-    Return, Print, Printf(usize), Putc
+    Return, Print, Printf(usize), Putc, Pop,
+
 }
 
 pub type Op = IrOp;
@@ -628,17 +641,15 @@ pub enum Opcode {
     TableKeysIndex, TableRemove, Field, TableField, ModuleField, Binary, Unary, Len,
     ConcatString, Builtin1, Builtin2, CallExternal, JumpIfFalse, Jump, JumpIfFalseKeep,
     JumpIfTrueKeep, CallMethod, CallCurrentMethod, CallModule, Return, Print, Printf, Putc,
-    Cast,
-    TrackDestructor, UntrackDestructor,
+    Cast, TrackDestructor, UntrackDestructor, Pop,
 }
-
 impl Opcode {
     pub fn from_word(word: u32) -> Result<Self, Error> {
-        if word > Self::UntrackDestructor as u32 { return Err(Error::Runtime("invalid bytecode opcode".into())); }
+        // Замените UntrackDestructor на Pop
+        if word > Self::Pop as u32 { return Err(Error::Runtime("invalid bytecode opcode".into())); }
         Ok(unsafe { std::mem::transmute(word) })
     }
 }
-
 pub enum DecodedOp<'a> {
     AddI32, AddF32, AddF64, Push(&'a Value), MakeString(&'a Rc<str>), Input(&'a Rc<Type>), Require(&'a Rc<ModuleArtifact>), Load(usize), LoadCurrentReceiver,
     LoadCurrentField(&'a Rc<StructField>), Store(usize), StoreIndex(usize, &'a Rc<Type>), StoreTableIndex(usize, &'a Rc<Type>),
@@ -651,7 +662,7 @@ pub enum DecodedOp<'a> {
     JumpIfFalse(usize), Jump(usize), JumpIfFalseKeep(usize), JumpIfTrueKeep(usize),
     CallMethod(usize, usize), CallCurrentMethod(usize), CallModule(usize, &'a Rc<str>),
     TrackDestructor(usize, usize), UntrackDestructor(usize),
-    Return, Print, Printf(usize), Putc,
+    Return, Print, Printf(usize), Putc, Pop,
 }
 
 impl FlatBytecode {
@@ -661,6 +672,7 @@ impl FlatBytecode {
     pub fn lower(ir: Vec<IrOp>) -> Self {
         let mut out = Self::default();
         for op in ir { match op {
+            IrOp::Pop => out.op(Opcode::Pop),
             IrOp::AddI32 => out.op(Opcode::AddI32), IrOp::AddF32 => out.op(Opcode::AddF32), IrOp::AddF64 => out.op(Opcode::AddF64),
             IrOp::Push(v) => { out.op(Opcode::Push); let x=out.constant(Constant::Value(v)); out.word(x as usize); }
             IrOp::MakeString(v) => { out.op(Opcode::MakeString); let x=out.constant(Constant::String(v)); out.word(x as usize); }
@@ -712,6 +724,7 @@ impl FlatBytecode {
             };
         }
         let decoded=match opcode {
+            Opcode::Pop => DecodedOp::Pop,
             Opcode::AddI32=>DecodedOp::AddI32, Opcode::AddF32=>DecodedOp::AddF32, Opcode::AddF64=>DecodedOp::AddF64,
             Opcode::Push=>{ c!(Constant::Value(v)); DecodedOp::Push(v) }, Opcode::MakeString=>{ c!(Constant::String(v)); DecodedOp::MakeString(v) }, Opcode::Input=>{ c!(Constant::Type(v)); DecodedOp::Input(v) }, Opcode::Require=>{ c!(Constant::Module(v)); DecodedOp::Require(v) }, Opcode::Load=>DecodedOp::Load(word(&mut pc)?), Opcode::LoadCurrentReceiver=>DecodedOp::LoadCurrentReceiver,
             Opcode::LoadCurrentField=>{ c!(Constant::Field(v)); DecodedOp::LoadCurrentField(v) }, Opcode::Store=>DecodedOp::Store(word(&mut pc)?), Opcode::StoreIndex=>{ let a=word(&mut pc)?; c!(Constant::Type(v)); DecodedOp::StoreIndex(a,v) }, Opcode::StoreTableIndex=>{ let a=word(&mut pc)?; c!(Constant::Type(v)); DecodedOp::StoreTableIndex(a,v) }, Opcode::StoreTensorIndex=>{ let a=word(&mut pc)?; c!(Constant::Type(v)); let b=word(&mut pc)?; DecodedOp::StoreTensorIndex(a,v,b) }, Opcode::StoreTensorIndexF32=>DecodedOp::StoreTensorIndexF32(word(&mut pc)?,word(&mut pc)?),
@@ -787,7 +800,6 @@ pub struct Compiler {
     pub scope_stack: Vec<ScopeContext>,
     pub loops: Vec<LoopContext>
 }
-
 impl Default for Compiler {
     fn default() -> Self {
         Self {
@@ -795,7 +807,6 @@ impl Default for Compiler {
         }
     }
 }
-
 impl Compiler {
     pub fn with_module_root(module_root: PathBuf) -> Self { Self { module_root: Some(module_root), ..Self::default() } }
     pub fn with_extern_functions(extern_functions: HashMap<String, HostSignature>) -> Self { Self { extern_functions, ..Self::default() } }
@@ -1018,7 +1029,6 @@ impl Compiler {
         self.code[skip_body] = Op::Jump(after_body);
         Ok(())
     }
-
     fn statement(&mut self, stmt: Statement) -> Result<(), Error> { match stmt {
         Statement::Located { node, location } => return self.statement(*node).map_err(|error| error.at(location)),
         Statement::Struct { name, fields, methods } => {
@@ -1362,9 +1372,14 @@ impl Compiler {
             self.loops.last_mut().expect("checked loop context").continue_jumps.push(jump);
             Ok(())
         },
+        Statement::Call { name, args } => {
+            let dummy_expr = Expr::Call(name, args);
+            let _ty = self.expr(dummy_expr, None)?;
+            self.code.push(Op::Pop);
+            Ok(())
+        },
     }
     }
-
     fn expr(&mut self, expr: Expr, expected: Option<&Type>) -> Result<Type, Error> { match expr {
         Expr::Located { node, location } => return self.expr(*node, expected).map_err(|error| error.at(location)),
         Expr::Integer(n) => { let ty = expected.unwrap_or(&Type::I32); let val = int_value(n, ty)?; self.code.push(Op::Push(val)); Ok(ty.clone()) },

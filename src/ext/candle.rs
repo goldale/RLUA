@@ -284,7 +284,7 @@ fn candle_save_model(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value,
     let [Value::Table(ref_table, _), Value::String(ref_path)] = arguments else {
         return Err(Error::Runtime("candle_save_model expects (table<i32>, string)".into()));
     };
-    
+
     // 1. Достаем путь сохранения из кучи L0
     let path = match heap.borrow().get(*ref_path)? {
         HeapObject::String(text) => text.clone(),
@@ -292,19 +292,19 @@ fn candle_save_model(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value,
     };
 
     let mut tensors_to_save = std::collections::HashMap::new();
-    
+
     // 2. Итерируемся по таблице L0
     if let HeapObject::Table { entries, .. } = heap.borrow().get(*ref_table)? {
         for (key, val) in entries {
             // Извлекаем имя тензора и его ID в реестре Candle
             if let (TableKey::Name(name), Value::I32(id)) = (key, val) {
                 let mut tensor = get_tensor(*id)?;
-                
+
                 // АВТОКОНВЕРТАЦИЯ: Если тензор в BF16, переводим его в F32
                 if tensor.dtype() == candle_core::DType::BF16 {
                     tensor = tensor.to_dtype(candle_core::DType::F32).map_err(|e| Error::Runtime(e.to_string()))?;
                 }
-                
+
                 tensors_to_save.insert(name.to_string(), tensor);
             }
         }
@@ -313,7 +313,7 @@ fn candle_save_model(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value,
     }
     // 3. Сохраняем в формат safetensors средствами Candle
     candle_core::safetensors::save(&tensors_to_save, &path).map_err(|e| Error::Runtime(e.to_string()))?;
-    
+
     Ok(Value::Bool(true))
 }
 
@@ -599,7 +599,7 @@ fn host_tokenizer_decode(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Va
             .replace('\u{2581}', " ") // SentencePiece (используется в TinyLlama/Llama)
             .replace('Ġ', " ")        // ByteLevel BPE (используется в GPT-2/Llama 3)
             .replace("<0x0A>", "\n"); // Явный токен переноса строки
-            
+
         Ok::<String, Error>(clean_text)
     })?;
     // Аллоцируем строку в куче L0

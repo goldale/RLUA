@@ -17,10 +17,10 @@ fn get_cli_arg(arguments: &[Value], heap: &RefCell<l0::Heap>) -> Result<Value, l
     let [Value::I32(idx)] = arguments else {
         return Err(l0::Error::Runtime("get_arg expects 1 i32 argument".into()));
     };
-    
+
     // В Rust args() содержит: 0 = бинарник l0, 1 = путь к скрипту, 2 = первый параметр скрипта
     let arg_str = std::env::args().nth(*idx as usize).unwrap_or_else(|| "".to_string());
-    
+
     let mut h = heap.borrow_mut();
     let ref_id = h.allocate(l0::HeapObject::String(arg_str));
     Ok(Value::String(ref_id))
