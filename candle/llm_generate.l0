@@ -1,109 +1,118 @@
 printf("=== СТАРТ ГЕНЕРАЦИИ ТЕКСТА (SmolLM-135M) ===\n")
-let weights: table<i32> = candle_load_model("smollm-135m.safetensors")
+-- Читаем параметр под индексом 2 (если есть) или берем по умолчанию
+let model_path: string = get_arg(2)
+if len(model_path) == 0 then
+    model_path = "smollm-135m.safetensors"
+end
+printf("Загрузка весов из: {} ...\n", model_path)
+let weights: table<i32> = candle_load_model(model_path)
+let tokenizer_id: i32 = tokenizer_load("./models/tokenizer.json")
 
 let w_emb: i32 = weights["model.embed_tokens.weight"]
 let w_ln_f: i32 = weights["model.norm.weight"]
-let w_lm_head: i32 = weights["lm_head.weight"]
 
--- В L0 нет встроенного токенизатора строк, поэтому мы подаём ID токена напрямую.
--- 2048 в моделях LLaMA обычно означает что-то вроде пробела или буквы "T"
-let current_token: i32 = 2048
-let pos: i32 = 0
+-- Запрашиваем промпт у пользователя
+printf("\nВведите стартовый промпт (или нажмите Enter): ")
+let prompt: string = input
+if len(prompt) == 0 then
+    prompt = "Artificial intelligence is"
+end
 
--- Массивы для хранения ID тензоров KV-кэша для каждого из 30 слоев
+-- Кодируем промпт в токены
+let prompt_tokens: vector<i32> = tokenizer_encode(tokenizer_id, prompt)
+let prompt_len: i32 = len(prompt_tokens)
+
+printf("Промпт закодирован в {} токенов.\n", prompt_len)
+printf("Генерируем продолжение:\n\n")
+printf("{}", prompt)
+
 let k_caches: tensor<i32, 1> = zeros<i32>([30])
 let v_caches: tensor<i32, 1> = zeros<i32>([30])
 
-printf("Запускаем цикл генерации 10 токенов...\n\n")
+let shape_q: vector<f32> = [1.0, 9.0, 1.0, 64.0]
+let shape_k: vector<f32> = [1.0, 3.0, 1.0, 64.0]
+let shape_flat: vector<f32> = [576.0]
 
-while pos < 10 do
-    printf("Позиция {}: Входной Токен ID = {}", pos, current_token)
+let pos: i32 = 0
+let current_token: i32 = prompt_tokens[0]
 
-    -- 1. Получаем вектор эмбеддинга
+-- Генерируем 40 токенов
+while pos < 40 do
     let x: i32 = candle_embedding(w_emb, current_token)
 
-    -- 2. Проход через все 30 слоев трансформера
     let l: i32 = 0
     while l < 30 do
-        -- L0 динамически собирает имя нужного веса из строки и номера слоя!
         let prefix: string = "model.layers." + int2str(l as i64)
 
-        -- ================= АТТЕНШН (Внимание) =================
-        let w_norm1: i32 = weights[prefix + ".input_layernorm.weight"]
-        let x_norm: i32 = candle_rmsnorm(x, w_norm1, 0.00001)
+        -- ================= АТТЕНШН =================
+        let x_norm: i32 = candle_rmsnorm(x, weights[prefix + ".input_layernorm.weight"], 0.00001)
 
         let q: i32 = candle_linear_id(weights[prefix + ".self_attn.q_proj.weight"], x_norm)
         let k: i32 = candle_linear_id(weights[prefix + ".self_attn.k_proj.weight"], x_norm)
         let v: i32 = candle_linear_id(weights[prefix + ".self_attn.v_proj.weight"], x_norm)
 
-        -- Превращаем плоские векторы в 4D-головы: [Batch=1, Heads, SeqLen=1, HeadDim=64]
-        let q_heads: i32 = candle_reshape_id(q, [1.0, 9.0, 1.0, 64.0])
-        let k_heads: i32 = candle_reshape_id(k, [1.0, 3.0, 1.0, 64.0])
-        let v_heads: i32 = candle_reshape_id(v, [1.0, 3.0, 1.0, 64.0])
+        let q_heads: i32 = candle_reshape_id(q, shape_q)
+        let k_heads: i32 = candle_reshape_id(k, shape_k)
+        let v_heads: i32 = candle_reshape_id(v, shape_k)
 
-        -- Добавляем информацию о позиции слова в предложении (RoPE)
         let q_rope: i32 = candle_apply_rope_id(q_heads, pos, 64)
         let k_rope: i32 = candle_apply_rope_id(k_heads, pos, 64)
 
-        -- Обновление KV Cache (Магия "памяти" нейросети)
         let k_final: i32 = 0
         let v_final: i32 = 0
         if pos == 0 then
             k_final = k_rope
             v_final = v_heads
         else
-            -- Доклеиваем новый токен к истории предыдущих токенов по оси SeqLen (dim = 2)
             k_final = candle_cat_id(k_caches[l], k_rope, 2)
             v_final = candle_cat_id(v_caches[l], v_heads, 2)
         end
-        -- Сохраняем обратно в память
         k_caches[l] = k_final
         v_caches[l] = v_final
 
-        -- Размножаем K и V (Механика Grouped Query Attention)
         let k_rep: i32 = candle_repeat_kv_id(k_final, 3)
         let v_rep: i32 = candle_repeat_kv_id(v_final, 3)
 
-        -- Умножаем (Q * K^T) / sqrt(64) и применяем Softmax
         let k_t: i32 = candle_transpose_id(k_rep, 2, 3)
         let scores: i32 = candle_matmul_id(q_rope, k_t)
         let scaled_scores: i32 = candle_scale_id(scores, 0.125)
         let attn_probs: i32 = candle_softmax_dim_id(scaled_scores, 3)
 
-        -- Умножаем вероятности на V
         let context: i32 = candle_matmul_id(attn_probs, v_rep)
-
-        -- Сворачиваем обратно в плоский вектор [576]
-        let context_flat: i32 = candle_reshape_id(context, [576.0])
+        let context_flat: i32 = candle_reshape_id(context, shape_flat)
         let attn_out: i32 = candle_linear_id(weights[prefix + ".self_attn.o_proj.weight"], context_flat)
-
-        -- Residual связь
         x = candle_add_id(x, attn_out)
 
-        -- ================= MLP (Feed-Forward) =================
-        let w_norm2: i32 = weights[prefix + ".post_attention_layernorm.weight"]
-        let x_norm2: i32 = candle_rmsnorm(x, w_norm2, 0.00001)
-
+        -- ================= MLP =================
+        let x_norm2: i32 = candle_rmsnorm(x, weights[prefix + ".post_attention_layernorm.weight"], 0.00001)
         let gate: i32 = candle_linear_id(weights[prefix + ".mlp.gate_proj.weight"], x_norm2)
         let up: i32 = candle_linear_id(weights[prefix + ".mlp.up_proj.weight"], x_norm2)
         let act: i32 = candle_silu(gate)
         let mul: i32 = candle_mul_id(act, up)
         let down: i32 = candle_linear_id(weights[prefix + ".mlp.down_proj.weight"], mul)
 
-        -- Вторая Residual связь
         x = candle_add_id(x, down)
-
         l = l + 1
     end
-    -- 3. Финальная нормализация и получение логитов словаря (Language Model Head)
-    let final_norm: i32 = candle_rmsnorm(x, w_ln_f, 0.00001)
-    let logits: i32 = candle_linear_id(w_lm_head, final_norm)
 
-    -- 4. Выбираем слово с наибольшей вероятностью
-    current_token = candle_argmax_token(logits)
-    printf(" ---> Сгенерирован следующий токен: {}\n", current_token)
+    let final_norm: i32 = candle_rmsnorm(x, w_ln_f, 0.00001)
+    let logits: i32 = candle_linear_id(w_emb, final_norm)
+
+    let next_token: i32 = candle_argmax_token(logits)
+
+    -- ЛОГИКА ПРЕФИЛЛА (Prefill vs Decode)
+    if pos < prompt_len - 1 then
+        -- Мы всё ещё "скармливаем" промпт: игнорируем предсказание и берём следующий токен пользователя
+        current_token = prompt_tokens[pos + 1]
+    else
+        -- Промпт кончился: используем предсказание модели и печатаем слово!
+        current_token = next_token
+        let word: string = tokenizer_decode(tokenizer_id, current_token)
+        -- printf без \n печатает в ту же строку, формируя связный текст
+        printf("{}", word)
+    end
 
     pos = pos + 1
 end
 
-printf("\n=== ГЕНЕРАЦИЯ ЗАВЕРШЕНА ===\n")
+printf("\n\n=== ГЕНЕРАЦИЯ ЗАВЕРШЕНА ===\n")

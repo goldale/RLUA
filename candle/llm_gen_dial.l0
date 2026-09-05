@@ -1,0 +1,151 @@
+--printf("=== ИНТЕРАКТИВНЫЙ ЧАТ С НЕЙРОСЕТЬЮ (SmolLM-135M) ===\n")
+printf("=== ИНТЕРАКТИВНЫЙ ЧАТ С НЕЙРОСЕТЬЮ (SmolLM-360M) ===\n")
+
+let model_path: string = get_arg(2)
+if len(model_path) == 0 then
+    --model_path = "smollm-135m.safetensors"
+    model_path = "smollm-360m.safetensors"
+end
+
+printf("Загрузка весов из: {} ...\n", model_path)
+let weights: table<i32> = candle_load_model(model_path)
+let tokenizer_id: i32 = tokenizer_load("./models/tokenizer.json")
+
+let w_emb: i32 = weights["model.embed_tokens.weight"]
+let w_ln_f: i32 = weights["model.norm.weight"]
+
+-- Инициализируем глобальный KV-кэш и позицию для ВСЕГО диалога
+let k_caches: tensor<i32, 1> = zeros<i32>([30])
+let v_caches: tensor<i32, 1> = zeros<i32>([30])
+let pos: i32 = 0
+
+let shape_q: vector<f32> = [1.0, 9.0, 1.0, 64.0]
+let shape_k: vector<f32> = [1.0, 3.0, 1.0, 64.0]
+let shape_flat: vector<f32> = [576.0]
+
+let chat_active: bool = 1 == 1
+printf("\nЧат запущен! Введите 'exit' для выхода.\n")
+
+-- ================= БЕСКОНЕЧНЫЙ ЦИКЛ ЧАТА =================
+while chat_active do
+    printf("\nВы: ")
+    let user_input: string = input
+    
+    if user_input == "exit" then
+        chat_active = 1 == 0
+        continue
+    end
+
+    -- Если это не первое сообщение, добавляем перенос строки для отделения контекста
+    if pos > 0 then
+        user_input = "\n" + user_input
+    end
+
+    -- Кодируем сообщение пользователя
+    let prompt_tokens: vector<i32> = tokenizer_encode(tokenizer_id, user_input)
+    let prompt_len: i32 = len(prompt_tokens)
+    
+    if prompt_len == 0 then
+        continue
+    end
+
+    printf("Бот: ")
+
+    let p_idx: i32 = 0
+    let current_token: i32 = prompt_tokens[0]
+    let generated_count: i32 = 0
+    let response_active: bool = 1 == 1
+    
+    -- Цикл генерации ответа (пока не встретим EOS или не превысим лимит в 50 токенов)
+    while response_active do
+        let x: i32 = candle_embedding(w_emb, current_token)
+
+        let l: i32 = 0
+        while l < 30 do
+            let prefix: string = "model.layers." + int2str(l as i64)
+
+            -- ================= АТТЕНШН =================
+            let x_norm: i32 = candle_rmsnorm(x, weights[prefix + ".input_layernorm.weight"], 0.00001)
+
+            let q: i32 = candle_linear_id(weights[prefix + ".self_attn.q_proj.weight"], x_norm)
+            let k: i32 = candle_linear_id(weights[prefix + ".self_attn.k_proj.weight"], x_norm)
+            let v: i32 = candle_linear_id(weights[prefix + ".self_attn.v_proj.weight"], x_norm)
+
+            let q_heads: i32 = candle_reshape_id(q, shape_q)
+            let k_heads: i32 = candle_reshape_id(k, shape_k)
+            let v_heads: i32 = candle_reshape_id(v, shape_k)
+
+            let q_rope: i32 = candle_apply_rope_id(q_heads, pos, 64)
+            let k_rope: i32 = candle_apply_rope_id(k_heads, pos, 64)
+
+            let k_final: i32 = 0
+            let v_final: i32 = 0
+            if pos == 0 then
+                k_final = k_rope
+                v_final = v_heads
+            else
+                k_final = candle_cat_id(k_caches[l], k_rope, 2)
+                v_final = candle_cat_id(v_caches[l], v_heads, 2)
+            end
+            k_caches[l] = k_final
+            v_caches[l] = v_final
+
+            let k_rep: i32 = candle_repeat_kv_id(k_final, 3)
+            let v_rep: i32 = candle_repeat_kv_id(v_final, 3)
+
+            let k_t: i32 = candle_transpose_id(k_rep, 2, 3)
+            let scores: i32 = candle_matmul_id(q_rope, k_t)
+            let scaled_scores: i32 = candle_scale_id(scores, 0.125)
+            let attn_probs: i32 = candle_softmax_dim_id(scaled_scores, 3)
+
+            let context: i32 = candle_matmul_id(attn_probs, v_rep)
+            let context_flat: i32 = candle_reshape_id(context, shape_flat)
+            let attn_out: i32 = candle_linear_id(weights[prefix + ".self_attn.o_proj.weight"], context_flat)
+
+            x = candle_add_id(x, attn_out)
+
+            -- ================= MLP =================
+            let x_norm2: i32 = candle_rmsnorm(x, weights[prefix + ".post_attention_layernorm.weight"], 0.00001)
+            let gate: i32 = candle_linear_id(weights[prefix + ".mlp.gate_proj.weight"], x_norm2)
+            let up: i32 = candle_linear_id(weights[prefix + ".mlp.up_proj.weight"], x_norm2)
+            let act: i32 = candle_silu(gate)
+            let mul: i32 = candle_mul_id(act, up)
+            let down: i32 = candle_linear_id(weights[prefix + ".mlp.down_proj.weight"], mul)
+
+            x = candle_add_id(x, down)
+            l = l + 1
+        end
+
+        let final_norm: i32 = candle_rmsnorm(x, w_ln_f, 0.00001)
+        let logits: i32 = candle_linear_id(w_emb, final_norm)
+
+        let next_token: i32 = candle_argmax_token(logits)
+
+        -- ЛОГИКА ПРЕФИЛЛА И ОТВЕТА
+        if p_idx < prompt_len - 1 then
+            -- Пока промпт не кончился, скармливаем токены пользователя в KV-кэш
+            p_idx = p_idx + 1
+            current_token = prompt_tokens[p_idx]
+        else
+            -- Промпт кончился — выводим предсказания модели
+            current_token = next_token
+            
+            -- Проверка на EOS-токены (End of Sequence)
+            if current_token == 0 || current_token == 2 || current_token == 151643 || current_token == 151645 then
+                response_active = 1 == 0
+            else
+                let word: string = tokenizer_decode(tokenizer_id, current_token)
+                printf("{}", word)
+                generated_count = generated_count + 1
+                
+                -- Ограничитель на 50 токенов (чтобы не ждать вечно, если модель увлечётся)
+                if generated_count >= 50 then
+                    response_active = 1 == 0
+                end
+            end
+        end
+
+        -- Продвигаем позицию контекста вперед!
+        pos = pos + 1
+    end
+end

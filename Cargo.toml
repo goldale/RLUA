@@ -28,6 +28,8 @@ openblas-src = { version = "0.10", features = ["system", "rustls"] }
 #candle-core = { version = "0.6", features = ["cuda"] }
 candle-core = { version = "0.6"}
 candle-nn = { version = "0.6" }
+safetensors = "0.4.3"
+tokenizers = "0.15"
 
 [[example]]
 name = "md5_host"

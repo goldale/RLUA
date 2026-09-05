@@ -1,0 +1,30 @@
+printf("=== УТИЛИТА КОНВЕРТАЦИИ ВЕСОВ В FP32 ===\n")
+
+-- 1. Определяем файлы
+--let in_path: string = "smollm2-1.7b.safetensors"
+--let out_path: string = "smollm2-1.7b-fp32.safetensors"
+let in_path: string = "tinyllama-1.1b.safetensors"
+let out_path: string = "tinyllama-1.1b-fp32.safetensors"
+
+printf("\n[Шаг 1] Чтение модели из: {}...\n", in_path)
+
+-- Загружаем модель. candle_load_model вернет таблицу, где ключи - имена слоев (string), а значения - ID (i32)
+let weights: table<i32> = candle_load_model(in_path)
+
+let total_tensors: i32 = len(weights)
+printf("Успешно считано тензоров: {}\n", total_tensors)
+
+-- 2. Запускаем сохранение
+printf("\n[Шаг 2] Конвертация BF16 -> F32 и сохранение...\n")
+printf("Пожалуйста, подождите, это может занять несколько секунд...\n")
+
+-- Передаем таблицу обратно в Rust. Там она переберется, каждый тензор преобразуется
+-- в нативный Float32 и запишется по новому пути
+let success: bool = candle_save_model(weights, out_path)
+
+if success then
+    printf("\n=== ГОТОВО! Модель сохранена как {} ===\n", out_path)
+    printf("Теперь вы можете загружать ее в Ваш чат на максимальной скорости CPU.\n")
+else
+    printf("\n[ОШИБКА] Произошел сбой при сохранении файла.\n")
+end

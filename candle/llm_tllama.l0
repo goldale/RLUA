@@ -1,0 +1,204 @@
+printf("=== ИНТЕРАКТИВНЫЙ ЧАТ С НЕЙРОСЕТЬЮ (TinyLlama-1.1B) ===\n")
+
+let model_path: string = get_arg(2)
+if len(model_path) == 0 then
+    model_path = "tinyllama-1.1b-fp32.safetensors"
+end
+
+printf("Загрузка весов из: {} ...\n", model_path)
+let weights: table<i32> = candle_load_model(model_path)
+let tokenizer_id: i32 = tokenizer_load("./models/tinyllama_tokenizer.json")
+
+let w_emb: i32 = weights["model.embed_tokens.weight"]
+let w_ln_f: i32 = weights["model.norm.weight"]
+-- TinyLlama использует отдельную матрицу логитов, она не связана с эмбеддингами
+let w_lm_head: i32 = weights["lm_head.weight"]
+
+-- KV-кэш для 22 слоев (специфика TinyLlama)
+let k_caches: tensor<i32, 1> = zeros<i32>([22])
+let v_caches: tensor<i32, 1> = zeros<i32>([22])
+let pos: i32 = 0
+
+-- 32 головы Q и 4 головы K/V, размерность головы 64, общая ширина 2048
+let shape_q: vector<f32> = [1.0, 32.0, 1.0, 64.0]
+let shape_k: vector<f32> = [1.0, 4.0, 1.0, 64.0]
+let shape_flat: vector<f32> = [2048.0]
+
+let chat_active: bool = 1 == 1
+printf("\nЧат запущен! Введите 'exit' для выхода.\n")
+
+-- ====== БЕСКОНЕЧНЫЙ ЦИКЛ ЧАТА =================
+-- Буфер для хранения истории токенов всего диалога
+let context_buf: tensor<i32, 1> = zeros<i32>([2048])
+let context_len: i32 = 0
+
+while chat_active do
+    printf("\nВы: ")
+    let user_input: string = input
+    
+    if user_input == "exit" then
+        chat_active = 1 == 0
+        continue
+    end
+    -- Оборачиваем ввод в спец-теги, чтобы модель поняла, что это вопрос человека, 
+    let formatted_input: string = "<|user|>\n" + user_input + "\n<|assistant|>\n"
+    let prompt_tokens: vector<i32> = tokenizer_encode(tokenizer_id, formatted_input)
+
+    let prompt_len: i32 = len(prompt_tokens)
+    
+    if prompt_len == 0 then
+        continue
+    end
+
+    printf("Бот: ")
+
+    let p_idx: i32 = 0
+    let current_token: i32 = prompt_tokens[0]
+    let generated_count: i32 = 0
+    let response_active: bool = 1 == 1
+    
+    while response_active do
+        let x: i32 = candle_embedding(w_emb, current_token)
+
+        let l: i32 = 0
+        -- Цикл ровно до 22 (количество слоев в TinyLlama)
+	-- Цикл ровно до 22 (количество слоев в TinyLlama)
+        while l < 22 do
+            let prefix: string = "model.layers." + int2str(l as i64)
+
+            -- ================= АТТЕНШН =================
+            let x_norm: i32 = candle_rmsnorm(x, weights[prefix + ".input_layernorm.weight"], 0.00001)
+
+            let q: i32 = candle_linear_id(weights[prefix + ".self_attn.q_proj.weight"], x_norm)
+            let k: i32 = candle_linear_id(weights[prefix + ".self_attn.k_proj.weight"], x_norm)
+            let v: i32 = candle_linear_id(weights[prefix + ".self_attn.v_proj.weight"], x_norm)
+
+            let q_heads: i32 = candle_reshape_id(q, shape_q)
+            let k_heads: i32 = candle_reshape_id(k, shape_k)
+            let v_heads: i32 = candle_reshape_id(v, shape_k)
+
+            let q_rope: i32 = candle_apply_rope_id(q_heads, pos, 64)
+            let k_rope: i32 = candle_apply_rope_id(k_heads, pos, 64)
+
+            let k_final: i32 = 0
+            let v_final: i32 = 0
+            if pos == 0 then
+                -- На первом токене мы просто кладем тензоры в кэш. Удалять их сейчас НЕЛЬЗЯ!
+                k_final = k_rope
+                v_final = v_heads
+            else
+                -- Достаем кэш из прошлого шага
+                let old_k: i32 = k_caches[l]
+                let old_v: i32 = v_caches[l]
+
+                -- Создаем новые склеенные тензоры
+                k_final = candle_cat_id(old_k, k_rope, 2)
+                v_final = candle_cat_id(old_v, v_heads, 2)
+
+                -- Удаляем старый кэш
+                let _f_k: bool = candle_free_tensor(old_k)
+                let _f_v: bool = candle_free_tensor(old_v)
+                
+                -- Удаляем текущие тензоры k_rope и v_heads, так как их данные мы уже забрали в k_final
+                let _f_kr: bool = candle_free_tensor(k_rope)
+                let _f_vh: bool = candle_free_tensor(v_heads)
+            end
+            k_caches[l] = k_final
+            v_caches[l] = v_final
+            
+            -- Дублируем 4 KV-головы в 32 Q-головы (коэффициент 8)
+            let k_rep: i32 = candle_repeat_kv_id(k_final, 8)
+            let v_rep: i32 = candle_repeat_kv_id(v_final, 8)
+
+            let k_t: i32 = candle_transpose_id(k_rep, 2, 3)
+            let scores: i32 = candle_matmul_id(q_rope, k_t)
+            let scaled_scores: i32 = candle_scale_id(scores, 0.125)
+            let attn_probs: i32 = candle_softmax_dim_id(scaled_scores, 3)
+
+            let context: i32 = candle_matmul_id(attn_probs, v_rep)
+            let context_flat: i32 = candle_reshape_id(context, shape_flat)
+            let attn_out: i32 = candle_linear_id(weights[prefix + ".self_attn.o_proj.weight"], context_flat)
+
+            -- Исправление утечки 1
+            let old_x1: i32 = x
+            x = candle_add_id(x, attn_out)
+            let _f_x1: bool = candle_free_tensor(old_x1)
+
+            -- ================= MLP =================
+            let x_norm2: i32 = candle_rmsnorm(x, weights[prefix + ".post_attention_layernorm.weight"], 0.00001)
+            let gate: i32 = candle_linear_id(weights[prefix + ".mlp.gate_proj.weight"], x_norm2)
+            let up: i32 = candle_linear_id(weights[prefix + ".mlp.up_proj.weight"], x_norm2)
+
+            let act: i32 = candle_silu(gate)
+            let mul: i32 = candle_mul_id(act, up)
+            let down: i32 = candle_linear_id(weights[prefix + ".mlp.down_proj.weight"], mul)
+
+            -- Исправление утечки 2
+            let old_x2: i32 = x
+            x = candle_add_id(x, down)
+            let _f_x2: bool = candle_free_tensor(old_x2)
+
+            -- === ОЧИСТКА ВРЕМЕННЫХ ТЕНЗОРОВ СЛОЯ ===
+            let _c: bool = candle_free_tensor(x_norm)
+            _c = candle_free_tensor(q)
+            _c = candle_free_tensor(k)
+            _c = candle_free_tensor(v)
+            _c = candle_free_tensor(q_heads)
+            _c = candle_free_tensor(k_heads)
+            -- ВНИМАНИЕ: v_heads удален отсюда!
+            _c = candle_free_tensor(q_rope)
+            -- ВНИМАНИЕ: k_rope удален отсюда!
+            _c = candle_free_tensor(k_rep)
+            _c = candle_free_tensor(v_rep)
+            _c = candle_free_tensor(k_t)
+            _c = candle_free_tensor(scores)
+            _c = candle_free_tensor(scaled_scores)
+            _c = candle_free_tensor(attn_probs)
+            _c = candle_free_tensor(context)
+            _c = candle_free_tensor(context_flat)
+            _c = candle_free_tensor(attn_out)
+            _c = candle_free_tensor(x_norm2)
+            _c = candle_free_tensor(gate)
+            _c = candle_free_tensor(up)
+            _c = candle_free_tensor(act)
+            _c = candle_free_tensor(mul)
+            _c = candle_free_tensor(down)
+
+            l = l + 1
+        end
+        let final_norm: i32 = candle_rmsnorm(x, w_ln_f, 0.00001)
+        let logits: i32 = candle_linear_id(w_lm_head, final_norm)
+
+        -- 3. Вызываем сэмплирование с историей! (Штраф 1.15 обычно идеален)
+        let next_token: i32 = candle_sample_token(logits, 0.7, context_buf, context_len, 1.15)
+
+        -- === ОЧИСТКА ТЕНЗОРОВ ПОСЛЕ ВЫБОРА ТОКЕНА ===
+        let _f3: bool = candle_free_tensor(x)
+        _f3 = candle_free_tensor(final_norm)
+        _f3 = candle_free_tensor(logits)
+
+        if p_idx < prompt_len - 1 then
+            p_idx = p_idx + 1
+            current_token = prompt_tokens[p_idx]
+        else
+            current_token = next_token
+            
+            -- 4. Записываем сгенерированный токен в историю!
+            context_buf[context_len] = current_token
+            context_len = context_len + 1
+            
+            if current_token == 0 || current_token == 2 || current_token == 151643 || current_token == 151645 then
+                response_active = 1 == 0
+            else
+                let word: string = tokenizer_decode(tokenizer_id, current_token)
+                printf("{}", word)
+                generated_count = generated_count + 1
+                
+                if generated_count >= 150 then
+                    response_active = 1 == 0
+                end
+            end
+        end
+        pos = pos + 1
+    end
+end
