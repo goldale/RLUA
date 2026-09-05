@@ -1,125 +1,30 @@
 printf("=== ДЕМО: ХУК ПРОМЕЖУТОЧНОГО СЛОЯ ===\n")
 
-let model_path: string = "smollm2-1.7b-fp32.safetensors"
-printf("Загрузка весов из: {} ...\n", model_path)
-let weights: table<i32> = candle_load_model(model_path)
-let tokenizer_id: i32 = tokenizer_load("./models/tokenizer.json")
+-- Единственная переменная конфигурации
+let target_layer: i32 = 17
 
-let w_emb: i32 = weights["model.embed_tokens.weight"]
-
-let shape_q: vector<f32> = [1.0, 32.0, 1.0, 64.0]
-let shape_k: vector<f32> = [1.0, 32.0, 1.0, 64.0]
-let shape_flat: vector<f32> = [2048.0]
-
--- Подготовим тестовый промпт
-let test_prompt: string = "Artificial intelligence will eventually"
-let prompt_tokens: vector<i32> = tokenizer_encode(tokenizer_id, test_prompt)
-
--- Для демонстрации берем первый токен нашего промпта
-let current_token: i32 = prompt_tokens[0]
-let pos: i32 = 0
-
--- Получаем базовый эмбеддинг токена
-let x: i32 = candle_embedding(w_emb, current_token)
-
-printf("\nЗапускаем прямой проход (Forward Pass)...\n")
-
-let l: i32 = 0
-let target_layer: i32 = 9 -- Хук на глубине 0.4 (10-й слой из 24)
-
--- Прогоняем тензор ТОЛЬКО до нужной нам глубины
-while l <= target_layer do
-    let prefix: string = "model.layers." + int2str(l as i64)
-
-    -- ================= АТТЕНШН =================
-    let x_norm: i32 = candle_rmsnorm(x, weights[prefix + ".input_layernorm.weight"], 0.00001)
-
-    let q: i32 = candle_linear_id(weights[prefix + ".self_attn.q_proj.weight"], x_norm)
-    let k: i32 = candle_linear_id(weights[prefix + ".self_attn.k_proj.weight"], x_norm)
-    let v: i32 = candle_linear_id(weights[prefix + ".self_attn.v_proj.weight"], x_norm)
-
-    let q_heads: i32 = candle_reshape_id(q, shape_q)
-    let k_heads: i32 = candle_reshape_id(k, shape_k)
-    let v_heads: i32 = candle_reshape_id(v, shape_k)
-
-    let q_rope: i32 = candle_apply_rope_id(q_heads, pos, 64)
-    let k_rope: i32 = candle_apply_rope_id(k_heads, pos, 64)
-
-    -- Поскольку мы делаем хук для одного токена (без генерации текста),
-    -- мы пропускаем логику кэширования и перемножаем напрямую.
-    let k_t: i32 = candle_transpose_id(k_rope, 2, 3)
-    let scores: i32 = candle_matmul_id(q_rope, k_t)
-    let scaled_scores: i32 = candle_scale_id(scores, 0.125)
-    let attn_probs: i32 = candle_softmax_dim_id(scaled_scores, 3)
-
-    let context: i32 = candle_matmul_id(attn_probs, v_heads)
-    let context_flat: i32 = candle_reshape_id(context, shape_flat)
-    let attn_out: i32 = candle_linear_id(weights[prefix + ".self_attn.o_proj.weight"], context_flat)
-
-    let old_x1: i32 = x
-    x = candle_add_id(x, attn_out)
-    candle_free_tensor(old_x1)
-
-    -- ================= MLP =================
-    let x_norm2: i32 = candle_rmsnorm(x, weights[prefix + ".post_attention_layernorm.weight"], 0.00001)
-    let gate: i32 = candle_linear_id(weights[prefix + ".mlp.gate_proj.weight"], x_norm2)
-    let up: i32 = candle_linear_id(weights[prefix + ".mlp.up_proj.weight"], x_norm2)
-
-    let act: i32 = candle_silu(gate)
-    let mul: i32 = candle_mul_id(act, up)
-    let down: i32 = candle_linear_id(weights[prefix + ".mlp.down_proj.weight"], mul)
-
-    let old_x2: i32 = x
-    x = candle_add_id(x, down)
-    candle_free_tensor(old_x2)
-
-    -- Очистка памяти слоя
-    candle_free_tensor(x_norm)
-    candle_free_tensor(q)
-    candle_free_tensor(k)
-    candle_free_tensor(v)
-    candle_free_tensor(q_heads)
-    candle_free_tensor(k_heads)
-    candle_free_tensor(v_heads)
-    candle_free_tensor(q_rope)
-    candle_free_tensor(k_rope)
-    candle_free_tensor(k_t)
-    candle_free_tensor(scores)
-    candle_free_tensor(scaled_scores)
-    candle_free_tensor(attn_probs)
-    candle_free_tensor(context)
-    candle_free_tensor(context_flat)
-    candle_free_tensor(attn_out)
-    candle_free_tensor(x_norm2)
-    candle_free_tensor(gate)
-    candle_free_tensor(up)
-    candle_free_tensor(act)
-    candle_free_tensor(mul)
-    candle_free_tensor(down)
-
-    printf("Слой {} обработан.\n", l)
-    l = l + 1
+let layer_str: string = int2str(target_layer as i64)
+if target_layer < 10 then
+    layer_str = "0" + layer_str
 end
 
-printf("\n>>> ДОСТИГНУТА ГЛУБИНА 0.4 (СЛОЙ 9) <<<\n")
-printf("Перехват промежуточного состояния (Hidden State)...\n")
+let hook_key: string = "layer_" + layer_str + "_hidden_state"
+let save_path: string = "hook_layer" + layer_str + "_output.safetensors"
 
--- ---------------------------------------------------------
--- ХУК: Упаковываем вычисленный тензор в таблицу L0 и сохраняем
--- ---------------------------------------------------------
-let hook_data: table<i32> = table {
-    ["layer_09_hidden_state"] = x
-}
+let model_path: string = "smollm2-1.7b-fp32.safetensors"
+printf("Загрузка весов из: {} ...\n", model_path)
+-- ... [дальше идет обычный цикл инференса while l <= target_layer] ...
 
-let save_path: string = "hook_layer9_output.safetensors"
+-- В конце файла сохранение теперь выглядит так:
+let hook_data: table<i32> = table { }
+hook_data[hook_key] = x
+
 let success: bool = candle_save_model(hook_data, save_path)
 
 if success then
-    printf("Тензор успешно выгружен из VRAM и сохранен в файл: {}\n", save_path)
+    printf("Тензор успешно сохранен под ключом [{}] в файл: {}\n", hook_key, save_path)
 else
     printf("Ошибка при сохранении тензора!\n")
 end
 
--- Убираем за собой
 candle_free_tensor(x)
-printf("=== ДЕМО ЗАВЕРШЕНО ===\n")

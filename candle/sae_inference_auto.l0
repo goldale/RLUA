@@ -1,0 +1,70 @@
+printf("=== ДЕМО: ИНФЕРЕНС SAE ===\n")
+
+-- 1. НАСТРОЙКИ (ЕДИНАЯ ТОЧКА КОНФИГУРАЦИИ)
+let model_name: string = "smollm2-1.7b"
+let target_layer: i32 = 17 
+
+-- Автоматическое форматирование с ведущим нулем (9 -> "09")[cite: 2]
+let layer_str: string = int2str(target_layer as i64)
+if target_layer < 10 then
+    layer_str = "0" + layer_str
+end
+-- 2. АВТОМАТИЧЕСКАЯ ГЕНЕРАЦИЯ ПУТЕЙ И КЛЮЧЕЙ
+-- Ожидаемые файлы: "hook_smollm2-1.7b_layer17.safetensors" и "sae_smollm2-1.7b_layer17.safetensors"[cite: 2]
+let hook_path: string = "hook_" + model_name + "_layer" + layer_str + ".safetensors"
+let sae_path: string = "sae_" + model_name + "_layer" + layer_str + ".safetensors"
+let hook_key: string = "layer_" + layer_str + "_hidden_state"
+printf("Модель: {}\n", model_name)
+printf("Ожидается слой: {}\n", target_layer)
+printf("Загружаем вектор скрытого состояния из: {} ...\n", hook_path)
+-- 3. ЗАГРУЗКА ВЕКТОРА
+-- Возвращается таблица, где ключи - имена тензоров (строки), а значения - их ID[cite: 2]
+let loaded_data: table<i32> = candle_load_model(hook_path)
+let x_id: i32 = loaded_data[hook_key]
+printf("Тензор [{}] успешно загружен! Внутренний ID: {}\n\n", hook_key, x_id)
+-- 4. ЗАГРУЗКА SAE
+printf("Загрузка весов SAE из: {} ...\n", sae_path)
+let sae_weights: table<i32> = candle_load_model(sae_path)
+
+-- Ключи для SAE (замените на encoder.weight, если утилита проверки покажет их)
+let w_enc_id: i32 = sae_weights["W_enc"]
+let b_enc_id: i32 = sae_weights["b_enc"]
+-- Если матрица имеет форму [in_features, out_features], раскомментируйте:
+-- w_enc_id = candle_transpose_id(w_enc_id, 0, 1)
+
+printf("Начинаем математический проход энкодера в VRAM...\n")
+
+-- 5. МАТЕМАТИКА ЭНКОДЕРА ( W_enc * x + b_enc )
+let wx_id: i32 = candle_linear_id(w_enc_id, x_id)
+let pre_act_id: i32 = candle_add_id(wx_id, b_enc_id)
+
+-- Выгружаем пред-активации и применяем ReLU
+let pre_act_dyn: dArray = candle_get_darray(pre_act_id)
+let features_dyn: dArray = candle_vector_relu(pre_act_dyn)
+
+let features: vector<f32> = features_dyn
+let num_features: i32 = len(features)
+
+printf("\nSAE отработал! Размерность латентного пространства: {}\n", num_features)
+printf("Ищем сработавшие (активные) концепции...\n\n")
+
+let i: i32 = 0
+let active_count: i32 = 0
+
+-- 6. ПОИСК АКТИВНЫХ ФИЧЕЙ
+while i < num_features do
+    if features[i] > 0.0 then
+        printf("Концепция #{}: сила активации = {}\n", i, features[i])
+        active_count = active_count + 1
+    end
+    i = i + 1
+end
+
+printf("\nВсего активно {} концепций из {}.\n", active_count, num_features)
+
+-- 7. ОЧИСТКА ПАМЯТИ
+candle_free_tensor(x_id)
+candle_free_tensor(wx_id)
+candle_free_tensor(pre_act_id)
+
+printf("=== АНАЛИЗ ЗАВЕРШЕН ===\n")
