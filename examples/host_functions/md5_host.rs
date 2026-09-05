@@ -1,106 +1,74 @@
 use l0::{Error, Heap, HeapObject, Type, Value, Vm};
-use md5::{Digest, Md5};
+use md5::{Md5, Digest};
 use std::cell::RefCell;
 
-/// Вычисляет MD5 для массива байтов (vector<u8>)
-fn md5_bytes(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Error> {
-    let [arg] = arguments else {
-        return Err(Error::Runtime("md5_bytes expects 1 argument".into()));
+/// Нативная Rust-функция, которая будет доступна внутри скриптов L0.
+/// Сигнатура всегда одинаковая: принимает слайс аргументов `Value` и ссылку на кучу `Heap`.
+fn l0_md5(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Error> {
+    // 1. Проверяем аргументы. Ожидаем ровно одну строку.
+    let [Value::String(ref_id)] = arguments else {
+        return Err(Error::Runtime("md5() expects exactly one string argument".into()));
     };
 
-    // Блок для локального неизменяемого заимствования кучи
-    let digest = {
+    // 2. Читаем строку из кучи VM.
+    // Мы ограничиваем область видимости `borrow()`, чтобы не держать кучу заблокированной,
+    // пока считаем хеш и форматируем результат.
+    let hash_hex = {
         let h = heap.borrow();
-        let bytes: &[u8] = match arg {
-            Value::Array(reference, ty) if **ty == Type::U8 => {
-                match h.get(*reference)? {
-                    HeapObject::Array { bytes, .. } => bytes.as_slice(),
-                    _ => return Err(Error::Runtime("invalid array heap object".into())),
-                }
-            }
-            _ => return Err(Error::Type("md5_bytes expects vector<u8>".into())),
+        let text = match h.get(*ref_id)? {
+            HeapObject::String(s) => s.as_str(),
+            _ => return Err(Error::Runtime("invalid string heap object".into())),
         };
-
+        
+        // Считаем MD5 хеш используя крейт `md-5`
         let mut hasher = Md5::new();
-        hasher.update(bytes);
-        hasher.finalize()
+        hasher.update(text.as_bytes());
+        let result = hasher.finalize();
+        
+        // Превращаем хеш в hex-строку
+        format!("{:x}", result)
     };
-
-    let hex_str = format!("{:x}", digest);
-
-    // Изменяемое заимствование для аллокации результата-строки
-    let mut h = heap.borrow_mut();
-    let ref_id = h.allocate(HeapObject::String(hex_str));
-    Ok(Value::String(ref_id))
+    // 3. Выделяем место в куче VM для новой строки с результатом
+    let mut h_mut = heap.borrow_mut();
+    let new_ref = h_mut.allocate(HeapObject::String(hash_hex));
+    // 4. Возвращаем указатель на новую строку
+    Ok(Value::String(new_ref))
 }
 
-/// Вычисляет MD5 для строки (string)
-fn md5_string(arguments: &[Value], heap: &RefCell<Heap>) -> Result<Value, Error> {
-    let [arg] = arguments else {
-        return Err(Error::Runtime("md5_string expects 1 argument".into()));
-    };
-
-    let digest = {
-        let h = heap.borrow();
-        let bytes: &[u8] = match arg {
-            Value::String(reference) => match h.get(*reference)? {
-                HeapObject::String(text) => text.as_bytes(),
-                _ => return Err(Error::Runtime("invalid string heap object".into())),
-            },
-            _ => return Err(Error::Type("md5_string expects a string".into())),
-        };
-
-        let mut hasher = Md5::new();
-        hasher.update(bytes);
-        hasher.finalize()
-    };
-
-    let hex_str = format!("{:x}", digest);
-
-    let mut h = heap.borrow_mut();
-    let ref_id = h.allocate(HeapObject::String(hex_str));
-    Ok(Value::String(ref_id))
-}
-
-fn main() -> Result<(), Error> {
+fn main() {
+    // Создаем экземпляр виртуальной машины L0
     let mut vm = Vm::default();
+    
+    // Включаем интерактивный режим, чтобы `printf` и `print` сразу выводили текст в консоль
+    vm.set_interactive(true);
 
-    // Регистрация функции для vector<u8>
+    // Регистрируем нашу нативную функцию в VM.
+    // Указываем: Имя в L0, Типы аргументов, Тип возвращаемого значения, Сама функция.
     vm.register_rust_function(
-        "md5_bytes",
-        vec![Type::Array(Box::new(Type::U8))],
-        Type::String,
-        md5_bytes,
-    )?;
+        "md5", 
+        vec![Type::String], 
+        Type::String, 
+        l0_md5
+    ).expect("Failed to register native function 'md5'");
 
-    // Регистрация функции для string
-    vm.register_rust_function(
-        "md5_string", vec![Type::String],
-        Type::String, md5_string,
-    )?;
-
-    // Выполнение тестового скрипта L0
+    // Пишем скрипт на языке L0, который использует нашу функцию
     let script = r#"
-        -- 1. Хэширование массива байтов (ASCII коды слова "hello")
-        let data: vector<u8> = [104, 101, 108, 108, 111]
-        let hash1: string = md5_bytes(data)
-
-        -- 2. Хэширование строки
-        let str_data: string = "hello"
-        let hash2: string = md5_string(str_data)
-
-        print("MD5 from vector<u8>:")
-        print(hash1)
-
-        print("MD5 from string:")
-        print(hash2)
-
-        if hash1 == hash2 then
-            print("Hashes match!")
-        end
+        printf("=== MD5 Hash Test ===\n")
+        
+        let text1: string = "hello world"
+        let hash1: string = md5(text1)
+        printf("MD5('{}') = {}\n", text1, hash1)
+        
+        let text2: string = "Rust + L0 = <3"
+        let hash2: string = md5(text2)
+        printf("MD5('{}') = {}\n", text2, hash2)
+        
+        printf("=====================\n")
     "#;
-    for line in vm.execute(script)? {
-        println!("{line}");
+    println!("Running L0 script from Rust host...\n");
+
+    // Исполняем скрипт
+    if let Err(error) = vm.execute(script) {
+        eprintln!("Execution error: {}", error);
     }
-    Ok(())
 }

@@ -1,18 +1,34 @@
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::cell::RefCell;
+use std::fs;
+
+// Подтягиваем типы из VM (lib.rs)
+use crate::{
+    Error, SourceLocation, StringId, StringInterner, Type, Value, 
+    scalar_size, types_compatible, is_numeric, is_integer, int_value, float_value,
+    StructField, StructLayout, TableKey
+};
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BinOp { Add, Sub, Mul, Div, Mod, Eq, Neq, Lt, Le, Gt, Ge, And, Or, BitAnd, BitOr, BitXor, Shl, Shr }
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum UnOp { Neg, Not }
 
 #[derive(Clone, Debug, PartialEq)]
-enum Token {
+pub enum Token {
     Let, Print, Printf, Putc, Input, This, Function, Export, Require, If, Then, Else, ElseIf,
     While, For, Do, Break, Continue, Struct, Table, End, As, In, Ident(StringId), Integer(i128),
     Float(f64), StringLit(StringId), Colon, DoubleColon, Equal, EqualEqual, Bang, BangEq, Plus,
     Minus, Star, Slash, Percent, Ampersand, Pipe, Caret, Shl, Shr, AndAnd, OrOr, Dot, Lt, Le,
     Gt, Ge, LParen, RParen, LBracket, RBracket, LBrace, RBrace, Comma, Semi, Eof
 }
+
 #[derive(Clone, Debug)]
-struct SpannedToken { kind: Token, location: SourceLocation }
+pub struct SpannedToken { pub kind: Token, pub location: SourceLocation }
+
 struct TokenBuffer { tokens: Vec<SpannedToken>, location: SourceLocation }
 impl TokenBuffer {
     fn new() -> Self { Self { tokens: Vec::new(), location: SourceLocation { offset: 0, line: 1, column: 1 } } }
@@ -23,7 +39,7 @@ impl TokenBuffer {
 }
 
 #[derive(Clone, Debug)]
-enum Expr {
+pub enum Expr {
     Integer(i128), Float(f64), String(StringId), Input, This, Require(String), Name(StringId),
     GlobalName(StringId),
     Array(Vec<Expr>), Table(Vec<(TableLiteralKey, Expr)>), StructLiteral(String, Vec<(String, Expr)>),
@@ -34,9 +50,9 @@ enum Expr {
     Located { node: Box<Expr>, location: SourceLocation },
 }
 
-struct LexedTokens { tokens: Vec<SpannedToken>, strings: StringInterner }
+pub struct LexedTokens { pub tokens: Vec<SpannedToken>, pub strings: StringInterner }
 
-fn lex(source: &str) -> Result<LexedTokens, Error> {
+pub fn lex(source: &str) -> Result<LexedTokens, Error> {
     let mut result = TokenBuffer::new(); let mut strings = StringInterner::new(); let chars: Vec<char> = source.chars().collect(); let mut i = 0;
     while i < chars.len() {
         result.begin(&chars, i);
@@ -117,13 +133,16 @@ fn lex(source: &str) -> Result<LexedTokens, Error> {
 }
 
 #[derive(Clone, Debug)]
-enum TableLiteralKey { Index(Expr), Name(String) }
+pub enum TableLiteralKey { Index(Expr), Name(String) }
+
 #[derive(Clone, Debug)]
-struct StructMethod { name: String, args: Vec<(String, Type)>, body: Option<Vec<Statement>> }
+pub struct StructMethod { pub name: String, pub args: Vec<(String, Type)>, pub body: Option<Vec<Statement>> }
+
 #[derive(Clone, Debug)]
-enum MethodReceiver { Name(String), This }
+pub enum MethodReceiver { Name(String), This }
+
 #[derive(Clone, Debug)]
-enum Statement {
+pub enum Statement {
     Struct { name: String, fields: Vec<(String, Type)>, methods: Vec<StructMethod> },
     MethodDefinition { struct_name: String, method: String, args: Vec<(String, Type)>, body: Vec<Statement> },
     ExportLet { name: StringId, ty: Type, expr: Expr },
@@ -146,16 +165,17 @@ enum Statement {
     Located { node: Box<Statement>, location: SourceLocation },
 }
 
-struct Parser { tokens: Vec<SpannedToken>, strings: StringInterner, at: usize, last_location: SourceLocation }
+pub struct Parser { tokens: Vec<SpannedToken>, strings: StringInterner, at: usize, last_location: SourceLocation }
 impl Parser {
-    fn new(lexed: LexedTokens) -> Self { Self { tokens: lexed.tokens, strings: lexed.strings, at: 0, last_location: SourceLocation { offset: 0, line: 1, column: 1 } } }
+    pub fn new(lexed: LexedTokens) -> Self { Self { tokens: lexed.tokens, strings: lexed.strings, at: 0, last_location: SourceLocation { offset: 0, line: 1, column: 1 } } }
     fn string(&self, id: StringId) -> String { self.strings.resolve(id).to_owned() }
     fn peek(&self) -> &Token { &self.tokens[self.at].kind }
     fn location(&self) -> SourceLocation { self.tokens.get(self.at).map(|token| token.location).unwrap_or(self.last_location) }
     fn next(&mut self) -> Token { let token = self.tokens[self.at].clone(); self.at += 1; self.last_location = token.location; token.kind }
     fn need(&mut self, wanted: Token) -> Result<(), Error> { let got = self.next(); if got == wanted { Ok(()) } else { Err(Error::Parse(format!("expected {wanted:?}, got {got:?}"))) } }
-    fn program(&mut self) -> Result<Vec<Statement>, Error> { self.block().map_err(|error| error.at(self.location())) }
-    fn into_program(mut self) -> Result<(Vec<Statement>, StringInterner), Error> {
+    
+    pub fn program(&mut self) -> Result<Vec<Statement>, Error> { self.block().map_err(|error| error.at(self.location())) }
+    pub fn into_program(mut self) -> Result<(Vec<Statement>, StringInterner), Error> {
         let program = self.program()?;
         Ok((program, self.strings))
     }
@@ -549,14 +569,13 @@ impl Parser {
     }
 }
 #[derive(Clone, Debug)]
-enum TableEntry { Index, Name(Rc<str>) }
+pub enum TableEntry { Index, Name(Rc<str>) }
 
 #[derive(Clone, Debug)]
-enum ModuleExport { Value { slot: usize, ty: Type }, Function { entry: usize }, Struct(StructLayout) }
+pub enum ModuleExport { Value { slot: usize, ty: Type }, Function { entry: usize }, Struct(StructLayout) }
 
-/// A numeric type is selected while compiling, not by the VM hot loop.
 #[derive(Clone, Debug)]
-enum BinaryOp {
+pub enum BinaryOp {
     I8(BinOp), I16(BinOp), I32(BinOp), I64(BinOp),
     U8(BinOp), U16(BinOp), U32(BinOp), U64(BinOp),
     F16(BinOp), F32(BinOp), F64(BinOp),
@@ -564,15 +583,13 @@ enum BinaryOp {
 }
 
 #[derive(Clone, Debug)]
-struct ModuleArtifact { id: String, code: Rc<FlatBytecode>, exports: HashMap<String, ModuleExport> }
+pub struct ModuleArtifact { pub id: String, pub code: Rc<FlatBytecode>, pub exports: HashMap<String, ModuleExport> }
 
 #[derive(Clone, Debug)]
-struct HostSignature { arguments: Vec<Type>, result: Type }
+pub struct HostSignature { pub arguments: Vec<Type>, pub result: Type }
 
 #[derive(Clone, Debug)]
-/// Compiler-only intermediate instruction.  It is lowered before a program
-/// reaches the VM; the VM executes `FlatBytecode`, never this enum.
-enum IrOp {
+pub enum IrOp {
     AddI32, AddF32, AddF64,
     Push(Value), MakeString(Rc<str>), Input(Rc<Type>), Require(Rc<ModuleArtifact>), Load(usize), LoadCurrentReceiver,
     LoadCurrentField(Rc<StructField>), Store(usize), StoreIndex(usize, Rc<Type>), StoreTableIndex(usize, Rc<Type>),
@@ -590,18 +607,13 @@ enum IrOp {
     Return, Print, Printf(usize), Putc
 }
 
-// Kept as a source-compatible spelling for the compiler's private IR.  No
-// `Op` values are stored in executable bytecode or observed by the VM.
-type Op = IrOp;
+pub type Op = IrOp;
 
-/// Compact executable program: opcode and operands are consecutive 32-bit
-/// words.  Heap-owning data lives once in the constant pool, rather than in
-/// every entry of the instruction stream.
 #[derive(Clone, Debug, Default)]
-struct FlatBytecode { words: Vec<u32>, constants: Vec<Constant> }
+pub struct FlatBytecode { pub words: Vec<u32>, pub constants: Vec<Constant> }
 
 #[derive(Clone, Debug)]
-enum Constant {
+pub enum Constant {
     Value(Value), String(Rc<str>), Type(Rc<Type>), Module(Rc<ModuleArtifact>),
     Field(Rc<StructField>), Entries(Rc<[TableEntry]>), Layout(Rc<StructLayout>),
     Binary(BinaryOp), Unary(UnOp), Builtin(BuiltinFn), TensorInit(TensorInit),
@@ -609,7 +621,7 @@ enum Constant {
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug)]
-enum Opcode {
+pub enum Opcode {
     AddI32, AddF32, AddF64, Push, MakeString, Input, Require, Load, LoadCurrentReceiver,
     LoadCurrentField, Store, StoreIndex, StoreTableIndex, StoreTensorIndex, StoreTensorIndexF32,
     StoreField, StoreFieldIndex, StoreTableField, StoreCurrentField, MakeArray, MakeTable,
@@ -617,21 +629,18 @@ enum Opcode {
     TableKeysIndex, TableRemove, Field, TableField, ModuleField, Binary, Unary, Len,
     ConcatString, Builtin1, Builtin2, CallExternal, JumpIfFalse, Jump, JumpIfFalseKeep,
     JumpIfTrueKeep, CallMethod, CallCurrentMethod, CallModule, Return, Print, Printf, Putc,
-    // Appended to preserve the numeric representation of existing opcodes.
     Cast,
     TrackDestructor, UntrackDestructor,
 }
 
 impl Opcode {
-    fn from_word(word: u32) -> Result<Self, Error> {
-        // Opcodes are emitted only by this compiler.  Keep malformed external
-        // bytecode diagnosable rather than treating it as undefined behaviour.
+    pub fn from_word(word: u32) -> Result<Self, Error> {
         if word > Self::UntrackDestructor as u32 { return Err(Error::Runtime("invalid bytecode opcode".into())); }
         Ok(unsafe { std::mem::transmute(word) })
     }
 }
 
-enum DecodedOp<'a> {
+pub enum DecodedOp<'a> {
     AddI32, AddF32, AddF64, Push(&'a Value), MakeString(&'a Rc<str>), Input(&'a Rc<Type>), Require(&'a Rc<ModuleArtifact>), Load(usize), LoadCurrentReceiver,
     LoadCurrentField(&'a Rc<StructField>), Store(usize), StoreIndex(usize, &'a Rc<Type>), StoreTableIndex(usize, &'a Rc<Type>),
     StoreTensorIndex(usize, &'a Rc<Type>, usize), StoreTensorIndexF32(usize, usize),
@@ -650,7 +659,7 @@ impl FlatBytecode {
     fn constant(&mut self, constant: Constant) -> u32 { let index = self.constants.len() as u32; self.constants.push(constant); index }
     fn word(&mut self, value: usize) { self.words.push(value as u32); }
     fn op(&mut self, opcode: Opcode) { self.words.push(opcode as u32); }
-    fn lower(ir: Vec<IrOp>) -> Self {
+    pub fn lower(ir: Vec<IrOp>) -> Self {
         let mut out = Self::default();
         for op in ir { match op {
             IrOp::AddI32 => out.op(Opcode::AddI32), IrOp::AddF32 => out.op(Opcode::AddF32), IrOp::AddF64 => out.op(Opcode::AddF64),
@@ -685,10 +694,9 @@ impl FlatBytecode {
             IrOp::Return => out.op(Opcode::Return), IrOp::Print => out.op(Opcode::Print), IrOp::Printf(v) => { out.op(Opcode::Printf); out.word(v); }, IrOp::Putc => out.op(Opcode::Putc),
         } while out.words.len() % 4 != 0 { out.words.push(0); } } out
     }
-    /// Decode by borrowing words and constant-pool entries.  This is inlined
-    /// into `Vm::run_from`; it never reconstructs compiler IR or allocates.
+    
     #[inline(always)]
-    fn decode(&self, mut pc: usize) -> Result<(DecodedOp<'_>, usize), Error> {
+    pub fn decode(&self, mut pc: usize) -> Result<(DecodedOp<'_>, usize), Error> {
         let instruction_start = pc;
         let opcode=Opcode::from_word(*self.words.get(pc).ok_or_else(|| Error::Runtime("truncated bytecode".into()))?)?; pc+=1;
         let word=|pc: &mut usize| -> Result<usize, Error> { let v=*self.words.get(*pc).ok_or_else(|| Error::Runtime("truncated bytecode operand".into()))? as usize; *pc+=1; Ok(v) };
@@ -715,20 +723,16 @@ impl FlatBytecode {
             Opcode::JumpIfFalse=>DecodedOp::JumpIfFalse(word(&mut pc)?), Opcode::Jump=>DecodedOp::Jump(word(&mut pc)?), Opcode::JumpIfFalseKeep=>DecodedOp::JumpIfFalseKeep(word(&mut pc)?), Opcode::JumpIfTrueKeep=>DecodedOp::JumpIfTrueKeep(word(&mut pc)?), Opcode::CallMethod=>DecodedOp::CallMethod(word(&mut pc)?,word(&mut pc)?), Opcode::CallCurrentMethod=>DecodedOp::CallCurrentMethod(word(&mut pc)?), Opcode::CallModule=>{let a=word(&mut pc)?;c!(Constant::String(b));DecodedOp::CallModule(a,b)}, Opcode::TrackDestructor=>DecodedOp::TrackDestructor(word(&mut pc)?,word(&mut pc)?), Opcode::UntrackDestructor=>DecodedOp::UntrackDestructor(word(&mut pc)?), Opcode::Return=>DecodedOp::Return, Opcode::Print=>DecodedOp::Print, Opcode::Printf=>DecodedOp::Printf(word(&mut pc)?), Opcode::Putc=>DecodedOp::Putc,
         }; Ok((decoded,instruction_start + 4))
     }
-
 }
 
-/// Built-ins are resolved during compilation. Keeping their identity in the
-/// opcode avoids retaining and repeatedly comparing function-name strings in
-/// the VM's hot loop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BuiltinFn {
+pub enum BuiltinFn {
     Sqrt, Sin, Cos, Tan, Asin, Acos, Atan, Floor, Ceil, Round, Abs,
     Pow, Min, Max, Atan2,
 }
 
 impl BuiltinFn {
-    fn unary(name: &str) -> Option<Self> {
+    pub fn unary(name: &str) -> Option<Self> {
         Some(match name {
             "sqrt" => Self::Sqrt, "sin" => Self::Sin, "cos" => Self::Cos,
             "tan" => Self::Tan, "asin" => Self::Asin, "acos" => Self::Acos,
@@ -738,7 +742,7 @@ impl BuiltinFn {
         })
     }
 
-    fn binary(name: &str) -> Option<Self> {
+    pub fn binary(name: &str) -> Option<Self> {
         Some(match name {
             "pow" => Self::Pow, "min" => Self::Min, "max" => Self::Max,
             "atan2" => Self::Atan2,
@@ -748,40 +752,55 @@ impl BuiltinFn {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum TensorInit { Zeros, Random }
+pub enum TensorInit { Zeros, Random }
 
 #[derive(Clone, Debug)]
-struct DestructorLocal { slot: usize, struct_name: String }
+pub struct DestructorLocal { pub slot: usize, pub struct_name: String }
 
 #[derive(Default)]
-struct ScopeContext { destructors: Vec<DestructorLocal> }
+pub struct ScopeContext { pub destructors: Vec<DestructorLocal> }
 
-struct LoopContext {
-    break_jumps: Vec<usize>,
-    continue_jumps: Vec<usize>,
-    continue_target: usize,
-    scope_base: usize,
+pub struct LoopContext {
+    pub break_jumps: Vec<usize>,
+    pub continue_jumps: Vec<usize>,
+    pub continue_target: usize,
+    pub scope_base: usize,
 }
 
-struct Compiler {
-    names: HashMap<String, (usize, Type)>, structs: HashMap<String, StructLayout>,
-    globals: HashMap<String, (usize, Type)>,
-    methods: HashMap<(String, String), Option<usize>>, pending_method_calls: Vec<(usize, String, String)>,
-    current_method_fields: Option<HashMap<String, StructField>>, current_method_struct: Option<String>,
-    module_root: Option<PathBuf>, module_artifacts: HashMap<String, ModuleArtifact>,
-    compiling_modules: Rc<RefCell<HashSet<String>>>,
-    exports: HashMap<String, ModuleExport>, extern_functions: HashMap<String, HostSignature>, code: Vec<Op>,
-    interned_names: HashMap<String, Rc<str>>,
-    strings: StringInterner,
-    next_slot: usize, scope_depth: usize, scope_stack: Vec<ScopeContext>, loops: Vec<LoopContext>
+pub struct Compiler {
+    pub names: HashMap<String, (usize, Type)>, 
+    pub structs: HashMap<String, StructLayout>,
+    pub globals: HashMap<String, (usize, Type)>,
+    pub methods: HashMap<(String, String), Option<usize>>, 
+    pub pending_method_calls: Vec<(usize, String, String)>,
+    pub current_method_fields: Option<HashMap<String, StructField>>, 
+    pub current_method_struct: Option<String>,
+    pub module_root: Option<PathBuf>, 
+    pub module_artifacts: HashMap<String, ModuleArtifact>,
+    pub compiling_modules: Rc<RefCell<HashSet<String>>>,
+    pub exports: HashMap<String, ModuleExport>, 
+    pub extern_functions: HashMap<String, HostSignature>, 
+    pub code: Vec<Op>,
+    pub interned_names: HashMap<String, Rc<str>>,
+    pub strings: StringInterner,
+    pub next_slot: usize, 
+    pub scope_depth: usize, 
+    pub scope_stack: Vec<ScopeContext>, 
+    pub loops: Vec<LoopContext>
 }
 
-impl Default for Compiler { fn default() -> Self { Self { names: HashMap::new(), structs: HashMap::new(), globals: HashMap::new(), methods: HashMap::new(), pending_method_calls: Vec::new(), current_method_fields: None, current_method_struct: None, module_root: None, module_artifacts: HashMap::new(), compiling_modules: Rc::new(RefCell::new(HashSet::new())), exports: HashMap::new(), extern_functions: HashMap::new(), code: Vec::new(), interned_names: HashMap::new(), strings: StringInterner::new(), next_slot: 0, scope_depth: 0, scope_stack: Vec::new(), loops: Vec::new() } } }
+impl Default for Compiler { 
+    fn default() -> Self { 
+        Self { 
+            names: HashMap::new(), structs: HashMap::new(), globals: HashMap::new(), methods: HashMap::new(), pending_method_calls: Vec::new(), current_method_fields: None, current_method_struct: None, module_root: None, module_artifacts: HashMap::new(), compiling_modules: Rc::new(RefCell::new(HashSet::new())), exports: HashMap::new(), extern_functions: HashMap::new(), code: Vec::new(), interned_names: HashMap::new(), strings: StringInterner::new(), next_slot: 0, scope_depth: 0, scope_stack: Vec::new(), loops: Vec::new() 
+        } 
+    } 
+}
 
 impl Compiler {
-    fn with_module_root(module_root: PathBuf) -> Self { Self { module_root: Some(module_root), ..Self::default() } }
-    fn with_extern_functions(extern_functions: HashMap<String, HostSignature>) -> Self { Self { extern_functions, ..Self::default() } }
-    fn with_strings(mut self, strings: StringInterner) -> Self { self.strings = strings; self }
+    pub fn with_module_root(module_root: PathBuf) -> Self { Self { module_root: Some(module_root), ..Self::default() } }
+    pub fn with_extern_functions(extern_functions: HashMap<String, HostSignature>) -> Self { Self { extern_functions, ..Self::default() } }
+    pub fn with_strings(mut self, strings: StringInterner) -> Self { self.strings = strings; self }
     fn string(&self, id: StringId) -> &str { self.strings.resolve(id) }
 
     fn intern_name(&mut self, name: &str) -> Rc<str> {
@@ -791,8 +810,6 @@ impl Compiler {
         interned
     }
 
-    /// Compile a lexical block and then discard bindings and slots introduced
-    /// inside it. Slots are reused by later blocks.
     fn scoped_block(&mut self, body: Vec<Statement>) -> Result<(), Error> {
         let saved_names = self.names.clone();
         let saved_next_slot = self.next_slot;
@@ -807,9 +824,6 @@ impl Compiler {
         result
     }
 
-    /// A destructor is an optional zero-argument method with the same name as
-    /// its struct.  Structs without such a method keep their existing value
-    /// semantics and require no cleanup bytecode.
     fn destructor_target(&self, struct_name: &str) -> Option<usize> {
         self.methods.get(&(struct_name.to_owned(), struct_name.to_owned())).copied().flatten()
     }
@@ -842,7 +856,6 @@ impl Compiler {
         Ok(())
     }
 
-    /// Emit cleanup for all lexical scopes that the control-flow edge leaves.
     fn emit_destructors_from_scope(&mut self, scope_base: usize) -> Result<(), Error> {
         let destructors = self.scope_stack.get(scope_base..)
             .ok_or_else(|| Error::Runtime("invalid loop scope for destructors".into()))?
@@ -881,12 +894,10 @@ impl Compiler {
         }
     }
 
-    fn compile(mut self, program: Vec<Statement>) -> Result<FlatBytecode, Error> { self.compile_program(program)?; Ok(FlatBytecode::lower(self.code)) }
+    pub fn compile(mut self, program: Vec<Statement>) -> Result<FlatBytecode, Error> { self.compile_program(program)?; Ok(FlatBytecode::lower(self.code)) }
 
-    fn compile_module(mut self, id: String, program: Vec<Statement>) -> Result<ModuleArtifact, Error> {
+    pub fn compile_module(mut self, id: String, program: Vec<Statement>) -> Result<ModuleArtifact, Error> {
         self.compile_program(program)?;
-        // Entries are initially compiler-IR indices; each executable record is
-        // four u32 words in the final stream.
         for export in self.exports.values_mut() {
             if let ModuleExport::Function { entry } = export { *entry *= 4; }
         }
@@ -906,7 +917,23 @@ impl Compiler {
         Ok(())
     }
 
+    // ИЗМЕНЁННЫЙ МЕТОД: проверяет наличие нативного модуля перед попыткой чтения с диска
     fn load_module(&mut self, requested: &str) -> Result<ModuleArtifact, Error> {
+        // 1. Проверяем наличие нативного расширения (например, "candle")
+        let ext_names: Vec<String> = crate::ext::available_extensions()
+            .into_iter().map(|e| e.name().to_string()).collect();
+            
+        if ext_names.contains(&requested.to_string()) {
+            let artifact = ModuleArtifact {
+                id: requested.to_string(),
+                code: Rc::new(FlatBytecode::default()),
+                exports: HashMap::new(),
+            };
+            self.module_artifacts.insert(requested.to_string(), artifact.clone());
+            return Ok(artifact);
+        }
+
+        // 2. Старый код загрузки .l0 файла с диска
         let root = self.module_root.as_ref().ok_or_else(|| Error::Type("require is available only when executing an .l0 file".into()))?;
         let relative = Path::new(requested);
         if relative.is_absolute() { return Err(Error::Type("module path must be relative".into())); }
@@ -914,6 +941,7 @@ impl Compiler {
         let canonical = fs::canonicalize(&candidate).map_err(|error| Error::Runtime(format!("cannot load module '{requested}': {error}")))?;
         if !canonical.starts_with(root) { return Err(Error::Type(format!("module '{requested}' escapes the module root"))); }
         let id = canonical.to_string_lossy().into_owned();
+        
         if let Some(module) = self.module_artifacts.get(&id) { return Ok(module.clone()); }
         if !self.compiling_modules.borrow_mut().insert(id.clone()) {
             return Err(Error::Type(format!("cyclic module import involving '{requested}'")));
@@ -937,6 +965,7 @@ impl Compiler {
         for (name, export) in module.exports { if let ModuleExport::Struct(mut layout) = export { let alias = format!("{binding}.{name}"); if self.structs.contains_key(&alias) { return Err(Error::Type(format!("imported struct '{alias}' conflicts with an existing struct"))); } layout.name = alias.clone(); self.structs.insert(alias, layout); } }
         Ok(())
     }
+
     fn compile_module_function(&mut self, name: String, body: Vec<Statement>) -> Result<(), Error> {
         if self.exports.contains_key(&name) { return Err(Error::Type(format!("module already exports '{name}'"))); }
         let skip_body = self.code.len(); self.code.push(Op::Jump(usize::MAX)); let entry = self.code.len();
@@ -944,6 +973,7 @@ impl Compiler {
         self.code.push(Op::Return); let after_body = self.code.len(); self.code[skip_body] = Op::Jump(after_body);
         self.exports.insert(name, ModuleExport::Function { entry }); Ok(())
     }
+
     fn compile_method_body(&mut self, struct_name: &str, method_name: &str, args: Vec<(String, Type)>, body: Vec<Statement>) -> Result<(), Error> {
         if method_name == struct_name && !args.is_empty() {
             return Err(Error::Type(format!("destructor '{struct_name}' must not accept arguments")));
@@ -967,7 +997,7 @@ impl Compiler {
         let saved_scope_stack = std::mem::take(&mut self.scope_stack);
         self.scope_depth += 1;
         self.scope_stack.push(ScopeContext::default());
-        // Read the arguments and bind them to local variable slots
+        
         for (arg_name, arg_ty) in args.into_iter().rev() {
             let slot = self.next_slot;
             self.next_slot += 1;
@@ -981,9 +1011,7 @@ impl Compiler {
         self.current_method_struct = previous_struct;
         self.names = saved_names;
         self.scope_stack = saved_scope_stack;
-        // Method-local slots remain reserved in the VM's shared local store.
-        // Reusing them for subsequently declared globals can overwrite a
-        // method receiver or one of its locals during a call.
+        
         self.scope_depth = saved_scope_depth;
         body_result?;
         self.code.push(Op::Return);
@@ -991,6 +1019,7 @@ impl Compiler {
         self.code[skip_body] = Op::Jump(after_body);
         Ok(())
     }
+
     fn statement(&mut self, stmt: Statement) -> Result<(), Error> { match stmt {
         Statement::Located { node, location } => return self.statement(*node).map_err(|error| error.at(location)),
         Statement::Struct { name, fields, methods } => {
@@ -1055,7 +1084,7 @@ impl Compiler {
             let name = self.string(name).to_owned();
             let found = self.expr(expr, Some(&ty))?;
             if !types_compatible(&ty, &found) { return Err(Error::Type(format!("'{name}' declared {ty}, but expression has type {found}"))); }
-
+            if is_numeric(&ty) && ty != found { self.code.push(Op::Cast(Rc::new(ty.clone()))); }
             let is_new_binding = !self.names.contains_key(&name);
             let slot = if let Some((existing_slot, existing_ty)) = self.names.get(&name) {
                 if existing_ty != &ty { return Err(Error::Type(format!("cannot redefine '{name}' with a different type"))); }
@@ -1076,10 +1105,24 @@ impl Compiler {
             }
             Ok(())
         },
-        Statement::Assign { name, expr } => { if let Some(field) = self.current_method_fields.as_ref().and_then(|fields| fields.get(&name)).cloned() { let found = self.expr(expr, Some(&field.ty))?; if !types_compatible(&field.ty, &found) { return Err(Error::Type(format!("field '{name}' is {}, but expression has type {found}", field.ty))); } self.code.push(Op::StoreCurrentField(Rc::new(field))); Ok(()) } else { let (slot, ty) = self.names.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))?; let found = self.expr(expr, Some(&ty))?; if !types_compatible(&ty, &found) { return Err(Error::Type(format!("'{name}' is {ty}, but expression has type {found}"))); } self.code.push(Op::Store(slot)); Ok(()) } },
+        Statement::Assign { name, expr } => { 
+            if let Some(field) = self.current_method_fields.as_ref().and_then(|fields| fields.get(&name)).cloned() { 
+                let found = self.expr(expr, Some(&field.ty))?; 
+                if !types_compatible(&field.ty, &found) { return Err(Error::Type(format!("field '{name}' is {}, but expression has type {found}", field.ty))); } 
+                if is_numeric(&field.ty) && field.ty != found { self.code.push(Op::Cast(Rc::new(field.ty.clone()))); } 
+                self.code.push(Op::StoreCurrentField(Rc::new(field))); 
+                Ok(()) 
+            } else { 
+                let (slot, ty) = self.names.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))?; 
+                let found = self.expr(expr, Some(&ty))?; 
+                if !types_compatible(&ty, &found) { return Err(Error::Type(format!("'{name}' is {ty}, but expression has type {found}"))); } 
+                if is_numeric(&ty) && ty != found { self.code.push(Op::Cast(Rc::new(ty.clone()))); } 
+                self.code.push(Op::Store(slot)); 
+                Ok(()) 
+            } 
+        },
         Statement::GlobalAssign { name, expr } => { let (slot, ty) = self.globals.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown global name '{name}'")))?; let found = self.expr(expr, Some(&ty))?; if !types_compatible(&ty, &found) { return Err(Error::Type(format!("global '{name}' is {ty}, but expression has type {found}"))); } self.code.push(Op::Store(slot)); Ok(()) },
         Statement::SetIndex { name, indices, expr } => {
-            // Исправление: сначала проверяем, является ли name полем текущей структуры
             let (slot, container_ty) = if let Some(field) = self.current_method_fields.as_ref().and_then(|fields| fields.get(&name)).cloned() {
                 let temp_slot = self.next_slot;
                 self.next_slot += 1;
@@ -1205,7 +1248,6 @@ impl Compiler {
             self.next_slot += 1;
             let end_slot = self.next_slot;
             self.next_slot += 1;
-            // The expressions were emitted in source order, so store the end first.
             self.code.push(Op::Store(end_slot));
             self.code.push(Op::Store(index_slot));
             self.names.insert(name.clone(), (index_slot, Type::I32));
@@ -1236,7 +1278,6 @@ impl Compiler {
         Statement::ForIn { name, iterable, body } => {
             if self.names.contains_key(&name) { return Err(Error::Type(format!("loop variable '{name}' is already defined"))); }
 
-            // 1. Validate the iterable type
             let iterable_ty = self.expr(iterable, None)?;
             let element_ty = match &iterable_ty {
                 Type::Array(inner) => (**inner).clone(),
@@ -1244,37 +1285,30 @@ impl Compiler {
                 Type::Tensor(inner, 1) => (**inner).clone(),
                 _ => return Err(Error::Type(format!("cannot iterate over {iterable_ty}; 'for ... in' requires a vector, 1D tensor, or table_keys"))),
             };
-            // 2. Allocate 4 internal slots (iterable, length, index, and the loop variable itself)
             let iterable_slot = self.next_slot; self.next_slot += 1;
             let len_slot      = self.next_slot; self.next_slot += 1;
             let index_slot    = self.next_slot; self.next_slot += 1;
             let item_slot     = self.next_slot; self.next_slot += 1;
 
-            // Store iterable object to ensure it is only evaluated once
             self.code.push(Op::Store(iterable_slot));
 
-            // len(iterable)
             self.code.push(Op::Load(iterable_slot));
             self.code.push(Op::Len);
             self.code.push(Op::Store(len_slot));
 
-            // index = 0
             self.code.push(Op::Push(Value::I32(0)));
             self.code.push(Op::Store(index_slot));
 
-            // Register loop variable bindings for the inner block
             self.names.insert(name.clone(), (item_slot, element_ty.clone()));
 
             let loop_start = self.code.len();
 
-            // Condition: if !(index < len) jump to end
             self.code.push(Op::Load(index_slot));
             self.code.push(Op::Load(len_slot));
             self.code.push(Op::Binary(BinaryOp::I32(BinOp::Lt)));
             let exit_jump = self.code.len();
             self.code.push(Op::JumpIfFalse(usize::MAX));
 
-            // Fetch item: item = iterable[index]
             self.code.push(Op::Load(iterable_slot));
             self.code.push(Op::Load(index_slot));
             match &iterable_ty {
@@ -1290,11 +1324,10 @@ impl Compiler {
                 _ => unreachable!(),
             }
             self.code.push(Op::Store(item_slot));
-            // Execute user block
+            
             self.loops.push(LoopContext { break_jumps: Vec::new(), continue_jumps: Vec::new(), continue_target: usize::MAX, scope_base: self.scope_stack.len() });
             self.scoped_block(body)?;
 
-            // Increment: index = index + 1
             let increment_start = self.code.len();
             self.code.push(Op::Load(index_slot));
             self.code.push(Op::Push(Value::I32(1)));
@@ -1302,7 +1335,6 @@ impl Compiler {
             self.code.push(Op::Store(index_slot));
             self.code.push(Op::Jump(loop_start));
 
-            // Patch jump offsets
             let loop_end = self.code.len();
             self.code[exit_jump] = Op::JumpIfFalse(loop_end);
 
@@ -1311,9 +1343,8 @@ impl Compiler {
             for jump in context.break_jumps { self.code[jump] = Op::Jump(loop_end); }
             for jump in context.continue_jumps { self.code[jump] = Op::Jump(context.continue_target); }
 
-            // Cleanup
             self.names.remove(&name);
-            self.next_slot = iterable_slot; // Rewind the 4 temporary slots so they can be reused
+            self.next_slot = iterable_slot; 
             Ok(())
         },
         Statement::Break => {
@@ -1471,7 +1502,7 @@ impl Compiler {
                 if lt != Type::Bool { return Err(Error::Type("logical operators require bool".into())); }
 
                 let jump_idx = self.code.len();
-                if op == BinOp::And { // <-- Removed *
+                if op == BinOp::And {
                     self.code.push(Op::JumpIfFalseKeep(usize::MAX));
                 } else {
                     self.code.push(Op::JumpIfTrueKeep(usize::MAX));
@@ -1481,7 +1512,7 @@ impl Compiler {
                 if rt != Type::Bool { return Err(Error::Type("logical operators require bool".into())); }
 
                 let end_idx = self.code.len();
-                if op == BinOp::And { // <-- Removed *
+                if op == BinOp::And {
                     self.code[jump_idx] = Op::JumpIfFalseKeep(end_idx);
                 } else {
                     self.code[jump_idx] = Op::JumpIfTrueKeep(end_idx);

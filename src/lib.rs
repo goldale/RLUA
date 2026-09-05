@@ -1,14 +1,23 @@
 //! L0: experimental typed Lua-like language with a stack bytecode VM.
-//! The public FFI boundary is C ABI, so it is callable both from C and Rust.
-use std::fs;
-use std::fmt;
-use std::rc::Rc;
+
+pub mod compiler;
+pub mod ffi;
+pub mod ext;
+
+#[cfg(test)]
+mod tests;
+
+pub use compiler::*;
+pub use ffi::*;
+
 use std::cell::RefCell;
-use std::os::raw::c_int;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::ffi::{CStr, CString};
+use std::fmt;
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+
 use cudarc::driver::{CudaSlice, DeviceSlice};
 use half::f16;
 
@@ -19,8 +28,8 @@ pub struct StringId(pub u32);
 
 #[derive(Clone, Debug, Default)]
 pub struct StringInterner {
-    strings: Vec<Rc<str>>,
-    lookup: std::collections::HashMap<Rc<str>, StringId>,
+    pub strings: Vec<Rc<str>>,
+    pub lookup: HashMap<Rc<str>, StringId>,
 }
 impl StringInterner {
     pub fn new() -> Self { Self::default() }
@@ -34,12 +43,14 @@ impl StringInterner {
     }
     pub fn resolve(&self, id: StringId) -> &str { &self.strings[id.0 as usize] }
 }
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Type {
     I8, I16, I32, I64, U8, U16, U32, U64, F16, F32, F64, Bool, String,
     Array(Box<Type>), Tensor(Box<Type>, usize), Table(Box<Type>), TableKey, TableKeys,
     Struct(String), Module(String), DArray, DTensor, DCudaTensor,
 }
+
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -63,39 +74,32 @@ impl fmt::Display for Type {
         }
     }
 }
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct HeapRef(usize);
+pub struct HeapRef(pub usize);
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     I8(i8), I16(i16), I32(i32), I64(i64), U8(u8), U16(u16), U32(u32), U64(u64),
-    /// IEEE-754 binary16 bits. Arithmetic widens to f32 and rounds back to f16.
     F16(u16), F32(f32), F64(f64), Bool(bool), String(HeapRef),
-    /// A handle to homogeneous scalar values packed in canonical little-endian form.
     Array(HeapRef, Box<Type>),
-    /// An opaque tensor handle plus its compiler-owned complete static type.
-    /// Keeping a shared `Type::Tensor` replaces the former `(Box<Type>, usize)`
-    /// payload and keeps each stack slot within three machine words.
     Tensor(HeapRef, Rc<Type>),
     CudaTensor(HeapRef, Rc<Type>),
     Table(HeapRef, Box<Type>),
-    /// `TableKey::Index(i128)` has 16-byte alignment; boxing it prevents that
-    /// uncommon key representation from raising the alignment of every stack
-    /// value.
     TableKey(Rc<TableKey>),
     TableKeys(HeapRef),
-    /// Layouts are immutable compiler metadata.  Keeping a shared reference
-    /// here avoids embedding the `String` and `Vec` headers in every VM slot.
     Struct(HeapRef, Rc<StructLayout>),
     Module(String),
 }
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TableKey { Index(i128), Name(Rc<str>) }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct StructField { name: String, ty: Type, index: usize }
+pub struct StructField { pub name: String, pub ty: Type, pub index: usize }
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StructLayout { name: String, fields: Vec<StructField> }
+pub struct StructLayout { pub name: String, pub fields: Vec<StructField> }
 
 impl Value {
     pub fn ty(&self) -> Type {
@@ -106,8 +110,7 @@ impl Value {
             Self::F32(_) => Type::F32, Self::F64(_) => Type::F64, Self::Bool(_) => Type::Bool,
             Self::String(_) => Type::String,
             Self::Array(_, element) => Type::Array(element.clone()),
-            Self::Tensor(_, ty) => ty.as_ref().clone(),
-            Self::CudaTensor(_, ty) => ty.as_ref().clone(),
+            Self::Tensor(_, ty) | Self::CudaTensor(_, ty) => ty.as_ref().clone(),
             Self::Table(_, element) => Type::Table(element.clone()),
             Self::TableKey(_) => Type::TableKey,
             Self::TableKeys(_) => Type::TableKeys,
@@ -115,13 +118,15 @@ impl Value {
             Self::Module(id) => Type::Module(id.clone()),
         }
     }
-    fn pack_array(values: Vec<Value>, element: &Type) -> Result<Vec<u8>, Error> {
+    
+    pub fn pack_array(values: Vec<Value>, element: &Type) -> Result<Vec<u8>, Error> {
         let element_size = scalar_size(element)?;
         let mut bytes = Vec::with_capacity(values.len().checked_mul(element_size).ok_or_else(|| Error::Runtime("array is too large".into()))?);
         for value in values { encode_scalar(&value, element, &mut bytes)?; }
         Ok(bytes)
     }
 }
+
 #[derive(Clone, Debug)]
 pub enum HeapObject {
     Array { bytes: Vec<u8>, element: Type },
@@ -132,22 +137,21 @@ pub enum HeapObject {
     TableKeys(Vec<TableKey>),
     String(String),
 }
+
 #[derive(Clone, Debug)]
 pub enum HeapSlot {
     Free { next_free: Option<usize> },
     Occupied { marked: bool, object: HeapObject },
 }
-/// Non-moving mark-and-sweep storage for every reference value in the VM.
+
 #[derive(Debug)]
 pub struct Heap {
     pub slots: Vec<HeapSlot>,
     pub free_head: Option<usize>,
-    /// Estimated bytes owned by live heap objects. This is deliberately based
-    /// on payload capacity rather than object count, since one tensor can be
-    /// substantially larger than many small objects.
     pub allocated_bytes: usize,
     pub threshold_bytes: usize,
 }
+
 impl Default for Heap {
     fn default() -> Self {
         Self {
@@ -158,6 +162,7 @@ impl Default for Heap {
         }
     }
 }
+
 impl Heap {
     fn object_size(object: &HeapObject) -> usize {
         use std::mem::size_of;
@@ -175,6 +180,7 @@ impl Heap {
             },
         }
     }
+
     pub fn allocate(&mut self, object: HeapObject) -> HeapRef {
         self.allocated_bytes = self.allocated_bytes.saturating_add(Self::object_size(&object));
         if let Some(index) = self.free_head {
@@ -188,19 +194,22 @@ impl Heap {
         self.slots.push(HeapSlot::Occupied { marked: false, object });
         HeapRef(index)
     }
+
     pub fn get(&self, reference: HeapRef) -> Result<&HeapObject, Error> {
         match self.slots.get(reference.0) {
             Some(HeapSlot::Occupied { object, .. }) => Ok(object),
             _ => Err(Error::Runtime("dangling heap reference".into())),
         }
     }
+
     pub fn get_mut(&mut self, reference: HeapRef) -> Result<&mut HeapObject, Error> {
         match self.slots.get_mut(reference.0) {
             Some(HeapSlot::Occupied { object, .. }) => Ok(object),
             _ => Err(Error::Runtime("dangling heap reference".into())),
         }
     }
-    fn heap_ref(value: &Value) -> Option<HeapRef> {
+
+    pub fn heap_ref(value: &Value) -> Option<HeapRef> {
         match value {
             Value::Array(reference, _) | Value::Tensor(reference, _) | Value::String(reference)
             | Value::Table(reference, _) | Value::TableKeys(reference) | Value::Struct(reference, _)
@@ -208,11 +217,8 @@ impl Heap {
             _ => None,
         }
     }
+
     fn mark_reference(&mut self, root: HeapRef) {
-        // Heap graphs can be arbitrarily deep. Mark iteratively so a valid
-        // script cannot exhaust the host thread stack during collection. The
-        // worklist contains only compact HeapRef values. In particular, we do
-        // not clone a table's or struct's values into a temporary vector.
         let mut work = vec![root];
         while let Some(reference) = work.pop() {
             let newly_marked = match self.slots.get_mut(reference.0) {
@@ -223,9 +229,6 @@ impl Heap {
             };
             if !newly_marked { continue; }
 
-            // The mutable borrow used to mark the slot has ended. Extending
-            // the worklist directly keeps traversal allocation-free except
-            // for the worklist's own amortized growth.
             match &self.slots[reference.0] {
                 HeapSlot::Occupied { object, .. } => match object {
                     HeapObject::Table { entries, .. } => {
@@ -241,7 +244,8 @@ impl Heap {
             }
         }
     }
-    fn collect(&mut self, roots: impl IntoIterator<Item = HeapRef>) -> usize {
+
+    pub fn collect(&mut self, roots: impl IntoIterator<Item = HeapRef>) -> usize {
         for root in roots { self.mark_reference(root); }
         let mut reclaimed = 0;
 
@@ -272,11 +276,12 @@ impl Heap {
         self.threshold_bytes = self.allocated_bytes.saturating_mul(2).max(64 * 1024);
         reclaimed
     }
-    fn should_collect(&self) -> bool { self.allocated_bytes >= self.threshold_bytes }
+
+    pub fn should_collect(&self) -> bool { self.allocated_bytes >= self.threshold_bytes }
 }
 
-fn table_key_display(key: &TableKey) -> String { match key { TableKey::Index(index) => format!("[{index}]"), TableKey::Name(name) => name.to_string() } }
-fn table_key_from_value(heap: &Heap, value: &Value) -> Result<TableKey, Error> {
+pub fn table_key_display(key: &TableKey) -> String { match key { TableKey::Index(index) => format!("[{index}]"), TableKey::Name(name) => name.to_string() } }
+pub fn table_key_from_value(heap: &Heap, value: &Value) -> Result<TableKey, Error> {
     let index = match value {
         Value::I8(v) => *v as i128, Value::I16(v) => *v as i128, Value::I32(v) => *v as i128, Value::I64(v) => *v as i128,
         Value::U8(v) => *v as i128, Value::U16(v) => *v as i128, Value::U32(v) => *v as i128, Value::U64(v) => *v as i128,
@@ -303,9 +308,9 @@ pub fn type_size(ty: &Type) -> Option<usize> {
     }
 }
 
-fn scalar_size(ty: &Type) -> Result<usize, Error> { type_size(ty).ok_or_else(|| Error::Type("packed storage supports scalar field and element types only".into())) }
+pub fn scalar_size(ty: &Type) -> Result<usize, Error> { type_size(ty).ok_or_else(|| Error::Type("packed storage supports scalar field and element types only".into())) }
 
-fn encode_scalar(value: &Value, element: &Type, bytes: &mut Vec<u8>) -> Result<(), Error> {
+pub fn encode_scalar(value: &Value, element: &Type, bytes: &mut Vec<u8>) -> Result<(), Error> {
     if &value.ty() != element { return Err(Error::Runtime("VM array type invariant broken".into())); }
     match value {
         Value::I8(v) => bytes.push(*v as u8), Value::U8(v) => bytes.push(*v),
@@ -319,7 +324,8 @@ fn encode_scalar(value: &Value, element: &Type, bytes: &mut Vec<u8>) -> Result<(
     }
     Ok(())
 }
-fn decode_scalar(bytes: &[u8], index: usize, element: &Type) -> Result<Value, Error> {
+
+pub fn decode_scalar(bytes: &[u8], index: usize, element: &Type) -> Result<Value, Error> {
     let size = scalar_size(element)?;
     let offset = index.checked_mul(size).ok_or_else(|| Error::Runtime("array index too large".into()))?;
     if offset + size > bytes.len() {
@@ -338,7 +344,7 @@ fn decode_scalar(bytes: &[u8], index: usize, element: &Type) -> Result<Value, Er
     }
 }
 
-fn write_scalar(bytes: &mut [u8], index: usize, value: &Value, element: &Type) -> Result<(), Error> {
+pub fn write_scalar(bytes: &mut [u8], index: usize, value: &Value, element: &Type) -> Result<(), Error> {
     let size = scalar_size(element)?;
     let offset = index.checked_mul(size).ok_or_else(|| Error::Runtime("array index too large".into()))?;
     if offset + size > bytes.len() {
@@ -381,35 +387,79 @@ impl fmt::Display for Value {
         }
     }
 }
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SourceLocation { pub offset: usize, pub line: usize, pub column: usize }
+
 impl SourceLocation {
-    fn at(chars: &[char], offset: usize) -> Self { let mut line = 1; let mut column = 1; for ch in &chars[..offset.min(chars.len())] { if *ch == '\n' { line += 1; column = 1; } else { column += 1; } } Self { offset, line, column } }
+    pub fn at(chars: &[char], offset: usize) -> Self { 
+        let mut line = 1; let mut column = 1; 
+        for ch in &chars[..offset.min(chars.len())] { 
+            if *ch == '\n' { line += 1; column = 1; } else { column += 1; } 
+        } 
+        Self { offset, line, column } 
+    }
 }
+
 #[derive(Debug, Clone, PartialEq)]
-pub enum Error { Lex(String), Parse(String), Type(String), Runtime(String), Located { source: Box<Error>, location: SourceLocation } }
-impl Error {
-    fn at(self, location: SourceLocation) -> Self { match self { Self::Located { .. } => self, source => Self::Located { source: Box::new(source), location } } }
-    pub fn location(&self) -> Option<SourceLocation> { match self { Self::Located { location, .. } => Some(*location), _ => None } }
+pub enum Error { 
+    Lex(String), Parse(String), Type(String), Runtime(String), 
+    Located { source: Box<Error>, location: SourceLocation } 
 }
-impl fmt::Display for Error { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { match self { Self::Lex(message) => write!(f, "lex error: {message}"), Self::Parse(message) => write!(f, "parse error: {message}"), Self::Type(message) => write!(f, "type error: {message}"), Self::Runtime(message) => write!(f, "runtime error: {message}"), Self::Located { source, location } => write!(f, "{source} at line {}, column {}", location.line, location.column), } } }
+
+impl Error {
+    pub fn at(self, location: SourceLocation) -> Self { 
+        match self { 
+            Self::Located { .. } => self, 
+            source => Self::Located { source: Box::new(source), location } 
+        } 
+    }
+    pub fn location(&self) -> Option<SourceLocation> { 
+        match self { Self::Located { location, .. } => Some(*location), _ => None } 
+    }
+}
+
+impl fmt::Display for Error { 
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { 
+        match self { 
+            Self::Lex(message) => write!(f, "lex error: {message}"), 
+            Self::Parse(message) => write!(f, "parse error: {message}"), 
+            Self::Type(message) => write!(f, "type error: {message}"), 
+            Self::Runtime(message) => write!(f, "runtime error: {message}"), 
+            Self::Located { source, location } => write!(f, "{source} at line {}, column {}", location.line, location.column), 
+        } 
+    } 
+}
 impl std::error::Error for Error {}
 
-include!("compiler.rs");
-fn types_compatible(expected: &Type, found: &Type) -> bool {
+pub fn types_compatible(expected: &Type, found: &Type) -> bool {
     if expected == found { return true; }
     match (expected, found) {
         (Type::Module(expected_id), Type::Module(_)) if expected_id.is_empty() => true,
         (Type::DArray, Type::Array(_)) | (Type::Array(_), Type::DArray) => true,
         (Type::DTensor, Type::Tensor(_, _)) | (Type::Tensor(_, _), Type::DTensor) => true,
         (Type::DCudaTensor, Type::DCudaTensor) => true,
+        (Type::F32, Type::F16) => true,
+        (Type::F64, Type::F16 | Type::F32) => true,
+        (Type::I16, Type::I8 | Type::U8) => true,
+        (Type::I32, Type::I8 | Type::U8 | Type::I16 | Type::U16) => true,
+        (Type::I64, Type::I8 | Type::U8 | Type::I16 | Type::U16 | Type::I32 | Type::U32) => true,
+        (Type::U16, Type::U8) => true,
+        (Type::U32, Type::U8 | Type::U16) => true,
+        (Type::U64, Type::U8 | Type::U16 | Type::U32) => true,
         _ => false
     }
 }
-fn is_numeric(t: &Type) -> bool { !matches!(t, Type::Bool|Type::String|Type::Array(_)|Type::Tensor(_, _)|Type::Table(_)|Type::TableKey|Type::TableKeys|Type::Struct(_)|Type::Module(_)|Type::DArray|Type::DTensor) }
-fn is_integer(t: &Type) -> bool { matches!(t, Type::I8|Type::I16|Type::I32|Type::I64|Type::U8|Type::U16|Type::U32|Type::U64) }
 
-fn int_value(n: i128, ty: &Type) -> Result<Value, Error> {
+pub fn is_numeric(t: &Type) -> bool { 
+    !matches!(t, Type::Bool|Type::String|Type::Array(_)|Type::Tensor(_, _)|Type::Table(_)|Type::TableKey|Type::TableKeys|Type::Struct(_)|Type::Module(_)|Type::DArray|Type::DTensor) 
+}
+
+pub fn is_integer(t: &Type) -> bool { 
+    matches!(t, Type::I8|Type::I16|Type::I32|Type::I64|Type::U8|Type::U16|Type::U32|Type::U64) 
+}
+
+pub fn int_value(n: i128, ty: &Type) -> Result<Value, Error> {
     match ty {
         Type::I8 => i8::try_from(n).map(Value::I8).map_err(|_| Error::Type(format!("{n} does not fit in i8"))),
         Type::I16 => i16::try_from(n).map(Value::I16).map_err(|_| Error::Type(format!("{n} does not fit in i16"))),
@@ -422,86 +472,114 @@ fn int_value(n: i128, ty: &Type) -> Result<Value, Error> {
         _ => Err(Error::Type(format!("integer literal cannot initialize {ty}"))),
     }
 }
-fn float_value(n: f64, ty: &Type) -> Value { match ty { Type::F16=>Value::F16(f32_to_f16(n as f32)),Type::F32=>Value::F32(n as f32),_=>Value::F64(n) } }
+
+pub fn float_value(n: f64, ty: &Type) -> Value { 
+    match ty { 
+        Type::F16 => Value::F16(f32_to_f16(n as f32)), 
+        Type::F32 => Value::F32(n as f32), 
+        _ => Value::F64(n) 
+    } 
+}
 
 pub type L0RustFunction = fn(&[Value], &RefCell<Heap>) -> Result<Value, Error>;
 
 #[derive(Clone)]
-enum ExternalFunction {
+pub enum ExternalFunction {
     Rust(L0RustFunction),
-    C(L0CFunction),
+    C(crate::ffi::L0CFunction),
 }
 
 #[derive(Clone)]
-struct RegisteredExternal { signature: HostSignature, function: ExternalFunction }
+pub struct RegisteredExternal { 
+    pub signature: HostSignature, 
+    pub function: ExternalFunction 
+}
 
-struct FfiCall { arguments: Vec<Value>, results: Vec<Value> }
+pub struct FfiCall { pub arguments: Vec<Value>, pub results: Vec<Value> }
 
-struct ModuleInstance { artifact: ModuleArtifact, vm: Vm }
+pub struct ModuleInstance { pub artifact: ModuleArtifact, pub vm: Vm }
 
-/// A live local that has an L0 destructor.  Entries are added only after the
-/// initializer completed, so unwinding never calls a destructor for a partly
-/// constructed value.
 #[derive(Clone, Copy, Debug)]
-struct ActiveDestructor { slot: usize, target: usize }
+pub struct ActiveDestructor { pub slot: usize, pub target: usize }
 
 pub struct Vm {
-    stack: Vec<Value>,
-    stack_ptr: usize,
-    locals: Vec<Value>,
-    output: Vec<String>,
-    interactive: bool,
-    input: VecDeque<String>,
-    modules: HashMap<String, ModuleInstance>,
-    extern_functions: HashMap<String, RegisteredExternal>,
-    heap: Rc<RefCell<Heap>>,
-    gc_owner: bool,
-    callback_state: Option<*mut L0State>,
-    random_state: u64,
-    active_destructors: Vec<ActiveDestructor>,
+    pub stack: Vec<Value>,
+    pub stack_ptr: usize,
+    pub locals: Vec<Value>,
+    pub output: Vec<String>,
+    pub interactive: bool,
+    pub input: VecDeque<String>,
+    pub modules: HashMap<String, ModuleInstance>,
+    pub extern_functions: HashMap<String, RegisteredExternal>,
+    pub heap: Rc<RefCell<Heap>>,
+    pub gc_owner: bool,
+    pub callback_state: Option<*mut crate::ffi::L0State>,
+    pub random_state: u64,
+    pub active_destructors: Vec<ActiveDestructor>,
+    
+    pub native_modules: HashMap<String, Box<dyn crate::ext::NativeModule>>,
 }
 
 impl Default for Vm {
     fn default() -> Self {
-        Self { stack: vec![Value::Bool(false); 4096], stack_ptr: 0, locals: Vec::with_capacity(64), output: Vec::new(), interactive: false, input: VecDeque::new(), modules: HashMap::new(), extern_functions: HashMap::new(), heap: Rc::new(RefCell::new(Heap::default())), gc_owner: true, callback_state: None, random_state: 0x5EED_CAFE_D15C_A11E, active_destructors: Vec::new() }
+        let mut vm = Self { 
+            stack: vec![Value::Bool(false); 4096], 
+            stack_ptr: 0, 
+            locals: Vec::with_capacity(64), 
+            output: Vec::new(), 
+            interactive: false, 
+            input: VecDeque::new(), 
+            modules: HashMap::new(), 
+            extern_functions: HashMap::new(), 
+            heap: Rc::new(RefCell::new(Heap::default())), 
+            gc_owner: true, 
+            callback_state: None, 
+            random_state: 0x5EED_CAFE_D15C_A11E, 
+            active_destructors: Vec::new(),
+            native_modules: HashMap::new(),
+        };
+        
+        for ext in crate::ext::available_extensions() {
+            vm.native_modules.insert(ext.name().to_string(), ext);
+        }
+        vm
     }
 }
 
 impl Vm {
-    fn with_shared_heap(heap: Rc<RefCell<Heap>>, extern_functions: HashMap<String, RegisteredExternal>,
-                        callback_state: Option<*mut L0State>) -> Self
-    { Self { heap, extern_functions, gc_owner: false, callback_state, ..Self::default() } }
-    /// Controls whether output is written to stdout as it is produced.
-    ///
-    /// Interactive execution is required for programs that print a prompt and
-    /// then wait for standard input in the same run.
+    pub fn with_shared_heap(
+        heap: Rc<RefCell<Heap>>, 
+        extern_functions: HashMap<String, RegisteredExternal>,
+        callback_state: Option<*mut crate::ffi::L0State>
+    ) -> Self { 
+        Self { heap, extern_functions, gc_owner: false, callback_state, ..Self::default() } 
+    }
+
     pub fn set_interactive(&mut self, interactive: bool) {
         self.interactive = interactive;
     }
-    // A VM is single-threaded and a heap is never accessed re-entrantly by two
-    // VMs.  Module VMs share the allocation domain, hence the Rc<RefCell<_>> at
-    // the embedding boundary; the interpreter itself uses these short-lived
-    // references to avoid dynamic borrow checks for every memory opcode.
+
     #[inline(always)]
     fn heap_ref(&self) -> &Heap { unsafe { &*self.heap.as_ptr() } }
+    
     #[inline(always)]
     fn heap_mut(&mut self) -> &mut Heap { unsafe { &mut *self.heap.as_ptr() } }
-    pub fn register_rust_function(&mut self, name: impl Into<String>, arguments: Vec<Type>, result: Type,
-                                  function: L0RustFunction) -> Result<(), Error>
-    {self.register_external(name.into(), HostSignature { arguments, result }, ExternalFunction::Rust(function))}
 
-    /// Register a C ABI callback that takes `i32` arguments and returns one `i32`.
-    /// The callback reads arguments through `l0_to_i32` and pushes its result with
-    /// `l0_push_i32`; zero means success and any non-zero status aborts the call.
-    pub fn register_c_i32_function(&mut self, name: impl Into<String>, argument_count: usize, function: L0CFunction) -> Result<(), Error> {
-        self.register_external(name.into(), HostSignature { arguments: vec![Type::I32; argument_count], result: Type::I32 },
-                               ExternalFunction::C(function))
+    pub fn register_rust_function(
+        &mut self, name: impl Into<String>, arguments: Vec<Type>, result: Type, function: L0RustFunction
+    ) -> Result<(), Error> {
+        self.register_external(name.into(), HostSignature { arguments, result }, ExternalFunction::Rust(function))
     }
 
-    fn register_external(&mut self, name: String, signature: HostSignature, function: ExternalFunction) -> Result<(), Error> {
+    pub fn register_c_i32_function(&mut self, name: impl Into<String>, argument_count: usize, function: crate::ffi::L0CFunction) -> Result<(), Error> {
+        self.register_external(name.into(), HostSignature { arguments: vec![Type::I32; argument_count], result: Type::I32 }, ExternalFunction::C(function))
+    }
+
+    pub fn register_external(&mut self, name: String, signature: HostSignature, function: ExternalFunction) -> Result<(), Error> {
         if name.is_empty() { return Err(Error::Type("external function name cannot be empty".into())); }
-        if self.extern_functions.insert(name.clone(), RegisteredExternal { signature, function }).is_some()
-        { return Err(Error::Type(format!("external function '{name}' is already registered"))); }
+        if self.extern_functions.insert(name.clone(), RegisteredExternal { signature, function }).is_some() { 
+            return Err(Error::Type(format!("external function '{name}' is already registered"))); 
+        }
         Ok(())
     }
 
@@ -516,14 +594,10 @@ impl Vm {
         Ok(self.run(&code)?.to_vec())
     }
 
-    /// Queue one line for the next `input` expression. This makes input-driven
-    /// programs deterministic in tests and embedding applications.
     pub fn push_input(&mut self, data: String) {
         self.input.push_back(data);
     }
 
-    /// Execute a source file while retaining this VM's registered host
-    /// functions. Relative `require` paths are resolved from the source file.
     pub fn execute_file(&mut self, path: impl AsRef<Path>) -> Result<Vec<String>, Error> {
         let path = fs::canonicalize(path.as_ref())
             .map_err(|error| Error::Runtime(format!("cannot open source file: {error}")))?;
@@ -548,8 +622,6 @@ impl Vm {
         roots
     }
 
-    /// Run a full collection. The return value is the number of reclaimed
-    /// objects; it is public so the runtime can be integration-tested.
     pub fn collect_garbage(&mut self) -> usize {
         let roots = self.roots();
         self.heap_mut().collect(roots)
@@ -668,14 +740,22 @@ impl Vm {
             },
         };
         if result.ty() != registered.signature.result { return Err(Error::Runtime(format!("external function '{name}' returned {}; expected {}", result.ty(), registered.signature.result))); }
+        if !types_compatible(&registered.signature.result, &result.ty()) { 
+            return Err(Error::Runtime(format!("external function '{name}' returned {}; expected {}", result.ty(), registered.signature.result))); 
+        }
+        let final_result = if is_numeric(&registered.signature.result) && result.ty() != registered.signature.result {
+            cast_numeric(result, &registered.signature.result)?
+        } else {
+            result
+        };
         self.stack_ptr = base;
-        self.push(result);
+        self.push(final_result);
         Ok(())
     }
 
-    fn run(&mut self, code: &FlatBytecode) -> Result<&[String], Error> { self.run_from(code, 0, false) }
+    pub fn run(&mut self, code: &FlatBytecode) -> Result<&[String], Error> { self.run_from(code, 0, false) }
 
-    fn run_from(&mut self, code: &FlatBytecode, pc: usize, terminal_return: bool) -> Result<&[String], Error> {
+    pub fn run_from(&mut self, code: &FlatBytecode, pc: usize, terminal_return: bool) -> Result<&[String], Error> {
         match self.run_from_inner(code, pc, terminal_return, None) {
             Ok(_) => Ok(&self.output),
             Err(error) => {
@@ -685,8 +765,6 @@ impl Vm {
         }
     }
 
-    /// Best-effort cleanup after a runtime error.  The original runtime error
-    /// is retained even if a destructor itself fails while the VM unwinds.
     fn unwind_destructors(&mut self, code: &FlatBytecode) {
         while let Some(destructor) = self.active_destructors.pop() {
             let _ = self.run_from_inner(code, destructor.target, true, Some(destructor.slot));
@@ -700,9 +778,6 @@ impl Vm {
             let (instruction, next_pc) = code.decode(pc)?;
             match instruction {
             DecodedOp::AddI32 => {
-                // The compiler emits two operands for every arithmetic opcode.
-                // Keep the diagnostic in debug builds, but do not branch twice
-                // per instruction in the production arithmetic hot path.
                 let right = self.pop_compiled();
                 let left = self.pop_compiled();
                 let (Value::I32(left), Value::I32(right)) = (left, right) else {
@@ -880,8 +955,6 @@ impl Vm {
                 let Value::String(left_ref) = left else { return Err(Error::Runtime("VM string invariant broken".into())); };
                 let Value::String(right_ref) = right else { return Err(Error::Runtime("VM string invariant broken".into())); };
 
-                // Borrow only long enough to copy both source slices directly
-                // into one exactly-sized allocation.
                 let combined = {
                     let heap = self.heap_ref();
                     match (heap.get(left_ref)?, heap.get(right_ref)?) {
@@ -986,8 +1059,15 @@ impl Vm {
         } pc = next_pc; } Ok(&self.output)
     }
 
-    fn load_module(&mut self, artifact: ModuleArtifact) -> Result<(), Error> {
+    fn load_module(&mut self, artifact: crate::compiler::ModuleArtifact) -> Result<(), Error> {
         let id = artifact.id.clone();
+        
+        if let Some(ext) = self.native_modules.remove(&id) {
+            ext.register(self)?; 
+            self.push(Value::Module(id));
+            return Ok(());
+        }
+
         if !self.modules.contains_key(&id) {
             let mut vm = Vm::with_shared_heap(self.heap.clone(), self.extern_functions.clone(), self.callback_state);
             vm.run(&artifact.code)?;
@@ -995,7 +1075,8 @@ impl Vm {
             self.modules.insert(id.clone(), ModuleInstance { artifact, vm });
             for line in output { self.emit(line); }
         }
-        self.push(Value::Module(id)); Ok(())
+        self.push(Value::Module(id)); 
+        Ok(())
     }
 
     fn call_module_function(&mut self, slot: usize, name: &str) -> Result<(), Error> {
@@ -1006,8 +1087,6 @@ impl Vm {
                 ModuleExport::Function { entry } => *entry,
                 _ => return Err(Error::Runtime(format!("'{name}' is not an exported module function"))),
             };
-            // Module bytecode is immutable and shared. This is an O(1)
-            // reference-count increment, not a bytecode-buffer copy.
             let code = Rc::clone(&instance.artifact.code);
             instance.vm.run_from(&code, entry, true)?;
             std::mem::take(&mut instance.vm.output)
@@ -1016,37 +1095,35 @@ impl Vm {
     }
 
     #[inline(always)]
-    fn push(&mut self, value: Value) {
+    pub fn push(&mut self, value: Value) {
         if self.stack_ptr >= self.stack.len() { self.stack.resize((self.stack_ptr + 1) * 2, Value::Bool(false)); }
         unsafe { self.push_unchecked(value) }
     }
 
     #[inline(always)]
-    unsafe fn push_unchecked(&mut self, value: Value) {
+    pub unsafe fn push_unchecked(&mut self, value: Value) {
         *self.stack.get_unchecked_mut(self.stack_ptr) = value;
         self.stack_ptr += 1;
     }
 
     #[inline(always)]
-    unsafe fn pop_unchecked(&mut self) -> Value {
+    pub unsafe fn pop_unchecked(&mut self) -> Value {
         self.stack_ptr -= 1;
         self.stack.get_unchecked(self.stack_ptr).clone()
     }
 
-    /// Used only by opcodes whose stack effect is fixed and emitted by the
-    /// compiler.  The debug assertion keeps compiler/VM mismatches visible
-    /// during development; release builds perform no underflow branch.
     #[inline(always)]
-    fn pop_compiled(&mut self) -> Value {
+    pub fn pop_compiled(&mut self) -> Value {
         debug_assert!(self.stack_ptr > 0, "compiler emitted a stack underflow");
         unsafe { self.pop_unchecked() }
     }
 
-    fn pop(&mut self) -> Result<Value, Error> {
+    pub fn pop(&mut self) -> Result<Value, Error> {
         if self.stack_ptr == 0 { return Err(Error::Runtime("stack underflow".into())); }
         Ok(unsafe { self.pop_unchecked() })
     }
-    fn emit(&mut self, s: String) {
+    
+    pub fn emit(&mut self, s: String) {
         if self.interactive {
             println!("{s}");
             let _ = io::stdout().flush();
@@ -1054,7 +1131,7 @@ impl Vm {
         self.output.push(s);
     }
 
-    fn read_input(&mut self, ty: &Type) -> Result<Value, Error> {
+    pub fn read_input(&mut self, ty: &Type) -> Result<Value, Error> {
         let line = match self.input.pop_front() {
             Some(line) => line,
             None => {
@@ -1079,9 +1156,9 @@ impl Vm {
     }
 }
 
-fn integer_to_usize(v: &Value) -> Result<usize, Error> { match v { Value::I8(x) if *x>=0 => Ok(*x as usize),Value::I16(x) if *x>=0 => Ok(*x as usize),Value::I32(x) if *x>=0 => Ok(*x as usize),Value::I64(x) if *x>=0 => Ok(*x as usize),Value::U8(x)=>Ok(*x as usize),Value::U16(x)=>Ok(*x as usize),Value::U32(x)=>Ok(*x as usize),Value::U64(x)=>usize::try_from(*x).map_err(|_|Error::Runtime("array index too large".into())),_=>Err(Error::Runtime("array index must be non-negative integer".into())) } }
+pub fn integer_to_usize(v: &Value) -> Result<usize, Error> { match v { Value::I8(x) if *x>=0 => Ok(*x as usize),Value::I16(x) if *x>=0 => Ok(*x as usize),Value::I32(x) if *x>=0 => Ok(*x as usize),Value::I64(x) if *x>=0 => Ok(*x as usize),Value::U8(x)=>Ok(*x as usize),Value::U16(x)=>Ok(*x as usize),Value::U32(x)=>Ok(*x as usize),Value::U64(x)=>usize::try_from(*x).map_err(|_|Error::Runtime("array index too large".into())),_=>Err(Error::Runtime("array index must be non-negative integer".into())) } }
 
-fn evaluate_builtin1(builtin: BuiltinFn, arg: Value) -> Result<Value, Error> {
+pub fn evaluate_builtin1(builtin: BuiltinFn, arg: Value) -> Result<Value, Error> {
     if builtin == BuiltinFn::Abs {
         match arg {
             Value::I8(v) => return v.checked_abs().map(Value::I8).ok_or_else(|| Error::Runtime("abs overflow".into())),
@@ -1118,7 +1195,7 @@ fn evaluate_builtin1(builtin: BuiltinFn, arg: Value) -> Result<Value, Error> {
     }
 }
 
-fn evaluate_builtin2(builtin: BuiltinFn, a: Value, b: Value, ty: &Type) -> Result<Value, Error> {
+pub fn evaluate_builtin2(builtin: BuiltinFn, a: Value, b: Value, ty: &Type) -> Result<Value, Error> {
     if matches!(builtin, BuiltinFn::Min | BuiltinFn::Max) {
         macro_rules! min_max {
             ($x:ident, $l:ident, $r:ident) => {
@@ -1182,7 +1259,8 @@ fn evaluate_builtin2(builtin: BuiltinFn, a: Value, b: Value, ty: &Type) -> Resul
         _ => Err(Error::Runtime("built-in requires matching floats".into()))
     }
 }
-fn evaluate_binary(heap: &Heap, a: Value, b: Value, opcode: &BinaryOp) -> Result<Value, Error> {
+
+pub fn evaluate_binary(heap: &Heap, a: Value, b: Value, opcode: &BinaryOp) -> Result<Value, Error> {
     if matches!(opcode, BinaryOp::Equal | BinaryOp::NotEqual) {
         let equal = match (&a, &b) {
             (Value::String(left), Value::String(right)) => match (heap.get(*left)?, heap.get(*right)?) {
@@ -1266,7 +1344,7 @@ fn evaluate_binary(heap: &Heap, a: Value, b: Value, opcode: &BinaryOp) -> Result
     Err(Error::Runtime("VM execution invariant broken: unsupported binary op".into()))
 }
 
-fn evaluate_unary(a: Value, op: &UnOp, ty: &Type) -> Result<Value, Error> {
+pub fn evaluate_unary(a: Value, op: &UnOp, ty: &Type) -> Result<Value, Error> {
     match op {
         UnOp::Neg => {
             match ty {
@@ -1288,7 +1366,7 @@ fn evaluate_unary(a: Value, op: &UnOp, ty: &Type) -> Result<Value, Error> {
     Err(Error::Runtime("VM execution invariant broken: unsupported unary op".into()))
 }
 
-fn cast_numeric(val: Value, target_ty: &Type) -> Result<Value, Error> {
+pub fn cast_numeric(val: Value, target_ty: &Type) -> Result<Value, Error> {
     macro_rules! cast_macro {
         ($v:ident) => {
             match target_ty {
@@ -1323,11 +1401,13 @@ fn cast_numeric(val: Value, target_ty: &Type) -> Result<Value, Error> {
     })
 }
 
-/// Compile and execute a source unit. `print` output is returned line by line.
-pub fn execute(source: &str) -> Result<Vec<String>, Error> { let (program, strings) = Parser::new(lex(source)?).into_program()?; let code = Compiler::default().with_strings(strings).compile(program)?; let mut vm = Vm::default(); Ok(vm.run(&code)?.to_vec()) }
-/// Compile and execute a source unit with deterministic input lines.  This is
-/// intended for embeddings and tests, where reading the host stdin is not
-/// appropriate.
+pub fn execute(source: &str) -> Result<Vec<String>, Error> { 
+    let (program, strings) = Parser::new(lex(source)?).into_program()?; 
+    let code = Compiler::default().with_strings(strings).compile(program)?; 
+    let mut vm = Vm::default(); 
+    Ok(vm.run(&code)?.to_vec()) 
+}
+
 pub fn execute_with_input<I, S>(source: &str, input: I) -> Result<Vec<String>, Error>
 where
     I: IntoIterator<Item = S>,
@@ -1339,163 +1419,26 @@ where
     vm.input.extend(input.into_iter().map(Into::into));
     Ok(vm.run(&code)?.to_vec())
 }
-/// Compile and execute a source unit with output flushed as it is produced.
-pub fn execute_interactive(source: &str) -> Result<(), Error> { let (program, strings) = Parser::new(lex(source)?).into_program()?; let code = Compiler::default().with_strings(strings).compile(program)?; let mut vm = Vm { interactive: true, ..Vm::default() }; vm.run(&code)?; Ok(()) }
-/// Compile and execute an L0 file, allowing `require` to load relative modules below the directory containing that file.
-pub fn execute_file(path: impl AsRef<Path>) -> Result<Vec<String>, Error> { Vm::default().execute_file(path) }
-/// File-based interactive execution. Unlike `execute_interactive`, this mode supports `require` and treats the source file's directory as module root.
-pub fn execute_interactive_file(path: impl AsRef<Path>) -> Result<(), Error> { let path = fs::canonicalize(path.as_ref()).map_err(|error| Error::Runtime(format!("cannot open source file: {error}")))?; let root = path.parent().ok_or_else(|| Error::Runtime("source file has no parent directory".into()))?.to_path_buf(); let source = fs::read_to_string(&path).map_err(|error| Error::Runtime(format!("cannot read source file: {error}")))?; let (program, strings) = Parser::new(lex(&source)?).into_program()?; let code = Compiler::with_module_root(root).with_strings(strings).compile(program)?; let mut vm = Vm { interactive: true, ..Vm::default() }; vm.run(&code)?; Ok(()) }
 
-/// Opaque C ABI state. Only this crate may access its interior.
-#[repr(C)] pub struct L0State {
-    vm: Vm,
-    ffi_call: Option<FfiCall>,
-    is_executing: bool,
-    last_error: Option<CString>,
-}
-pub type L0CFunction = unsafe extern "C" fn(*mut L0State) -> c_int;
-
-/// Stable scalar type IDs accepted by the C FFI registration API.
-///
-/// C values are decoded from `c_int` before becoming this enum, so invalid C
-/// input cannot create an invalid Rust enum discriminant.
-#[repr(i32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum L0TypeId {
-    I8 = 0, I16, I32, I64, U8, U16, U32, U64, F16, F32, F64,
-    Bool, DArray, DTensor,
+pub fn execute_interactive(source: &str) -> Result<(), Error> { 
+    let (program, strings) = Parser::new(lex(source)?).into_program()?; 
+    let code = Compiler::default().with_strings(strings).compile(program)?; 
+    let mut vm = Vm { interactive: true, ..Vm::default() }; 
+    vm.run(&code)?; 
+    Ok(()) 
 }
 
-impl L0TypeId {
-    fn from_raw(value: c_int) -> Option<Self> {
-        Some(match value {
-            0 => Self::I8, 1 => Self::I16, 2 => Self::I32, 3 => Self::I64,
-            4 => Self::U8, 5 => Self::U16, 6 => Self::U32, 7 => Self::U64,
-            8 => Self::F16, 9 => Self::F32, 10 => Self::F64, 11 => Self::Bool,
-            12 => Self::DArray, 13 => Self::DTensor,
-            _ => return None,
-        })
-    }
-
-    fn to_l0_type(self) -> Type {
-        match self {
-            Self::I8 => Type::I8, Self::I16 => Type::I16, Self::I32 => Type::I32, Self::I64 => Type::I64,
-            Self::U8 => Type::U8, Self::U16 => Type::U16, Self::U32 => Type::U32, Self::U64 => Type::U64,
-            Self::F16 => Type::F16, Self::F32 => Type::F32, Self::F64 => Type::F64, Self::Bool => Type::Bool,
-            Self::DArray => Type::DArray, Self::DTensor => Type::DTensor,
-        }
-    }
+pub fn execute_file(path: impl AsRef<Path>) -> Result<Vec<String>, Error> { 
+    Vm::default().execute_file(path) 
 }
 
-fn c_scalar_type(value: c_int) -> Option<Type> { L0TypeId::from_raw(value).map(L0TypeId::to_l0_type) }
-fn ffi_argument(state: &L0State, index: usize) -> Option<&Value> { if let Some(call) = state.ffi_call.as_ref() { call.arguments.get(index) } else { state.vm.stack[..state.vm.stack_ptr].get(index) } }
-fn ffi_push(state: &mut L0State, value: Value) { if let Some(call) = state.ffi_call.as_mut() { call.results.push(value); } else { state.vm.push(value); } }
-macro_rules! c_scalar_helpers {
-    ($push:ident, $read:ident, $variant:ident, $ty:ty) => {
-        #[no_mangle] pub unsafe extern "C" fn $push(state: *mut L0State, value: $ty) {
-            if let Some(state) = state.as_mut() { ffi_push(state, Value::$variant(value)); }
-        }
-        #[no_mangle] pub unsafe extern "C" fn $read(state: *mut L0State, index: usize, out: *mut $ty) -> c_int {
-            let Some(state) = state.as_ref() else { return 0 };
-            let Some(out) = out.as_mut() else { return 0 };
-            let Some(Value::$variant(value)) = ffi_argument(state, index) else { return 0 };
-            *out = *value;
-            1
-        }
-    };
-}
-
-c_scalar_helpers!(l0_push_i8, l0_to_i8, I8, i8);
-c_scalar_helpers!(l0_push_i16, l0_to_i16, I16, i16);
-c_scalar_helpers!(l0_push_i32, l0_to_i32, I32, i32);
-c_scalar_helpers!(l0_push_i64, l0_to_i64, I64, i64);
-c_scalar_helpers!(l0_push_u8, l0_to_u8, U8, u8);
-c_scalar_helpers!(l0_push_u16, l0_to_u16, U16, u16);
-c_scalar_helpers!(l0_push_u32, l0_to_u32, U32, u32);
-c_scalar_helpers!(l0_push_u64, l0_to_u64, U64, u64);
-c_scalar_helpers!(l0_push_f16, l0_to_f16, F16, u16);
-c_scalar_helpers!(l0_push_f32, l0_to_f32, F32, f32);
-c_scalar_helpers!(l0_push_f64, l0_to_f64, F64, f64);
-
-#[no_mangle] pub unsafe extern "C" fn l0_push_bool(state: *mut L0State, value: c_int) {
-    if let Some(state) = state.as_mut() { ffi_push(state, Value::Bool(value != 0)); }
-}
-#[no_mangle] pub unsafe extern "C" fn l0_to_bool(state: *mut L0State, index: usize, out: *mut c_int) -> c_int {
-    let Some(state) = state.as_ref() else { return 0 };
-    let Some(out) = out.as_mut() else { return 0 };
-    let Some(Value::Bool(value)) = ffi_argument(state, index) else { return 0 };
-    *out = c_int::from(*value);
-    1
-}
-
-#[no_mangle] pub extern "C" fn l0_abi_version() -> u32 { ABI_VERSION }
-#[no_mangle] pub extern "C" fn l0_new_state() -> *mut L0State { Box::into_raw(Box::new(L0State { vm: Vm::default(), ffi_call: None, is_executing: false, last_error: None })) }
-/// # Safety
-/// `state` must be valid. The returned pointer remains valid until the next
-/// operation on this state and must not be freed by the caller.
-#[no_mangle] pub unsafe extern "C" fn l0_last_error(state: *const L0State) -> *const std::os::raw::c_char {
-    state.as_ref().and_then(|state| state.last_error.as_ref()).map_or(std::ptr::null(), |message| message.as_ptr())
-}
-/// # Safety
-/// `state` must have been returned by `l0_new_state` and not freed already.
-#[no_mangle] pub unsafe extern "C" fn l0_free_state(state: *mut L0State) { if !state.is_null() { drop(Box::from_raw(state)); } }
-/// # Safety
-/// `state` must be valid and `name` must be a NUL-terminated UTF-8 string.
-#[no_mangle] pub unsafe extern "C" fn l0_register_i32_function(state: *mut L0State, name: *const std::os::raw::c_char, function: L0CFunction, argument_count: usize) -> c_int {
-    let Some(state) = state.as_mut() else { return 0 };
-    if name.is_null() { return 0; }
-    let Ok(name) = CStr::from_ptr(name).to_str() else { return 0; };
-    match state.vm.register_c_i32_function(name, argument_count, function) { Ok(()) => 1, Err(_) => 0 }
-}
-/// # Safety
-/// `state` must be valid, `name` must be NUL-terminated UTF-8, and `arg_types`
-/// must address `argument_count` type IDs when that count is nonzero.
-#[no_mangle] pub unsafe extern "C" fn l0_register_c_function(state: *mut L0State, name: *const std::os::raw::c_char, function: L0CFunction, arg_types: *const c_int, argument_count: usize, result_type: c_int) -> c_int {
-    let Some(state) = state.as_mut() else { return 0 };
-    if name.is_null() || (argument_count != 0 && arg_types.is_null()) { return 0; }
-    let Ok(name) = CStr::from_ptr(name).to_str() else { return 0; };
-    let Some(result) = c_scalar_type(result_type) else { return 0; };
-    let raw_arguments = if argument_count == 0 { &[] } else { std::slice::from_raw_parts(arg_types, argument_count) };
-    let mut arguments = Vec::with_capacity(argument_count);
-    for &raw_type in raw_arguments { let Some(ty) = c_scalar_type(raw_type) else { return 0; }; arguments.push(ty); }
-    match state.vm.register_external(name.to_owned(), HostSignature { arguments, result }, ExternalFunction::C(function)) { Ok(()) => 1, Err(_) => 0 }
-}
-/// # Safety
-/// `state` must be valid and `source` must be a NUL-terminated UTF-8 L0 unit.
-#[no_mangle] pub unsafe extern "C" fn l0_execute(state: *mut L0State, source: *const std::os::raw::c_char) -> c_int {
-    let Some(state_ref) = state.as_mut() else { return 0 };
-    if source.is_null() { return 0; }
-    let Ok(source) = CStr::from_ptr(source).to_str() else { return 0; };
-    if state_ref.is_executing { return 0; }
-    state_ref.last_error = None;
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        state_ref.is_executing = true;
-        let previous_state = state_ref.vm.callback_state.replace(state);
-        let result = state_ref.vm.execute(source);
-        state_ref.vm.callback_state = previous_state;
-        state_ref.is_executing = false;
-        result
-    }));
-    match result {
-        Ok(Ok(_)) => 1,
-        Ok(Err(error)) => { state_ref.last_error = CString::new(error.to_string()).ok(); 0 }
-        Err(_) => {
-            state_ref.is_executing = false;
-            state_ref.vm.callback_state = None;
-            state_ref.last_error = CString::new("panic prevented from crossing the C ABI boundary").ok();
-            0
-        }
-    }
-}
-/// Converts an `f32` to IEEE-754 binary16 bits using the `half` crate's
-/// correctly rounded implementation.
-pub fn f32_to_f16(value: f32) -> u16 { f16::from_f32(value).to_bits() }
-
-/// Converts IEEE-754 binary16 bits to `f32` using the `half` crate.
-pub fn f16_to_f32(bits: u16) -> f32 { f16::from_bits(bits).to_f32() }
-
-#[cfg(test)]
-mod immediate_regression_tests {
-    use super::*;
-    include!("tests.rs");
+pub fn execute_interactive_file(path: impl AsRef<Path>) -> Result<(), Error> { 
+    let path = fs::canonicalize(path.as_ref()).map_err(|error| Error::Runtime(format!("cannot open source file: {error}")))?; 
+    let root = path.parent().ok_or_else(|| Error::Runtime("source file has no parent directory".into()))?.to_path_buf(); 
+    let source = fs::read_to_string(&path).map_err(|error| Error::Runtime(format!("cannot read source file: {error}")))?; 
+    let (program, strings) = Parser::new(lex(&source)?).into_program()?; 
+    let code = Compiler::with_module_root(root).with_strings(strings).compile(program)?; 
+    let mut vm = Vm { interactive: true, ..Vm::default() }; 
+    vm.run(&code)?; 
+    Ok(()) 
 }

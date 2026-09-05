@@ -1,3 +1,6 @@
+use super::*;
+use crate::compiler::*;
+
 #[test]
 fn float_literals_cannot_claim_non_float_types() {
     assert!(matches!(execute("let value: i32 = 1.0"), Err(Error::Located { source, location: SourceLocation { line: 1, column: 18, .. } }) if matches!(*source, Error::Type(_))));
