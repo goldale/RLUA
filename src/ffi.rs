@@ -50,36 +50,36 @@ impl L0TypeId {
     }
 }
 
-fn c_scalar_type(value: c_int) -> Option<Type> { 
-    L0TypeId::from_raw(value).map(L0TypeId::to_l0_type) 
+fn c_scalar_type(value: c_int) -> Option<Type> {
+    L0TypeId::from_raw(value).map(L0TypeId::to_l0_type)
 }
 
-fn ffi_argument(state: &L0State, index: usize) -> Option<&Value> { 
-    if let Some(call) = state.ffi_call.as_ref() { 
-        call.arguments.get(index) 
-    } else { 
-        state.vm.stack[..state.vm.stack_ptr].get(index) 
-    } 
+fn ffi_argument(state: &L0State, index: usize) -> Option<&Value> {
+    if let Some(call) = state.ffi_call.as_ref() {
+        call.arguments.get(index)
+    } else {
+        state.vm.stack[..state.vm.stack_ptr].get(index)
+    }
 }
 
-fn ffi_push(state: &mut L0State, value: Value) { 
-    if let Some(call) = state.ffi_call.as_mut() { 
-        call.results.push(value); 
-    } else { 
-        state.vm.push(value); 
-    } 
+fn ffi_push(state: &mut L0State, value: Value) {
+    if let Some(call) = state.ffi_call.as_mut() {
+        call.results.push(value);
+    } else {
+        state.vm.push(value);
+    }
 }
 
 macro_rules! c_scalar_helpers {
     ($push:ident, $read:ident, $variant:ident, $ty:ty) => {
-        #[no_mangle] 
+        #[no_mangle]
         pub unsafe extern "C" fn $push(state: *mut L0State, value: $ty) {
-            if let Some(state) = state.as_mut() { 
-                ffi_push(state, Value::$variant(value)); 
+            if let Some(state) = state.as_mut() {
+                ffi_push(state, Value::$variant(value));
             }
         }
-        
-        #[no_mangle] 
+
+        #[no_mangle]
         pub unsafe extern "C" fn $read(state: *mut L0State, index: usize, out: *mut $ty) -> c_int {
             let Some(state) = state.as_ref() else { return 0 };
             let Some(out) = out.as_mut() else { return 0 };
@@ -102,14 +102,14 @@ c_scalar_helpers!(l0_push_f16, l0_to_f16, F16, u16);
 c_scalar_helpers!(l0_push_f32, l0_to_f32, F32, f32);
 c_scalar_helpers!(l0_push_f64, l0_to_f64, F64, f64);
 
-#[no_mangle] 
+#[no_mangle]
 pub unsafe extern "C" fn l0_push_bool(state: *mut L0State, value: c_int) {
-    if let Some(state) = state.as_mut() { 
-        ffi_push(state, Value::Bool(value != 0)); 
+    if let Some(state) = state.as_mut() {
+        ffi_push(state, Value::Bool(value != 0));
     }
 }
 
-#[no_mangle] 
+#[no_mangle]
 pub unsafe extern "C" fn l0_to_bool(state: *mut L0State, index: usize, out: *mut c_int) -> c_int {
     let Some(state) = state.as_ref() else { return 0 };
     let Some(out) = out.as_mut() else { return 0 };
@@ -118,25 +118,25 @@ pub unsafe extern "C" fn l0_to_bool(state: *mut L0State, index: usize, out: *mut
     1
 }
 
-#[no_mangle] 
-pub extern "C" fn l0_abi_version() -> u32 { 
-    ABI_VERSION 
+#[no_mangle]
+pub extern "C" fn l0_abi_version() -> u32 {
+    ABI_VERSION
 }
 
-#[no_mangle] 
-pub extern "C" fn l0_new_state() -> *mut L0State { 
-    Box::into_raw(Box::new(L0State { 
-        vm: Vm::default(), 
-        ffi_call: None, 
-        is_executing: false, 
-        last_error: None 
-    })) 
+#[no_mangle]
+pub extern "C" fn l0_new_state() -> *mut L0State {
+    Box::into_raw(Box::new(L0State {
+        vm: Vm::default(),
+        ffi_call: None,
+        is_executing: false,
+        last_error: None
+    }))
 }
 
 /// # Safety
 /// `state` must be valid. The returned pointer remains valid until the next
 /// operation on this state and must not be freed by the caller.
-#[no_mangle] 
+#[no_mangle]
 pub unsafe extern "C" fn l0_last_error(state: *const L0State) -> *const c_char {
     state.as_ref()
         .and_then(|state| state.last_error.as_ref())
@@ -145,74 +145,74 @@ pub unsafe extern "C" fn l0_last_error(state: *const L0State) -> *const c_char {
 
 /// # Safety
 /// `state` must have been returned by `l0_new_state` and not freed already.
-#[no_mangle] 
-pub unsafe extern "C" fn l0_free_state(state: *mut L0State) { 
-    if !state.is_null() { drop(Box::from_raw(state)); } 
+#[no_mangle]
+pub unsafe extern "C" fn l0_free_state(state: *mut L0State) {
+    if !state.is_null() { drop(Box::from_raw(state)); }
 }
 
 /// # Safety
 /// `state` must be valid and `name` must be a NUL-terminated UTF-8 string.
-#[no_mangle] 
+#[no_mangle]
 pub unsafe extern "C" fn l0_register_i32_function(
-    state: *mut L0State, 
-    name: *const c_char, 
-    function: L0CFunction, 
+    state: *mut L0State,
+    name: *const c_char,
+    function: L0CFunction,
     argument_count: usize
 ) -> c_int {
     let Some(state) = state.as_mut() else { return 0 };
     if name.is_null() { return 0; }
     let Ok(name) = CStr::from_ptr(name).to_str() else { return 0; };
-    match state.vm.register_c_i32_function(name, argument_count, function) { 
-        Ok(()) => 1, 
-        Err(_) => 0 
+    match state.vm.register_c_i32_function(name, argument_count, function) {
+        Ok(()) => 1,
+        Err(_) => 0
     }
 }
 
 /// # Safety
 /// `state` must be valid, `name` must be NUL-terminated UTF-8, and `arg_types`
 /// must address `argument_count` type IDs when that count is nonzero.
-#[no_mangle] 
+#[no_mangle]
 pub unsafe extern "C" fn l0_register_c_function(
-    state: *mut L0State, 
-    name: *const c_char, 
-    function: L0CFunction, 
-    arg_types: *const c_int, 
-    argument_count: usize, 
+    state: *mut L0State,
+    name: *const c_char,
+    function: L0CFunction,
+    arg_types: *const c_int,
+    argument_count: usize,
     result_type: c_int
 ) -> c_int {
     let Some(state) = state.as_mut() else { return 0 };
     if name.is_null() || (argument_count != 0 && arg_types.is_null()) { return 0; }
     let Ok(name) = CStr::from_ptr(name).to_str() else { return 0; };
     let Some(result) = c_scalar_type(result_type) else { return 0; };
-    let raw_arguments = if argument_count == 0 { 
-        &[] 
-    } else { 
-        std::slice::from_raw_parts(arg_types, argument_count) 
+    let raw_arguments = if argument_count == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(arg_types, argument_count)
     };
     let mut arguments = Vec::with_capacity(argument_count);
-    for &raw_type in raw_arguments { 
-        let Some(ty) = c_scalar_type(raw_type) else { return 0; }; 
-        arguments.push(ty); 
+    for &raw_type in raw_arguments {
+        let Some(ty) = c_scalar_type(raw_type) else { return 0; };
+        arguments.push(ty);
     }
     match state.vm.register_external(
-        name.to_owned(), 
-        HostSignature { arguments, result }, 
+        name.to_owned(),
+        HostSignature { arguments, result },
         ExternalFunction::C(function)
-    ) { 
-        Ok(()) => 1, 
-        Err(_) => 0 
+    ) {
+        Ok(()) => 1,
+        Err(_) => 0
     }
 }
 
 /// # Safety
 /// `state` must be valid and `source` must be a NUL-terminated UTF-8 L0 unit.
-#[no_mangle] 
+#[no_mangle]
 pub unsafe extern "C" fn l0_execute(state: *mut L0State, source: *const c_char) -> c_int {
     let Some(state_ref) = state.as_mut() else { return 0 };
     if source.is_null() { return 0; }
     let Ok(source) = CStr::from_ptr(source).to_str() else { return 0; };
     if state_ref.is_executing { return 0; }
-    
+
     state_ref.last_error = None;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         state_ref.is_executing = true;
@@ -224,9 +224,9 @@ pub unsafe extern "C" fn l0_execute(state: *mut L0State, source: *const c_char) 
     }));
     match result {
         Ok(Ok(_)) => 1,
-        Ok(Err(error)) => { 
-            state_ref.last_error = CString::new(error.to_string()).ok(); 
-            0 
+        Ok(Err(error)) => {
+            state_ref.last_error = CString::new(error.to_string()).ok();
+            0
         }
         Err(_) => {
             state_ref.is_executing = false;

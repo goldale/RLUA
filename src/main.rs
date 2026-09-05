@@ -12,28 +12,30 @@ fn int2str(arguments: &[Value], heap: &RefCell<l0::Heap>) -> Result<Value, Error
     let ref_id = h.allocate(HeapObject::String(str_val));
     Ok(Value::String(ref_id))
 }
-
 fn main() {
     let path = env::args().nth(1).unwrap_or_else(|| {
         eprintln!("usage: l0 <file.l0>");
         process::exit(2);
     });
-
-    if let Err(e) = fs::metadata(&path) { 
-        eprintln!("{path}: {e}"); 
-        process::exit(2); 
+    if let Err(e) = fs::metadata(&path) {
+        eprintln!("{path}: {e}");
+        process::exit(2);
     }
-
     let mut vm = Vm::default();
     vm.set_interactive(true);
-
+    // Регистрируем все нативные модули (включая Candle) до компиляции скрипта
+    for ext in l0::ext::available_extensions() {
+        if let Err(e) = ext.register(&mut vm) {
+            eprintln!("Failed to register extension '{}': {}", ext.name(), e);
+            process::exit(1);
+        }
+    }
     if let Err(e) = vm.register_rust_function("int2str", vec![Type::I64], Type::String, int2str) {
         eprintln!("Failed to register built-in functions: {}", e);
         process::exit(1);
     }
-
-    if let Err(error) = vm.execute_file(&path) { 
-        eprintln!("{path}: {error}"); 
-        process::exit(1); 
+    if let Err(error) = vm.execute_file(&path) {
+        eprintln!("{path}: {error}");
+        process::exit(1);
     }
 }

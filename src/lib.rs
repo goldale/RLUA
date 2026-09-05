@@ -43,7 +43,7 @@ impl StringInterner {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Type {
-    I8, I16, I32, I64, U8, U16, U32, U64, F16, F32, F64, Bool, String,
+    I8, I16, I32, I64, U8, U16, U32, U64, F16, BF16, F32, F64, Bool, String,
     Array(Box<Type>), Tensor(Box<Type>, usize), Table(Box<Type>), TableKey, TableKeys,
     Struct(String), Module(String), DArray, DTensor,
 }
@@ -55,7 +55,7 @@ impl fmt::Display for Type {
             Self::I32 => write!(f, "i32"), Self::I64 => write!(f, "i64"),
             Self::U8 => write!(f, "u8"), Self::U16 => write!(f, "u16"),
             Self::U32 => write!(f, "u32"), Self::U64 => write!(f, "u64"),
-            Self::F16 => write!(f, "f16"), Self::F32 => write!(f, "f32"),
+            Self::F16 => write!(f, "f16"), Self::BF16 => write!(f, "bf16"), Self::F32 => write!(f, "f32"),
             Self::F64 => write!(f, "f64"), Self::Bool => write!(f, "bool"),
             Self::String => write!(f, "string"),
             Self::Array(inner) => write!(f, "vector<{}>", inner),
@@ -77,7 +77,7 @@ pub struct HeapRef(pub usize);
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     I8(i8), I16(i16), I32(i32), I64(i64), U8(u8), U16(u16), U32(u32), U64(u64),
-    F16(u16), F32(f32), F64(f64), Bool(bool), String(HeapRef),
+    F16(u16), BF16(u16), F32(f32), F64(f64), Bool(bool), String(HeapRef),
     Array(HeapRef, Box<Type>),
     Tensor(HeapRef, Rc<Type>),
     Table(HeapRef, Box<Type>),
@@ -101,7 +101,7 @@ impl Value {
             Self::I8(_) => Type::I8, Self::I16(_) => Type::I16, Self::I32(_) => Type::I32,
             Self::I64(_) => Type::I64, Self::U8(_) => Type::U8, Self::U16(_) => Type::U16,
             Self::U32(_) => Type::U32, Self::U64(_) => Type::U64, Self::F16(_) => Type::F16,
-            Self::F32(_) => Type::F32, Self::F64(_) => Type::F64, Self::Bool(_) => Type::Bool,
+            Self::BF16(_) => Type::BF16, Self::F32(_) => Type::F32, Self::F64(_) => Type::F64, Self::Bool(_) => Type::Bool,
             Self::String(_) => Type::String,
             Self::Array(_, element) => Type::Array(element.clone()),
             Self::Table(_, element) => Type::Table(element.clone()),
@@ -109,7 +109,7 @@ impl Value {
             Self::TableKeys(_) => Type::TableKeys,
             Self::Struct(_, layout) => Type::Struct(layout.name.clone()),
             Self::Module(id) => Type::Module(id.clone()),
-            Self::Tensor(_, ty) => (**ty).clone(), // Добавлена эта строка
+            Self::Tensor(_, ty) => (**ty).clone(),
         }
     }
     pub fn pack_array(values: Vec<Value>, element: &Type) -> Result<Vec<u8>, Error> {
@@ -276,7 +276,7 @@ pub fn table_key_from_value(heap: &Heap, value: &Value) -> Result<TableKey, Erro
 pub fn type_size(ty: &Type) -> Option<usize> {
     match ty {
         Type::I8 | Type::U8 | Type::Bool => Some(1),
-        Type::I16 | Type::U16 | Type::F16 => Some(2),
+        Type::I16 | Type::U16 | Type::F16 | Type::BF16 => Some(2),
         Type::I32 | Type::U32 | Type::F32 => Some(4),
         Type::I64 | Type::U64 | Type::F64 => Some(8),
         Type::Array(_) | Type::Tensor(_, _) | Type::Table(_)
@@ -293,7 +293,7 @@ pub fn encode_scalar(value: &Value, element: &Type, bytes: &mut Vec<u8>) -> Resu
     match value {
         Value::I8(v) => bytes.push(*v as u8), Value::U8(v) => bytes.push(*v),
         Value::Bool(v) => bytes.push(u8::from(*v)),
-        Value::I16(v) => bytes.extend(v.to_le_bytes()), Value::U16(v) | Value::F16(v) => bytes.extend(v.to_le_bytes()),
+        Value::I16(v) => bytes.extend(v.to_le_bytes()),Value::U16(v) | Value::F16(v) | Value::BF16(v) => bytes.extend(v.to_le_bytes()),
         Value::I32(v) => bytes.extend(v.to_le_bytes()), Value::U32(v) => bytes.extend(v.to_le_bytes()),
         Value::F32(v) => bytes.extend(v.to_bits().to_le_bytes()),
         Value::I64(v) => bytes.extend(v.to_le_bytes()), Value::U64(v) => bytes.extend(v.to_le_bytes()),
@@ -312,16 +312,21 @@ pub fn decode_scalar(bytes: &[u8], index: usize, element: &Type) -> Result<Value
 
     let cell = &bytes[offset..offset + size];
     match element {
-        Type::I8 => Ok(Value::I8(cell[0] as i8)), Type::U8 => Ok(Value::U8(cell[0])), Type::Bool => Ok(Value::Bool(cell[0] != 0)),
-        Type::I16 => Ok(Value::I16(i16::from_le_bytes(cell.try_into().unwrap()))), Type::U16 => Ok(Value::U16(u16::from_le_bytes(cell.try_into().unwrap()))),
-        Type::F16 => Ok(Value::F16(u16::from_le_bytes(cell.try_into().unwrap()))), Type::I32 => Ok(Value::I32(i32::from_le_bytes(cell.try_into().unwrap()))),
-        Type::U32 => Ok(Value::U32(u32::from_le_bytes(cell.try_into().unwrap()))), Type::F32 => Ok(Value::F32(f32::from_bits(u32::from_le_bytes(cell.try_into().unwrap())))),
-        Type::I64 => Ok(Value::I64(i64::from_le_bytes(cell.try_into().unwrap()))), Type::U64 => Ok(Value::U64(u64::from_le_bytes(cell.try_into().unwrap()))),
+        Type::I8 => Ok(Value::I8(cell[0] as i8)), Type::U8 => Ok(Value::U8(cell[0])),
+        Type::Bool => Ok(Value::Bool(cell[0] != 0)),
+        Type::I16 => Ok(Value::I16(i16::from_le_bytes(cell.try_into().unwrap()))),
+        Type::U16 => Ok(Value::U16(u16::from_le_bytes(cell.try_into().unwrap()))),
+        Type::F16 => Ok(Value::F16(u16::from_le_bytes(cell.try_into().unwrap()))),
+        Type::BF16 => Ok(Value::BF16(u16::from_le_bytes(cell.try_into().unwrap()))),
+        Type::I32 => Ok(Value::I32(i32::from_le_bytes(cell.try_into().unwrap()))),
+        Type::U32 => Ok(Value::U32(u32::from_le_bytes(cell.try_into().unwrap()))),
+        Type::F32 => Ok(Value::F32(f32::from_bits(u32::from_le_bytes(cell.try_into().unwrap())))),
+        Type::I64 => Ok(Value::I64(i64::from_le_bytes(cell.try_into().unwrap()))),
+        Type::U64 => Ok(Value::U64(u64::from_le_bytes(cell.try_into().unwrap()))),
         Type::F64 => Ok(Value::F64(f64::from_bits(u64::from_le_bytes(cell.try_into().unwrap())))),
         _ => Err(Error::Type("not a scalar type".into())),
     }
 }
-
 pub fn write_scalar(bytes: &mut [u8], index: usize, value: &Value, element: &Type) -> Result<(), Error> {
     let size = scalar_size(element)?;
     let offset = index.checked_mul(size).ok_or_else(|| Error::Runtime("array index too large".into()))?;
@@ -331,9 +336,11 @@ pub fn write_scalar(bytes: &mut [u8], index: usize, value: &Value, element: &Typ
     if &value.ty() != element { return Err(Error::Runtime("VM array type invariant broken".into())); }
     let cell = &mut bytes[offset..offset + size];
     match value {
-        Value::I8(v) => cell[0] = *v as u8, Value::U8(v) => cell[0] = *v, Value::Bool(v) => cell[0] = u8::from(*v),
+        Value::U8(v) => cell[0] = *v,
+        Value::I8(v) => cell[0] = *v as u8,
+        Value::Bool(v) => cell[0] = u8::from(*v),
         Value::I16(v) => cell.copy_from_slice(&v.to_le_bytes()),
-        Value::U16(v) | Value::F16(v) => cell.copy_from_slice(&v.to_le_bytes()),
+        Value::U16(v) | Value::F16(v) | Value::BF16(v) => cell.copy_from_slice(&v.to_le_bytes()),
         Value::I32(v) => cell.copy_from_slice(&v.to_le_bytes()),
         Value::U32(v) => cell.copy_from_slice(&v.to_le_bytes()),
         Value::F32(v) => cell.copy_from_slice(&v.to_bits().to_le_bytes()),
@@ -347,11 +354,17 @@ pub fn write_scalar(bytes: &mut [u8], index: usize, value: &Value, element: &Typ
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::I8(v) => write!(f, "{v}"), Self::I16(v) => write!(f, "{v}"),
-            Self::I32(v) => write!(f, "{v}"), Self::I64(v) => write!(f, "{v}"),
-            Self::U8(v) => write!(f, "{v}"), Self::U16(v) => write!(f, "{v}"),
-            Self::U32(v) => write!(f, "{v}"), Self::U64(v) => write!(f, "{v}"),
-            Self::F16(v) => write!(f, "{}", f16_to_f32(*v)), Self::F32(v) => write!(f, "{v}"),
+            Self::I8(v) => write!(f, "{v}"),
+            Self::I16(v) => write!(f, "{v}"),
+            Self::I32(v) => write!(f, "{v}"),
+            Self::I64(v) => write!(f, "{v}"),
+            Self::U8(v) => write!(f, "{v}"),
+            Self::U16(v) => write!(f, "{v}"),
+            Self::U32(v) => write!(f, "{v}"),
+            Self::U64(v) => write!(f, "{v}"),
+            Self::F16(v) => write!(f, "{}", f16_to_f32(*v)),
+            Self::F32(v) => write!(f, "{v}"),
+            Self::BF16(v) => write!(f, "{}", bf16_to_f32(*v)),
             Self::F64(v) => write!(f, "{v}"), Self::Bool(v) => write!(f, "{v}"),
             Self::String(reference) => write!(f, "string@{}", reference.0),
             Self::Array(reference, element) => write!(f, "vector<{}>@{}", element, reference.0),
@@ -364,48 +377,45 @@ impl fmt::Display for Value {
         }
     }
 }
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SourceLocation { pub offset: usize, pub line: usize, pub column: usize }
 
 impl SourceLocation {
-    pub fn at(chars: &[char], offset: usize) -> Self { 
-        let mut line = 1; let mut column = 1; 
-        for ch in &chars[..offset.min(chars.len())] { 
-            if *ch == '\n' { line += 1; column = 1; } else { column += 1; } 
-        } 
-        Self { offset, line, column } 
+    pub fn at(chars: &[char], offset: usize) -> Self {
+        let mut line = 1; let mut column = 1;
+        for ch in &chars[..offset.min(chars.len())] {
+            if *ch == '\n' { line += 1; column = 1; } else { column += 1; }
+        }
+        Self { offset, line, column }
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Error { 
-    Lex(String), Parse(String), Type(String), Runtime(String), 
-    Located { source: Box<Error>, location: SourceLocation } 
+pub enum Error {
+    Lex(String), Parse(String), Type(String), Runtime(String),
+    Located { source: Box<Error>, location: SourceLocation }
 }
-
 impl Error {
-    pub fn at(self, location: SourceLocation) -> Self { 
-        match self { 
-            Self::Located { .. } => self, 
-            source => Self::Located { source: Box::new(source), location } 
-        } 
+    pub fn at(self, location: SourceLocation) -> Self {
+        match self {
+            Self::Located { .. } => self,
+            source => Self::Located { source: Box::new(source), location }
+        }
     }
-    pub fn location(&self) -> Option<SourceLocation> { 
-        match self { Self::Located { location, .. } => Some(*location), _ => None } 
+    pub fn location(&self) -> Option<SourceLocation> {
+        match self { Self::Located { location, .. } => Some(*location), _ => None }
     }
 }
-
-impl fmt::Display for Error { 
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { 
-        match self { 
-            Self::Lex(message) => write!(f, "lex error: {message}"), 
-            Self::Parse(message) => write!(f, "parse error: {message}"), 
-            Self::Type(message) => write!(f, "type error: {message}"), 
-            Self::Runtime(message) => write!(f, "runtime error: {message}"), 
-            Self::Located { source, location } => write!(f, "{source} at line {}, column {}", location.line, location.column), 
-        } 
-    } 
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Lex(message) => write!(f, "lex error: {message}"),
+            Self::Parse(message) => write!(f, "parse error: {message}"),
+            Self::Type(message) => write!(f, "type error: {message}"),
+            Self::Runtime(message) => write!(f, "runtime error: {message}"),
+            Self::Located { source, location } => write!(f, "{source} at line {}, column {}", location.line, location.column),
+        }
+    }
 }
 impl std::error::Error for Error {}
 
@@ -415,8 +425,8 @@ pub fn types_compatible(expected: &Type, found: &Type) -> bool {
         (Type::Module(expected_id), Type::Module(_)) if expected_id.is_empty() => true,
         (Type::DArray, Type::Array(_)) | (Type::Array(_), Type::DArray) => true,
         (Type::DTensor, Type::Tensor(_, _)) | (Type::Tensor(_, _), Type::DTensor) => true,
-        (Type::F32, Type::F16) => true,
-        (Type::F64, Type::F16 | Type::F32) => true,
+        (Type::F32, Type::F16 | Type::BF16) => true,
+        (Type::F64, Type::F16 | Type::BF16 | Type::F32) => true,
         (Type::I16, Type::I8 | Type::U8) => true,
         (Type::I32, Type::I8 | Type::U8 | Type::I16 | Type::U16) => true,
         (Type::I64, Type::I8 | Type::U8 | Type::I16 | Type::U16 | Type::I32 | Type::U32) => true,
@@ -426,17 +436,24 @@ pub fn types_compatible(expected: &Type, found: &Type) -> bool {
         _ => false
     }
 }
-pub fn is_numeric(t: &Type) -> bool { 
-    !matches!(t, Type::Bool|Type::String|Type::Array(_)|Type::Tensor(_, _)|Type::Table(_)|Type::TableKey|Type::TableKeys|Type::Struct(_)|Type::Module(_)|Type::DArray|Type::DTensor) 
+pub fn is_numeric(t: &Type) -> bool {
+    !matches!(t, Type::Bool|Type::String|Type::Array(_)|Type::Tensor(_, _)|Type::Table(_)|Type::TableKey|Type::TableKeys|Type::Struct(_)|Type::Module(_)|Type::DArray|Type::DTensor)
 }
-pub fn is_integer(t: &Type) -> bool { 
-    matches!(t, Type::I8|Type::I16|Type::I32|Type::I64|Type::U8|Type::U16|Type::U32|Type::U64) 
+pub fn is_integer(t: &Type) -> bool {
+    matches!(t, Type::I8|Type::I16|Type::I32|Type::I64|Type::U8|Type::U16|Type::U32|Type::U64)
 }
 #[inline]
 pub fn f16_to_f32(bits: u16) -> f32 {
     half::f16::from_bits(bits).to_f32()
 }
-
+#[inline]
+pub fn bf16_to_f32(bits: u16) -> f32 {
+    half::bf16::from_bits(bits).to_f32()
+}
+#[inline]
+pub fn f32_to_bf16(value: f32) -> u16 {
+    half::bf16::from_f32(value).to_bits()
+}
 #[inline]
 pub fn f32_to_f16(value: f32) -> u16 {
     half::f16::from_f32(value).to_bits()
@@ -454,12 +471,13 @@ pub fn int_value(n: i128, ty: &Type) -> Result<Value, Error> {
         _ => Err(Error::Type(format!("integer literal cannot initialize {ty}"))),
     }
 }
-pub fn float_value(n: f64, ty: &Type) -> Value { 
-    match ty { 
-        Type::F16 => Value::F16(f32_to_f16(n as f32)), 
-        Type::F32 => Value::F32(n as f32), 
-        _ => Value::F64(n) 
-    } 
+pub fn float_value(n: f64, ty: &Type) -> Value {
+    match ty {
+        Type::F16 => Value::F16(f32_to_f16(n as f32)),
+        Type::BF16 => Value::BF16(f32_to_bf16(n as f32)),
+        Type::F32 => Value::F32(n as f32),
+        _ => Value::F64(n)
+    }
 }
 pub type L0RustFunction = fn(&[Value], &RefCell<Heap>) -> Result<Value, Error>;
 
@@ -469,9 +487,9 @@ pub enum ExternalFunction {
     C(crate::ffi::L0CFunction),
 }
 #[derive(Clone)]
-pub struct RegisteredExternal { 
-    pub signature: HostSignature, 
-    pub function: ExternalFunction 
+pub struct RegisteredExternal {
+    pub signature: HostSignature,
+    pub function: ExternalFunction
 }
 pub struct FfiCall { pub arguments: Vec<Value>, pub results: Vec<Value> }
 pub struct ModuleInstance { pub artifact: ModuleArtifact, pub vm: Vm }
@@ -491,29 +509,29 @@ pub struct Vm {
     pub callback_state: Option<*mut crate::ffi::L0State>,
     pub random_state: u64,
     pub active_destructors: Vec<ActiveDestructor>,
-    
+
     pub native_modules: HashMap<String, Box<dyn crate::ext::NativeModule>>,
 }
 
 impl Default for Vm {
     fn default() -> Self {
-        let mut vm = Self { 
-            stack: vec![Value::Bool(false); 4096], 
-            stack_ptr: 0, 
-            locals: Vec::with_capacity(64), 
-            output: Vec::new(), 
-            interactive: false, 
-            input: VecDeque::new(), 
-            modules: HashMap::new(), 
-            extern_functions: HashMap::new(), 
-            heap: Rc::new(RefCell::new(Heap::default())), 
-            gc_owner: true, 
-            callback_state: None, 
-            random_state: 0x5EED_CAFE_D15C_A11E, 
+        let mut vm = Self {
+            stack: vec![Value::Bool(false); 4096],
+            stack_ptr: 0,
+            locals: Vec::with_capacity(64),
+            output: Vec::new(),
+            interactive: false,
+            input: VecDeque::new(),
+            modules: HashMap::new(),
+            extern_functions: HashMap::new(),
+            heap: Rc::new(RefCell::new(Heap::default())),
+            gc_owner: true,
+            callback_state: None,
+            random_state: 0x5EED_CAFE_D15C_A11E,
             active_destructors: Vec::new(),
             native_modules: HashMap::new(),
         };
-        
+
         for ext in crate::ext::available_extensions() {
             vm.native_modules.insert(ext.name().to_string(), ext);
         }
@@ -523,11 +541,11 @@ impl Default for Vm {
 
 impl Vm {
     pub fn with_shared_heap(
-        heap: Rc<RefCell<Heap>>, 
+        heap: Rc<RefCell<Heap>>,
         extern_functions: HashMap<String, RegisteredExternal>,
         callback_state: Option<*mut crate::ffi::L0State>
-    ) -> Self { 
-        Self { heap, extern_functions, gc_owner: false, callback_state, ..Self::default() } 
+    ) -> Self {
+        Self { heap, extern_functions, gc_owner: false, callback_state, ..Self::default() }
     }
 
     pub fn set_interactive(&mut self, interactive: bool) {
@@ -536,7 +554,7 @@ impl Vm {
 
     #[inline(always)]
     fn heap_ref(&self) -> &Heap { unsafe { &*self.heap.as_ptr() } }
-    
+
     #[inline(always)]
     fn heap_mut(&mut self) -> &mut Heap { unsafe { &mut *self.heap.as_ptr() } }
 
@@ -552,8 +570,8 @@ impl Vm {
 
     pub fn register_external(&mut self, name: String, signature: HostSignature, function: ExternalFunction) -> Result<(), Error> {
         if name.is_empty() { return Err(Error::Type("external function name cannot be empty".into())); }
-        if self.extern_functions.insert(name.clone(), RegisteredExternal { signature, function }).is_some() { 
-            return Err(Error::Type(format!("external function '{name}' is already registered"))); 
+        if self.extern_functions.insert(name.clone(), RegisteredExternal { signature, function }).is_some() {
+            return Err(Error::Type(format!("external function '{name}' is already registered")));
         }
         Ok(())
     }
@@ -655,6 +673,7 @@ impl Vm {
             let value = match init {
                 TensorInit::Random => match element {
                     Type::F16 => Value::F16(f32_to_f16(self.next_random_unit() as f32)),
+                    Type::BF16 => Value::BF16(f32_to_bf16(self.next_random_unit() as f32)),
                     Type::F32 => Value::F32(self.next_random_unit() as f32),
                     Type::F64 => Value::F64(self.next_random_unit()),
                     _ => return Err(Error::Runtime("random tensor element invariant broken".into())),
@@ -714,9 +733,8 @@ impl Vm {
                 ffi_call.results.into_iter().next().expect("checked external result")
             },
         };
-        if result.ty() != registered.signature.result { return Err(Error::Runtime(format!("external function '{name}' returned {}; expected {}", result.ty(), registered.signature.result))); }
-        if !types_compatible(&registered.signature.result, &result.ty()) { 
-            return Err(Error::Runtime(format!("external function '{name}' returned {}; expected {}", result.ty(), registered.signature.result))); 
+        if !types_compatible(&registered.signature.result, &result.ty()) {
+            return Err(Error::Runtime(format!("external function '{name}' returned {}; expected {}", result.ty(), registered.signature.result)));
         }
         let final_result = if is_numeric(&registered.signature.result) && result.ty() != registered.signature.result {
             cast_numeric(result, &registered.signature.result)?
@@ -1036,9 +1054,9 @@ impl Vm {
 
     fn load_module(&mut self, artifact: crate::compiler::ModuleArtifact) -> Result<(), Error> {
         let id = artifact.id.clone();
-        
+
         if let Some(ext) = self.native_modules.remove(&id) {
-            ext.register(self)?; 
+            ext.register(self)?;
             self.push(Value::Module(id));
             return Ok(());
         }
@@ -1050,7 +1068,7 @@ impl Vm {
             self.modules.insert(id.clone(), ModuleInstance { artifact, vm });
             for line in output { self.emit(line); }
         }
-        self.push(Value::Module(id)); 
+        self.push(Value::Module(id));
         Ok(())
     }
 
@@ -1097,7 +1115,7 @@ impl Vm {
         if self.stack_ptr == 0 { return Err(Error::Runtime("stack underflow".into())); }
         Ok(unsafe { self.pop_unchecked() })
     }
-    
+
     pub fn emit(&mut self, s: String) {
         if self.interactive {
             println!("{s}");
@@ -1141,9 +1159,10 @@ pub fn evaluate_builtin1(builtin: BuiltinFn, arg: Value) -> Result<Value, Error>
             Value::I32(v) => return v.checked_abs().map(Value::I32).ok_or_else(|| Error::Runtime("abs overflow".into())),
             Value::I64(v) => return v.checked_abs().map(Value::I64).ok_or_else(|| Error::Runtime("abs overflow".into())),
             Value::U8(_) | Value::U16(_) | Value::U32(_) | Value::U64(_) => return Ok(arg),
+            Value::F16(v) => return Ok(Value::F16(f32_to_f16(f16_to_f32(v).abs()))),
+            Value::BF16(v) => return Ok(Value::BF16(f32_to_bf16(bf16_to_f32(v).abs()))),
             Value::F32(v) => return Ok(Value::F32(v.abs())),
             Value::F64(v) => return Ok(Value::F64(v.abs())),
-            Value::F16(v) => return Ok(Value::F16(f32_to_f16(f16_to_f32(v).abs()))),
             _ => return Err(Error::Runtime("invalid type for abs".into())),
         }
     }
@@ -1166,6 +1185,17 @@ pub fn evaluate_builtin1(builtin: BuiltinFn, arg: Value) -> Result<Value, Error>
         Value::F32(v) => float_math1!(v, f32, F32, false),
         Value::F64(v) => float_math1!(v, f64, F64, false),
         Value::F16(v) => float_math1!(v, f32, F16, true),
+        Value::BF16(v) => {
+            let val = bf16_to_f32(*v);
+            let res = match builtin {
+                BuiltinFn::Sqrt => val.sqrt(), BuiltinFn::Sin => val.sin(), BuiltinFn::Cos => val.cos(),
+                BuiltinFn::Tan => val.tan(), BuiltinFn::Asin => val.asin(), BuiltinFn::Acos => val.acos(),
+                BuiltinFn::Atan => val.atan(), BuiltinFn::Floor => val.floor(), BuiltinFn::Ceil => val.ceil(),
+                BuiltinFn::Round => val.round(),
+                _ => return Err(Error::Runtime("invalid unary built-in".into())),
+            };
+            Ok(Value::BF16(f32_to_bf16(res)))
+        },
         _ => Err(Error::Runtime("built-in requires a float".into()))
     }
 }
@@ -1193,6 +1223,11 @@ pub fn evaluate_builtin2(builtin: BuiltinFn, a: Value, b: Value, ty: &Type) -> R
                 let l = f16_to_f32(*l_raw); let r = f16_to_f32(*r_raw);
                 if builtin == BuiltinFn::Min { return Ok(Value::F16(f32_to_f16(if l < r { l } else { r }))); }
                 else { return Ok(Value::F16(f32_to_f16(if l > r { l } else { r }))); }
+            },
+            (Value::BF16(l_raw), Value::BF16(r_raw)) => {
+                let l = bf16_to_f32(*l_raw); let r = bf16_to_f32(*r_raw);
+                if builtin == BuiltinFn::Min { return Ok(Value::BF16(f32_to_bf16(if l < r { l } else { r }))); }
+                else { return Ok(Value::BF16(f32_to_bf16(if l > r { l } else { r }))); }
             },
             _ => return Err(Error::Runtime("invalid type for min/max".into()))
         }
@@ -1231,6 +1266,15 @@ pub fn evaluate_builtin2(builtin: BuiltinFn, a: Value, b: Value, ty: &Type) -> R
         (Value::F32(l), Value::F32(r)) => float_math2!(l, r, f32, F32, false),
         (Value::F64(l), Value::F64(r)) => float_math2!(l, r, f64, F64, false),
         (Value::F16(l), Value::F16(r)) => float_math2!(l, r, f32, F16, true),
+        (Value::BF16(l), Value::BF16(r)) => {
+            let l = bf16_to_f32(*l);
+            let r = bf16_to_f32(*r);
+            let res = match builtin {
+                BuiltinFn::Pow => l.powf(r), BuiltinFn::Atan2 => l.atan2(r),
+                _ => return Err(Error::Runtime("invalid binary built-in".into())),
+            };
+            Ok(Value::BF16(f32_to_bf16(res)))
+        },
         _ => Err(Error::Runtime("built-in requires matching floats".into()))
     }
 }
@@ -1314,6 +1358,24 @@ pub fn evaluate_binary(heap: &Heap, a: Value, b: Value, opcode: &BinaryOp) -> Re
                 }
             }
         },
+        BinaryOp::BF16(op) => {
+            if let (Value::BF16(l_raw), Value::BF16(r_raw)) = (a, b) {
+                let l = bf16_to_f32(l_raw);
+                let r = bf16_to_f32(r_raw);
+                match op {
+                    BinOp::Add => return Ok(Value::BF16(f32_to_bf16(l + r))),
+                    BinOp::Sub => return Ok(Value::BF16(f32_to_bf16(l - r))),
+                    BinOp::Mul => return Ok(Value::BF16(f32_to_bf16(l * r))),
+                    BinOp::Div => return Ok(Value::BF16(f32_to_bf16(l / r))),
+                    BinOp::Mod => return Ok(Value::BF16(f32_to_bf16(l % r))),
+                    BinOp::Lt  => return Ok(Value::Bool(l < r)),
+                    BinOp::Le  => return Ok(Value::Bool(l <= r)),
+                    BinOp::Gt  => return Ok(Value::Bool(l > r)),
+                    BinOp::Ge  => return Ok(Value::Bool(l >= r)),
+                    _ => return Err(Error::Runtime("VM float operator invariant broken".into()))
+                }
+            }
+        },
         BinaryOp::Equal | BinaryOp::NotEqual => unreachable!(),
     }
     Err(Error::Runtime("VM execution invariant broken: unsupported binary op".into()))
@@ -1331,6 +1393,7 @@ pub fn evaluate_unary(a: Value, op: &UnOp, ty: &Type) -> Result<Value, Error> {
                 Type::F32 => if let Value::F32(v) = a { return Ok(Value::F32(-v)); },
                 Type::F64 => if let Value::F64(v) = a { return Ok(Value::F64(-v)); },
                 Type::F16 => if let Value::F16(v) = a { return Ok(Value::F16(f32_to_f16(-f16_to_f32(v)))); },
+                Type::BF16 => if let Value::BF16(v) = a { return Ok(Value::BF16(f32_to_bf16(-bf16_to_f32(v)))); },
                 _ => {}
             }
         },
@@ -1356,6 +1419,7 @@ pub fn cast_numeric(val: Value, target_ty: &Type) -> Result<Value, Error> {
                 Type::F32 => Value::F32(*$v as f32),
                 Type::F64 => Value::F64(*$v as f64),
                 Type::F16 => Value::F16(f32_to_f16(*$v as f32)),
+                Type::BF16 => Value::BF16(f32_to_bf16(*$v as f32)),
                 _ => return Err(Error::Runtime("invalid cast target".into())),
             }
         }
@@ -1372,15 +1436,16 @@ pub fn cast_numeric(val: Value, target_ty: &Type) -> Result<Value, Error> {
         Value::F32(ref v) => cast_macro!(v),
         Value::F64(ref v) => cast_macro!(v),
         Value::F16(v_raw) => { let val = f16_to_f32(v_raw); let v = &val; cast_macro!(v) },
+        Value::BF16(v_raw) => { let val = bf16_to_f32(v_raw); let v = &val; cast_macro!(v) },
         _ => return Err(Error::Runtime("invalid cast source".into())),
     })
 }
 
-pub fn execute(source: &str) -> Result<Vec<String>, Error> { 
-    let (program, strings) = Parser::new(lex(source)?).into_program()?; 
-    let code = Compiler::default().with_strings(strings).compile(program)?; 
-    let mut vm = Vm::default(); 
-    Ok(vm.run(&code)?.to_vec()) 
+pub fn execute(source: &str) -> Result<Vec<String>, Error> {
+    let (program, strings) = Parser::new(lex(source)?).into_program()?;
+    let code = Compiler::default().with_strings(strings).compile(program)?;
+    let mut vm = Vm::default();
+    Ok(vm.run(&code)?.to_vec())
 }
 
 pub fn execute_with_input<I, S>(source: &str, input: I) -> Result<Vec<String>, Error>
@@ -1395,25 +1460,23 @@ where
     Ok(vm.run(&code)?.to_vec())
 }
 
-pub fn execute_interactive(source: &str) -> Result<(), Error> { 
-    let (program, strings) = Parser::new(lex(source)?).into_program()?; 
-    let code = Compiler::default().with_strings(strings).compile(program)?; 
-    let mut vm = Vm { interactive: true, ..Vm::default() }; 
-    vm.run(&code)?; 
-    Ok(()) 
+pub fn execute_interactive(source: &str) -> Result<(), Error> {
+    let (program, strings) = Parser::new(lex(source)?).into_program()?;
+    let code = Compiler::default().with_strings(strings).compile(program)?;
+    let mut vm = Vm { interactive: true, ..Vm::default() };
+    vm.run(&code)?;
+    Ok(())
 }
-
-pub fn execute_file(path: impl AsRef<Path>) -> Result<Vec<String>, Error> { 
-    Vm::default().execute_file(path) 
+pub fn execute_file(path: impl AsRef<Path>) -> Result<Vec<String>, Error> {
+    Vm::default().execute_file(path)
 }
-
-pub fn execute_interactive_file(path: impl AsRef<Path>) -> Result<(), Error> { 
-    let path = fs::canonicalize(path.as_ref()).map_err(|error| Error::Runtime(format!("cannot open source file: {error}")))?; 
-    let root = path.parent().ok_or_else(|| Error::Runtime("source file has no parent directory".into()))?.to_path_buf(); 
-    let source = fs::read_to_string(&path).map_err(|error| Error::Runtime(format!("cannot read source file: {error}")))?; 
-    let (program, strings) = Parser::new(lex(&source)?).into_program()?; 
-    let code = Compiler::with_module_root(root).with_strings(strings).compile(program)?; 
-    let mut vm = Vm { interactive: true, ..Vm::default() }; 
-    vm.run(&code)?; 
-    Ok(()) 
+pub fn execute_interactive_file(path: impl AsRef<Path>) -> Result<(), Error> {
+    let path = fs::canonicalize(path.as_ref()).map_err(|error| Error::Runtime(format!("cannot open source file: {error}")))?;
+    let root = path.parent().ok_or_else(|| Error::Runtime("source file has no parent directory".into()))?.to_path_buf();
+    let source = fs::read_to_string(&path).map_err(|error| Error::Runtime(format!("cannot read source file: {error}")))?;
+    let (program, strings) = Parser::new(lex(&source)?).into_program()?;
+    let code = Compiler::with_module_root(root).with_strings(strings).compile(program)?;
+    let mut vm = Vm { interactive: true, ..Vm::default() };
+    vm.run(&code)?;
+    Ok(())
 }

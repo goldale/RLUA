@@ -6,7 +6,7 @@ use std::fs;
 
 // Подтягиваем типы из VM (lib.rs)
 use crate::{
-    Error, SourceLocation, StringId, StringInterner, Type, Value, 
+    Error, SourceLocation, StringId, StringInterner, Type, Value,
     scalar_size, types_compatible, is_numeric, is_integer, int_value, float_value,
     StructField, StructLayout,
 };
@@ -173,7 +173,7 @@ impl Parser {
     fn location(&self) -> SourceLocation { self.tokens.get(self.at).map(|token| token.location).unwrap_or(self.last_location) }
     fn next(&mut self) -> Token { let token = self.tokens[self.at].clone(); self.at += 1; self.last_location = token.location; token.kind }
     fn need(&mut self, wanted: Token) -> Result<(), Error> { let got = self.next(); if got == wanted { Ok(()) } else { Err(Error::Parse(format!("expected {wanted:?}, got {got:?}"))) } }
-    
+
     pub fn program(&mut self) -> Result<Vec<Statement>, Error> { self.block().map_err(|error| error.at(self.location())) }
     pub fn into_program(mut self) -> Result<(Vec<Statement>, StringInterner), Error> {
         let program = self.program()?;
@@ -350,7 +350,7 @@ impl Parser {
         Token::Ident(n) => { let n = self.string(n); match n.as_str() {
             "i8" => Ok(Type::I8), "i16" => Ok(Type::I16), "i32" => Ok(Type::I32), "i64" => Ok(Type::I64),
             "u8" => Ok(Type::U8), "u16" => Ok(Type::U16), "u32" => Ok(Type::U32), "u64" => Ok(Type::U64),
-            "f16" => Ok(Type::F16), "f32" => Ok(Type::F32), "f64" => Ok(Type::F64), "bool" => Ok(Type::Bool),
+            "f16" => Ok(Type::F16), "bf16" => Ok(Type::BF16), "f32" => Ok(Type::F32), "f64" => Ok(Type::F64), "bool" => Ok(Type::Bool),
             "table_key" => Ok(Type::TableKey), "table_keys" => Ok(Type::TableKeys),
             "vector" => { self.need(Token::Lt)?; let inner = self.ty()?; self.need(Token::Gt)?; Ok(Type::Array(Box::new(inner))) },
             "tensor" => {
@@ -577,7 +577,7 @@ pub enum ModuleExport { Value { slot: usize, ty: Type }, Function { entry: usize
 pub enum BinaryOp {
     I8(BinOp), I16(BinOp), I32(BinOp), I64(BinOp),
     U8(BinOp), U16(BinOp), U32(BinOp), U64(BinOp),
-    F16(BinOp), F32(BinOp), F64(BinOp),
+    F16(BinOp), BF16(BinOp), F32(BinOp), F64(BinOp),
     Equal, NotEqual,
 }
 
@@ -693,7 +693,7 @@ impl FlatBytecode {
             IrOp::Return => out.op(Opcode::Return), IrOp::Print => out.op(Opcode::Print), IrOp::Printf(v) => { out.op(Opcode::Printf); out.word(v); }, IrOp::Putc => out.op(Opcode::Putc),
         } while out.words.len() % 4 != 0 { out.words.push(0); } } out
     }
-    
+
     #[inline(always)]
     pub fn decode(&self, mut pc: usize) -> Result<(DecodedOp<'_>, usize), Error> {
         let instruction_start = pc;
@@ -767,33 +767,33 @@ pub struct LoopContext {
 }
 
 pub struct Compiler {
-    pub names: HashMap<String, (usize, Type)>, 
+    pub names: HashMap<String, (usize, Type)>,
     pub structs: HashMap<String, StructLayout>,
     pub globals: HashMap<String, (usize, Type)>,
-    pub methods: HashMap<(String, String), Option<usize>>, 
+    pub methods: HashMap<(String, String), Option<usize>>,
     pub pending_method_calls: Vec<(usize, String, String)>,
-    pub current_method_fields: Option<HashMap<String, StructField>>, 
+    pub current_method_fields: Option<HashMap<String, StructField>>,
     pub current_method_struct: Option<String>,
-    pub module_root: Option<PathBuf>, 
+    pub module_root: Option<PathBuf>,
     pub module_artifacts: HashMap<String, ModuleArtifact>,
     pub compiling_modules: Rc<RefCell<HashSet<String>>>,
-    pub exports: HashMap<String, ModuleExport>, 
-    pub extern_functions: HashMap<String, HostSignature>, 
+    pub exports: HashMap<String, ModuleExport>,
+    pub extern_functions: HashMap<String, HostSignature>,
     pub code: Vec<Op>,
     pub interned_names: HashMap<String, Rc<str>>,
     pub strings: StringInterner,
-    pub next_slot: usize, 
-    pub scope_depth: usize, 
-    pub scope_stack: Vec<ScopeContext>, 
+    pub next_slot: usize,
+    pub scope_depth: usize,
+    pub scope_stack: Vec<ScopeContext>,
     pub loops: Vec<LoopContext>
 }
 
-impl Default for Compiler { 
-    fn default() -> Self { 
-        Self { 
-            names: HashMap::new(), structs: HashMap::new(), globals: HashMap::new(), methods: HashMap::new(), pending_method_calls: Vec::new(), current_method_fields: None, current_method_struct: None, module_root: None, module_artifacts: HashMap::new(), compiling_modules: Rc::new(RefCell::new(HashSet::new())), exports: HashMap::new(), extern_functions: HashMap::new(), code: Vec::new(), interned_names: HashMap::new(), strings: StringInterner::new(), next_slot: 0, scope_depth: 0, scope_stack: Vec::new(), loops: Vec::new() 
-        } 
-    } 
+impl Default for Compiler {
+    fn default() -> Self {
+        Self {
+            names: HashMap::new(), structs: HashMap::new(), globals: HashMap::new(), methods: HashMap::new(), pending_method_calls: Vec::new(), current_method_fields: None, current_method_struct: None, module_root: None, module_artifacts: HashMap::new(), compiling_modules: Rc::new(RefCell::new(HashSet::new())), exports: HashMap::new(), extern_functions: HashMap::new(), code: Vec::new(), interned_names: HashMap::new(), strings: StringInterner::new(), next_slot: 0, scope_depth: 0, scope_stack: Vec::new(), loops: Vec::new()
+        }
+    }
 }
 
 impl Compiler {
@@ -886,7 +886,7 @@ impl Compiler {
                 Type::I32 => Ok(BinaryOp::I32(op)), Type::I64 => Ok(BinaryOp::I64(op)),
                 Type::U8 => Ok(BinaryOp::U8(op)), Type::U16 => Ok(BinaryOp::U16(op)),
                 Type::U32 => Ok(BinaryOp::U32(op)), Type::U64 => Ok(BinaryOp::U64(op)),
-                Type::F16 => Ok(BinaryOp::F16(op)), Type::F32 => Ok(BinaryOp::F32(op)),
+                Type::F16 => Ok(BinaryOp::F16(op)), Type::BF16 => Ok(BinaryOp::BF16(op)), Type::F32 => Ok(BinaryOp::F32(op)),
                 Type::F64 => Ok(BinaryOp::F64(op)),
                 _ => Err(Error::Type(format!("unsupported binary operand type {ty}"))),
             },
@@ -921,7 +921,7 @@ impl Compiler {
         // 1. Проверяем наличие нативного расширения (например, "candle")
         let ext_names: Vec<String> = crate::ext::available_extensions()
             .into_iter().map(|e| e.name().to_string()).collect();
-            
+
         if ext_names.contains(&requested.to_string()) {
             let artifact = ModuleArtifact {
                 id: requested.to_string(),
@@ -940,7 +940,7 @@ impl Compiler {
         let canonical = fs::canonicalize(&candidate).map_err(|error| Error::Runtime(format!("cannot load module '{requested}': {error}")))?;
         if !canonical.starts_with(root) { return Err(Error::Type(format!("module '{requested}' escapes the module root"))); }
         let id = canonical.to_string_lossy().into_owned();
-        
+
         if let Some(module) = self.module_artifacts.get(&id) { return Ok(module.clone()); }
         if !self.compiling_modules.borrow_mut().insert(id.clone()) {
             return Err(Error::Type(format!("cyclic module import involving '{requested}'")));
@@ -996,7 +996,7 @@ impl Compiler {
         let saved_scope_stack = std::mem::take(&mut self.scope_stack);
         self.scope_depth += 1;
         self.scope_stack.push(ScopeContext::default());
-        
+
         for (arg_name, arg_ty) in args.into_iter().rev() {
             let slot = self.next_slot;
             self.next_slot += 1;
@@ -1010,7 +1010,7 @@ impl Compiler {
         self.current_method_struct = previous_struct;
         self.names = saved_names;
         self.scope_stack = saved_scope_stack;
-        
+
         self.scope_depth = saved_scope_depth;
         body_result?;
         self.code.push(Op::Return);
@@ -1104,21 +1104,21 @@ impl Compiler {
             }
             Ok(())
         },
-        Statement::Assign { name, expr } => { 
-            if let Some(field) = self.current_method_fields.as_ref().and_then(|fields| fields.get(&name)).cloned() { 
-                let found = self.expr(expr, Some(&field.ty))?; 
-                if !types_compatible(&field.ty, &found) { return Err(Error::Type(format!("field '{name}' is {}, but expression has type {found}", field.ty))); } 
-                if is_numeric(&field.ty) && field.ty != found { self.code.push(Op::Cast(Rc::new(field.ty.clone()))); } 
-                self.code.push(Op::StoreCurrentField(Rc::new(field))); 
-                Ok(()) 
-            } else { 
-                let (slot, ty) = self.names.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))?; 
-                let found = self.expr(expr, Some(&ty))?; 
-                if !types_compatible(&ty, &found) { return Err(Error::Type(format!("'{name}' is {ty}, but expression has type {found}"))); } 
-                if is_numeric(&ty) && ty != found { self.code.push(Op::Cast(Rc::new(ty.clone()))); } 
-                self.code.push(Op::Store(slot)); 
-                Ok(()) 
-            } 
+        Statement::Assign { name, expr } => {
+            if let Some(field) = self.current_method_fields.as_ref().and_then(|fields| fields.get(&name)).cloned() {
+                let found = self.expr(expr, Some(&field.ty))?;
+                if !types_compatible(&field.ty, &found) { return Err(Error::Type(format!("field '{name}' is {}, but expression has type {found}", field.ty))); }
+                if is_numeric(&field.ty) && field.ty != found { self.code.push(Op::Cast(Rc::new(field.ty.clone()))); }
+                self.code.push(Op::StoreCurrentField(Rc::new(field)));
+                Ok(())
+            } else {
+                let (slot, ty) = self.names.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown name '{name}'")))?;
+                let found = self.expr(expr, Some(&ty))?;
+                if !types_compatible(&ty, &found) { return Err(Error::Type(format!("'{name}' is {ty}, but expression has type {found}"))); }
+                if is_numeric(&ty) && ty != found { self.code.push(Op::Cast(Rc::new(ty.clone()))); }
+                self.code.push(Op::Store(slot));
+                Ok(())
+            }
         },
         Statement::GlobalAssign { name, expr } => { let (slot, ty) = self.globals.get(&name).cloned().ok_or_else(|| Error::Type(format!("unknown global name '{name}'")))?; let found = self.expr(expr, Some(&ty))?; if !types_compatible(&ty, &found) { return Err(Error::Type(format!("global '{name}' is {ty}, but expression has type {found}"))); } self.code.push(Op::Store(slot)); Ok(()) },
         Statement::SetIndex { name, indices, expr } => {
@@ -1323,7 +1323,7 @@ impl Compiler {
                 _ => unreachable!(),
             }
             self.code.push(Op::Store(item_slot));
-            
+
             self.loops.push(LoopContext { break_jumps: Vec::new(), continue_jumps: Vec::new(), continue_target: usize::MAX, scope_base: self.scope_stack.len() });
             self.scoped_block(body)?;
 
@@ -1343,7 +1343,7 @@ impl Compiler {
             for jump in context.continue_jumps { self.code[jump] = Op::Jump(context.continue_target); }
 
             self.names.remove(&name);
-            self.next_slot = iterable_slot; 
+            self.next_slot = iterable_slot;
             Ok(())
         },
         Statement::Break => {
@@ -1370,7 +1370,7 @@ impl Compiler {
         Expr::Integer(n) => { let ty = expected.unwrap_or(&Type::I32); let val = int_value(n, ty)?; self.code.push(Op::Push(val)); Ok(ty.clone()) },
         Expr::Float(n) => {
             let ty = expected.unwrap_or(&Type::F64);
-            if !matches!(ty, Type::F16 | Type::F32 | Type::F64) {
+            if !matches!(ty, Type::F16 | Type::BF16 | Type::F32 | Type::F64) {
                 return Err(Error::Type(format!("float literal cannot initialize {ty}")));
             }
             let val = float_value(n, ty);
@@ -1410,7 +1410,7 @@ impl Compiler {
             let shape_ty = self.expr(*shape, Some(&Type::Array(Box::new(Type::U64))))?;
             if shape_ty != Type::Array(Box::new(Type::U64)) { return Err(Error::Type("tensor shape must be vector<u64>".into())); }
             let init = if name == "zeros" { TensorInit::Zeros } else { TensorInit::Random };
-            if matches!(init, TensorInit::Random) && !matches!(element, Type::F16 | Type::F32 | Type::F64) { return Err(Error::Type("random<T> supports f16, f32, and f64 tensors only".into())); }
+            if matches!(init, TensorInit::Random) && !matches!(element, Type::F16 | Type::BF16 | Type::F32 | Type::F64) { return Err(Error::Type("random<T> supports f16, bf16, f32, and f64 tensors only".into())); }
             self.code.push(Op::MakeTensor(init, Rc::new(element.clone()), rank));
             Ok(Type::Tensor(Box::new(element), rank))
         },
@@ -1451,7 +1451,7 @@ impl Compiler {
                     if args.len() != 1 { return Err(Error::Type(format!("{} expects 1 argument", name))); }
                     let arg = args.remove(0);
                     let ty = self.expr(arg, expected)?;
-                    if !matches!(ty, Type::F16 | Type::F32 | Type::F64) { return Err(Error::Type(format!("{} requires a float argument, got {}", name, ty))); }
+                    if !matches!(ty, Type::F16 | Type::BF16 | Type::F32 | Type::F64) { return Err(Error::Type(format!("{} requires a float argument, got {}", name, ty))); }
                     self.code.push(Op::Builtin1(BuiltinFn::unary(&name).expect("known unary built-in"), Rc::new(ty.clone())));
                     Ok(ty)
                 },
@@ -1470,7 +1470,7 @@ impl Compiler {
                     let t1 = self.expr(arg1, expected)?;
                     let t2 = self.expr(arg2, Some(&t1))?;
                     if !types_compatible(&t1, &t2) { return Err(Error::Type(format!("{} arguments must have same type", name))); }
-                    if name == "atan2" && !matches!(t1, Type::F16 | Type::F32 | Type::F64) { return Err(Error::Type("atan2 requires float arguments".into())); }
+                    if name == "atan2" && !matches!(t1, Type::F16 | Type::BF16 | Type::F32 | Type::F64) { return Err(Error::Type("atan2 requires float arguments".into())); }
                     self.code.push(Op::Builtin2(BuiltinFn::binary(&name).expect("known binary built-in"), Rc::new(t1.clone())));
                     Ok(t1)
                 },
