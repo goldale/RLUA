@@ -27,6 +27,7 @@ ndarray-linalg = { version = "0.16.0", features = ["openblas-system"] }
 openblas-src = { version = "0.10", features = ["system", "rustls"] }
 #candle-core = { version = "0.6", features = ["cuda"] }
 candle-core = { version = "0.6"}
+candle-nn = { version = "0.6" }
 
 [[example]]
 name = "md5_host"

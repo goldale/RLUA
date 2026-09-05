@@ -1,0 +1,56 @@
+printf("=== ТЕСТ ЗАГРУЗКИ МОДЕЛИ В L0 ===\n")
+
+-- 1. Загружаем модель safetensors в память GPU/CPU
+let model_path: string = "smollm-135m.safetensors"
+printf("Чтение и mmap файла: {}\n", model_path)
+
+let weights: table<i32> = candle_load_model(model_path)
+let total_tensors: i32 = len(weights)
+printf("Успешно загружено тензоров: {}\n\n", total_tensors)
+
+-- 2. Инспектируем структуру: выведем первые несколько слоев модели
+printf("--- Примеры найденных слоев ---\n")
+let tkeys: table_keys = keys(weights)
+let limit: i32 = 10
+if total_tensors < limit then
+    limit = total_tensors
+end
+
+let i: i32 = 0
+for k in tkeys do
+    if i < limit then
+        printf("Тензор [{}]: ID = {}\n", k, weights[k])
+        i = i + 1
+    end
+end
+
+-- 3. Выполняем действия с входным трактом модели
+-- А: Извлекаем ID матрицы эмбеддингов и весов нормализации
+let w_embed_id: i32 = weights["model.embed_tokens.weight"]
+let w_norm_id: i32 = weights["model.layers.0.input_layernorm.weight"]
+
+printf("\nID матрицы эмбеддингов: {}\n", w_embed_id)
+printf("ID RMSNorm 0-го слоя: {}\n", w_norm_id)
+
+-- Б: Получаем эмбеддинг для токена (например, токен с ID = 42)
+printf("\nВыполняем Lookup эмбеддинга для токена 42...\n")
+let token_emb: i32 = candle_embedding(w_embed_id, 42)
+printf("Эмбеддинг создан в VRAM, ID тензора: {}\n", token_emb)
+
+-- В: Применяем RMSNorm первого слоя к эмбеддингу
+let eps: f32 = 0.00001
+printf("Применяем candle_rmsnorm (eps={})...\n", eps)
+let norm_emb: i32 = candle_rmsnorm(token_emb, w_norm_id, eps)
+printf("Нормализованный тензор ID: {}\n", norm_emb)
+
+-- Г: Прогоняем через Softmax
+let probs: i32 = candle_softmax(norm_emb)
+printf("Softmax применен, тензор вероятностей ID: {}\n", probs)
+
+-- 4. Освобождаем временные тензоры, чтобы не засорять видеопамять
+let free1: bool = candle_free_tensor(token_emb)
+let free2: bool = candle_free_tensor(norm_emb)
+let free3: bool = candle_free_tensor(probs)
+
+printf("\nВременные тензоры успешно очищены: {}\n", free1 && free2 && free3)
+printf("=== ТЕСТ УСПЕШНО ЗАВЕРШЕН ===\n")

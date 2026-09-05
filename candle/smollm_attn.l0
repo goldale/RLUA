@@ -1,0 +1,88 @@
+printf("=== ТЕСТ SELF-ATTENTION БЛОКА (SmolLM-135M) ===\n")
+
+-- 1. Загружаем веса
+let weights: table<i32> = candle_load_model("smollm-135m.safetensors")
+
+let w_emb: i32 = weights["model.embed_tokens.weight"]
+let w_norm: i32 = weights["model.layers.0.input_layernorm.weight"]
+
+let w_q: i32 = weights["model.layers.0.self_attn.q_proj.weight"]
+let w_k: i32 = weights["model.layers.0.self_attn.k_proj.weight"]
+let w_v: i32 = weights["model.layers.0.self_attn.v_proj.weight"]
+let w_o: i32 = weights["model.layers.0.self_attn.o_proj.weight"]
+
+-- Эмулируем вход первого токена (pos = 0)
+let x_emb: i32 = candle_embedding(w_emb, 42)
+let x_norm: i32 = candle_rmsnorm(x_emb, w_norm, 0.00001)
+
+-- ==========================================
+-- ФАЗА 1: Q, K, V Проекции
+-- ==========================================
+printf("\nФАЗА 1: Вычисляем проекции Q, K, V...\n")
+let q_id: i32 = candle_linear_id(w_q, x_norm) -- Форма: [576]
+let k_id: i32 = candle_linear_id(w_k, x_norm) -- Форма: [192]
+let v_id: i32 = candle_linear_id(w_v, x_norm) -- Форма: [192]
+
+-- ==========================================
+-- ФАЗА 2: Reshape под головы (GQA)
+-- ==========================================
+-- SmolLM-135M параметры: 9 Q-голов, 3 KV-головы, head_dim = 64
+let shape_q: vector<f32> = [1.0, 9.0, 64.0]
+let shape_k: vector<f32> = [1.0, 3.0, 64.0]
+
+let q_heads: i32 = candle_reshape_id(q_id, shape_q)
+let k_heads: i32 = candle_reshape_id(k_id, shape_k)
+let v_heads: i32 = candle_reshape_id(v_id, shape_k)
+
+-- ==========================================
+-- ФАЗА 3: RoPE
+-- ==========================================
+printf("ФАЗА 3: Применяем RoPE...\n")
+let q_rope: i32 = candle_apply_rope_id(q_heads, 0, 64)
+let k_rope: i32 = candle_apply_rope_id(k_heads, 0, 64)
+
+-- ==========================================
+-- ФАЗА 4: Дублирование ключей и значений
+-- ==========================================
+printf("ФАЗА 4: Разворачиваем GQA (repeat_kv)...\n")
+-- Голов Q в 3 раза больше (9 / 3 = 3), поэтому дублируем K и V трижды
+let k_rep: i32 = candle_repeat_kv_id(k_rope, 3)
+let v_rep: i32 = candle_repeat_kv_id(v_heads, 3)
+
+-- ==========================================
+-- ФАЗА 5: Умножение Attention (Scaled Dot-Product)
+-- ==========================================
+printf("ФАЗА 5: Q * K^T и Softmax...\n")
+-- Транспонируем K: [1, 9, 64] -> [1, 64, 9] (меняем размерности 1 и 2)
+let k_T: i32 = candle_transpose_id(k_rep, 1, 2)
+
+-- Умножаем: Q [1, 9, 64] * K^T [1, 64, 9] = Scores [1, 9, 9]
+let scores: i32 = candle_matmul_id(q_rope, k_T)
+
+-- Делим на sqrt(head_dim) = sqrt(64) = 8.0  -> умножаем на 1/8
+let scaled_scores: i32 = candle_scale_id(scores, 0.125)
+
+-- Softmax по последней оси (dim = 2)
+let attn_probs: i32 = candle_softmax_dim_id(scaled_scores, 2)
+
+-- Умножаем вероятности на значения: [1, 9, 9] * V [1, 9, 64] = Context [1, 9, 64]
+let context: i32 = candle_matmul_id(attn_probs, v_rep)
+
+-- ==========================================
+-- ФАЗА 6: O Projection (Output)
+-- ==========================================
+printf("ФАЗА 6: Выходная проекция (O)...\n")
+-- Сплющиваем головы обратно в [576]
+let flat_shape: vector<f32> = [576.0]
+let context_flat: i32 = candle_reshape_id(context, flat_shape)
+
+-- Умножаем на матрицу W_o
+let attn_out: i32 = candle_linear_id(w_o, context_flat)
+
+printf("\nAttention блок успешно вычислен! Граф отработал полностью на GPU.\n")
+
+-- Вытаскиваем результат на посмотреть
+let out_dyn: dArray = candle_get_darray(attn_out)
+let out_vec: vector<f32> = out_dyn
+
+printf("Срез выходных данных [0-2]: {}, {}, {}\n", out_vec[0], out_vec[1], out_vec[2])

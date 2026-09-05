@@ -1,0 +1,73 @@
+printf("=== ТЕСТ ПОЛНОЦЕННОГО MLP БЛОКА (SwiGLU) ===\n")
+
+-- 1. Загружаем модель (загружает только указатели!)
+let model_path: string = "smollm-135m.safetensors"
+printf("Загрузка весов из: {}\n", model_path)
+let weights: table<i32> = candle_load_model(model_path)
+
+-- Получаем ID нужных нам матриц
+let w_emb: i32 = weights["model.embed_tokens.weight"]
+let w_norm: i32 = weights["model.layers.0.input_layernorm.weight"]
+
+let w_gate: i32 = weights["model.layers.0.mlp.gate_proj.weight"]
+let w_up:   i32 = weights["model.layers.0.mlp.up_proj.weight"]
+let w_down: i32 = weights["model.layers.0.mlp.down_proj.weight"]
+
+printf("Веса успешно найдены в VRAM!\n\n")
+
+-- ==========================================
+-- ФАЗА 1: Подготовка входа (Embedding -> RMSNorm)
+-- ==========================================
+let token_id: i32 = 42
+let x_emb: i32 = candle_embedding(w_emb, token_id)
+let x_norm: i32 = candle_rmsnorm(x_emb, w_norm, 0.00001)
+
+-- ==========================================
+-- ФАЗА 2: Блок MLP (SwiGLU)
+-- ==========================================
+printf("Вычисляем MLP (SwiGLU)...\n")
+
+-- A. Gate Projection: gate = W_gate * x
+let gate_id: i32 = candle_linear_id(w_gate, x_norm)
+
+-- B. Up Projection: up = W_up * x
+let up_id: i32 = candle_linear_id(w_up, x_norm)
+
+-- C. Активация SiLU: act = SiLU(gate)
+let act_id: i32 = candle_silu(gate_id)
+
+-- D. Умножение (Element-wise): mul = act * up
+let mul_id: i32 = candle_mul_id(act_id, up_id)
+
+-- E. Down Projection: output = W_down * mul
+let mlp_out_id: i32 = candle_linear_id(w_down, mul_id)
+
+printf("MLP блок успешно вычислен на GPU!\n\n")
+
+-- ==========================================
+-- ФАЗА 3: Выгрузка результата в L0 и очистка
+-- ==========================================
+printf("Выгружаем результат на CPU для просмотра...\n")
+let out_dyn: dArray = candle_get_darray(mlp_out_id)
+
+-- Так как мы писали авто-каст и умные конвертеры,
+-- L0 сам поймет (f32 или f16) и отдаст нам нужный вектор!
+let mlp_vector: vector<f32> = out_dyn
+
+printf("Первые 5 значений на выходе MLP-блока:\n")
+printf("[0]: {}\n", mlp_vector[0])
+printf("[1]: {}\n", mlp_vector[1])
+printf("[2]: {}\n", mlp_vector[2])
+printf("[3]: {}\n", mlp_vector[3])
+printf("[4]: {}\n", mlp_vector[4])
+
+-- Очищаем видеопамять от промежуточных тензоров (ОБЯЗАТЕЛЬНО!)
+let f1: bool = candle_free_tensor(x_emb)
+let f2: bool = candle_free_tensor(x_norm)
+let f3: bool = candle_free_tensor(gate_id)
+let f4: bool = candle_free_tensor(up_id)
+let f5: bool = candle_free_tensor(act_id)
+let f6: bool = candle_free_tensor(mul_id)
+let f7: bool = candle_free_tensor(mlp_out_id)
+
+printf("\nВременная память освобождена.\n")

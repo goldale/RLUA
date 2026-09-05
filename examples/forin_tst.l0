@@ -51,11 +51,11 @@ for x in flow_vec do
     if x == 2 then
         continue -- Skip 2
     end
-    
+
     if x == 6 then
         break -- Stop completely before printing 6
     end
-    
+
     printf("Flow item: {}", x)
 end
 
@@ -63,9 +63,9 @@ end
 -- This ensures the compiler's `self.next_slot` correctly tracks and rewinds temporary slot allocations across nested scopes.
 printf("\n--- Test 5: Nested ForIn Loops ---\n")
 let outer_vec: vector<i32> = [1, 2]
-let inner_map: table<string> = table { 
-    [0] = "Aaaaaaa", 
-    [1] = "Byyyyyyy" 
+let inner_map: table<string> = table {
+    [0] = "Aaaaaaa",
+    [1] = "Byyyyyyy"
 }
 let tkeys: table_keys = keys(inner_map)
 
