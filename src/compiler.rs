@@ -1,14 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::fs;
 
 // Подтягиваем типы из VM (lib.rs)
 use crate::{
     Error, SourceLocation, StringId, StringInterner, Type, Value, 
     scalar_size, types_compatible, is_numeric, is_integer, int_value, float_value,
-    StructField, StructLayout, TableKey
+    StructField, StructLayout,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -361,7 +361,6 @@ impl Parser {
             "string" => Ok(Type::String),
             "dArray" => Ok(Type::DArray),
             "dTensor" => Ok(Type::DTensor),
-            "dCudaTensor" => Ok(Type::DCudaTensor),
             "module" => Ok(Type::Module(String::new())),
             _ if *self.peek() == Token::Dot => {
                 self.next();

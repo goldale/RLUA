@@ -10,16 +10,13 @@ mod tests;
 pub use compiler::*;
 pub use ffi::*;
 
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
 use std::rc::Rc;
-
-use cudarc::driver::{CudaSlice, DeviceSlice};
-use half::f16;
+use std::cell::RefCell;
+use std::io::{self, Write};
+use std::collections::{HashMap, VecDeque};
+use std::path::Path;
 
 pub const ABI_VERSION: u32 = 3;
 
@@ -48,7 +45,7 @@ impl StringInterner {
 pub enum Type {
     I8, I16, I32, I64, U8, U16, U32, U64, F16, F32, F64, Bool, String,
     Array(Box<Type>), Tensor(Box<Type>, usize), Table(Box<Type>), TableKey, TableKeys,
-    Struct(String), Module(String), DArray, DTensor, DCudaTensor,
+    Struct(String), Module(String), DArray, DTensor,
 }
 
 impl fmt::Display for Type {
@@ -66,7 +63,6 @@ impl fmt::Display for Type {
             Self::Table(inner) => write!(f, "table<{}>", inner),
             Self::TableKey => write!(f, "table_key"),
             Self::TableKeys => write!(f, "table_keys"),
-            Self::DCudaTensor => write!(f, "dCudaTensor"),
             Self::Struct(name) => write!(f, "{name}"),
             Self::Module(_) => write!(f, "module"),
             Self::DArray => write!(f, "dArray"),
@@ -84,7 +80,6 @@ pub enum Value {
     F16(u16), F32(f32), F64(f64), Bool(bool), String(HeapRef),
     Array(HeapRef, Box<Type>),
     Tensor(HeapRef, Rc<Type>),
-    CudaTensor(HeapRef, Rc<Type>),
     Table(HeapRef, Box<Type>),
     TableKey(Rc<TableKey>),
     TableKeys(HeapRef),
@@ -100,7 +95,6 @@ pub struct StructField { pub name: String, pub ty: Type, pub index: usize }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StructLayout { pub name: String, pub fields: Vec<StructField> }
-
 impl Value {
     pub fn ty(&self) -> Type {
         match self {
@@ -110,15 +104,14 @@ impl Value {
             Self::F32(_) => Type::F32, Self::F64(_) => Type::F64, Self::Bool(_) => Type::Bool,
             Self::String(_) => Type::String,
             Self::Array(_, element) => Type::Array(element.clone()),
-            Self::Tensor(_, ty) | Self::CudaTensor(_, ty) => ty.as_ref().clone(),
             Self::Table(_, element) => Type::Table(element.clone()),
             Self::TableKey(_) => Type::TableKey,
             Self::TableKeys(_) => Type::TableKeys,
             Self::Struct(_, layout) => Type::Struct(layout.name.clone()),
             Self::Module(id) => Type::Module(id.clone()),
+            Self::Tensor(_, ty) => (**ty).clone(), // Добавлена эта строка
         }
     }
-    
     pub fn pack_array(values: Vec<Value>, element: &Type) -> Result<Vec<u8>, Error> {
         let element_size = scalar_size(element)?;
         let mut bytes = Vec::with_capacity(values.len().checked_mul(element_size).ok_or_else(|| Error::Runtime("array is too large".into()))?);
@@ -126,24 +119,20 @@ impl Value {
         Ok(bytes)
     }
 }
-
 #[derive(Clone, Debug)]
 pub enum HeapObject {
     Array { bytes: Vec<u8>, element: Type },
     Struct { values: Vec<Value>, layout: Rc<StructLayout> },
     Tensor { bytes: Vec<u8>, element: Type, shape: Vec<usize> },
-    CudaTensor { data: CudaSlice<u8>, element: Type, shape: Vec<usize> },
     Table { entries: HashMap<TableKey, Value>, element: Type },
     TableKeys(Vec<TableKey>),
     String(String),
 }
-
 #[derive(Clone, Debug)]
 pub enum HeapSlot {
     Free { next_free: Option<usize> },
     Occupied { marked: bool, object: HeapObject },
 }
-
 #[derive(Debug)]
 pub struct Heap {
     pub slots: Vec<HeapSlot>,
@@ -172,7 +161,6 @@ impl Heap {
             HeapObject::String(text) => text.capacity(),
             HeapObject::Table { entries, .. } => entries.capacity() * size_of::<(TableKey, Value)>(),
             HeapObject::TableKeys(keys) => keys.capacity() * size_of::<TableKey>(),
-            HeapObject::CudaTensor { data, .. } => data.len(),
             HeapObject::Struct { values, layout } => {
                 values.capacity() * size_of::<Value>()
                     + layout.fields.capacity() * size_of::<StructField>()
@@ -180,7 +168,6 @@ impl Heap {
             },
         }
     }
-
     pub fn allocate(&mut self, object: HeapObject) -> HeapRef {
         self.allocated_bytes = self.allocated_bytes.saturating_add(Self::object_size(&object));
         if let Some(index) = self.free_head {
@@ -194,30 +181,25 @@ impl Heap {
         self.slots.push(HeapSlot::Occupied { marked: false, object });
         HeapRef(index)
     }
-
     pub fn get(&self, reference: HeapRef) -> Result<&HeapObject, Error> {
         match self.slots.get(reference.0) {
             Some(HeapSlot::Occupied { object, .. }) => Ok(object),
             _ => Err(Error::Runtime("dangling heap reference".into())),
         }
     }
-
     pub fn get_mut(&mut self, reference: HeapRef) -> Result<&mut HeapObject, Error> {
         match self.slots.get_mut(reference.0) {
             Some(HeapSlot::Occupied { object, .. }) => Ok(object),
             _ => Err(Error::Runtime("dangling heap reference".into())),
         }
     }
-
     pub fn heap_ref(value: &Value) -> Option<HeapRef> {
         match value {
             Value::Array(reference, _) | Value::Tensor(reference, _) | Value::String(reference)
-            | Value::Table(reference, _) | Value::TableKeys(reference) | Value::Struct(reference, _)
-            | Value::CudaTensor(reference, _) => Some(*reference),
+            | Value::Table(reference, _) | Value::TableKeys(reference) | Value::Struct(reference, _) => Some(*reference),
             _ => None,
         }
     }
-
     fn mark_reference(&mut self, root: HeapRef) {
         let mut work = vec![root];
         while let Some(reference) = work.pop() {
@@ -237,14 +219,12 @@ impl Heap {
                     HeapObject::Struct { values, .. } => {
                         work.extend(values.iter().filter_map(Self::heap_ref));
                     }
-                    HeapObject::Array { .. } | HeapObject::Tensor { .. } | HeapObject::CudaTensor { .. }
-                    | HeapObject::String(_) | HeapObject::TableKeys(_) => {}
+                    HeapObject::Array { .. } | HeapObject::Tensor { .. } | HeapObject::String(_) | HeapObject::TableKeys(_) => {}
                 },
                 _ => {}
             }
         }
     }
-
     pub fn collect(&mut self, roots: impl IntoIterator<Item = HeapRef>) -> usize {
         for root in roots { self.mark_reference(root); }
         let mut reclaimed = 0;
@@ -260,7 +240,6 @@ impl Heap {
                 }
             }
         }
-
         while let Some(HeapSlot::Free { .. }) = self.slots.last() {
             self.slots.pop();
         }
@@ -276,7 +255,6 @@ impl Heap {
         self.threshold_bytes = self.allocated_bytes.saturating_mul(2).max(64 * 1024);
         reclaimed
     }
-
     pub fn should_collect(&self) -> bool { self.allocated_bytes >= self.threshold_bytes }
 }
 
@@ -304,7 +282,7 @@ pub fn type_size(ty: &Type) -> Option<usize> {
         Type::Array(_) | Type::Tensor(_, _) | Type::Table(_)
             | Type::TableKey | Type::TableKeys | Type::Struct(_)
             | Type::String | Type::Module(_) | Type::DArray
-            | Type::DTensor | Type::DCudaTensor => None,
+            | Type::DTensor => None,
     }
 }
 
@@ -378,7 +356,6 @@ impl fmt::Display for Value {
             Self::String(reference) => write!(f, "string@{}", reference.0),
             Self::Array(reference, element) => write!(f, "vector<{}>@{}", element, reference.0),
             Self::Tensor(reference, ty) => write!(f, "{}@{}", ty, reference.0),
-            Self::CudaTensor(reference, ty) => write!(f, "{}@{}", ty, reference.0),
             Self::Table(reference, element) => write!(f, "table<{}>@{}", element, reference.0),
             Self::TableKey(key) => write!(f, "{}", table_key_display(key)),
             Self::TableKeys(reference) => write!(f, "table_keys@{}", reference.0),
@@ -438,7 +415,6 @@ pub fn types_compatible(expected: &Type, found: &Type) -> bool {
         (Type::Module(expected_id), Type::Module(_)) if expected_id.is_empty() => true,
         (Type::DArray, Type::Array(_)) | (Type::Array(_), Type::DArray) => true,
         (Type::DTensor, Type::Tensor(_, _)) | (Type::Tensor(_, _), Type::DTensor) => true,
-        (Type::DCudaTensor, Type::DCudaTensor) => true,
         (Type::F32, Type::F16) => true,
         (Type::F64, Type::F16 | Type::F32) => true,
         (Type::I16, Type::I8 | Type::U8) => true,
@@ -450,15 +426,21 @@ pub fn types_compatible(expected: &Type, found: &Type) -> bool {
         _ => false
     }
 }
-
 pub fn is_numeric(t: &Type) -> bool { 
     !matches!(t, Type::Bool|Type::String|Type::Array(_)|Type::Tensor(_, _)|Type::Table(_)|Type::TableKey|Type::TableKeys|Type::Struct(_)|Type::Module(_)|Type::DArray|Type::DTensor) 
 }
-
 pub fn is_integer(t: &Type) -> bool { 
     matches!(t, Type::I8|Type::I16|Type::I32|Type::I64|Type::U8|Type::U16|Type::U32|Type::U64) 
 }
+#[inline]
+pub fn f16_to_f32(bits: u16) -> f32 {
+    half::f16::from_bits(bits).to_f32()
+}
 
+#[inline]
+pub fn f32_to_f16(value: f32) -> u16 {
+    half::f16::from_f32(value).to_bits()
+}
 pub fn int_value(n: i128, ty: &Type) -> Result<Value, Error> {
     match ty {
         Type::I8 => i8::try_from(n).map(Value::I8).map_err(|_| Error::Type(format!("{n} does not fit in i8"))),
@@ -472,7 +454,6 @@ pub fn int_value(n: i128, ty: &Type) -> Result<Value, Error> {
         _ => Err(Error::Type(format!("integer literal cannot initialize {ty}"))),
     }
 }
-
 pub fn float_value(n: f64, ty: &Type) -> Value { 
     match ty { 
         Type::F16 => Value::F16(f32_to_f16(n as f32)), 
@@ -480,7 +461,6 @@ pub fn float_value(n: f64, ty: &Type) -> Value {
         _ => Value::F64(n) 
     } 
 }
-
 pub type L0RustFunction = fn(&[Value], &RefCell<Heap>) -> Result<Value, Error>;
 
 #[derive(Clone)]
@@ -488,20 +468,15 @@ pub enum ExternalFunction {
     Rust(L0RustFunction),
     C(crate::ffi::L0CFunction),
 }
-
 #[derive(Clone)]
 pub struct RegisteredExternal { 
     pub signature: HostSignature, 
     pub function: ExternalFunction 
 }
-
 pub struct FfiCall { pub arguments: Vec<Value>, pub results: Vec<Value> }
-
 pub struct ModuleInstance { pub artifact: ModuleArtifact, pub vm: Vm }
-
 #[derive(Clone, Copy, Debug)]
 pub struct ActiveDestructor { pub slot: usize, pub target: usize }
-
 pub struct Vm {
     pub stack: Vec<Value>,
     pub stack_ptr: usize,

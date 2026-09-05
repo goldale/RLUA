@@ -2,7 +2,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
 
 // Импортируем типы из ядра (lib.rs) и компилятора (compiler.rs)
-use crate::{Error, ExternalFunction, FfiCall, Type, Value, Vm};
+use crate::{ExternalFunction, FfiCall, Type, Value, Vm};
 use crate::compiler::HostSignature;
 
 pub const ABI_VERSION: u32 = 3;
@@ -222,7 +222,6 @@ pub unsafe extern "C" fn l0_execute(state: *mut L0State, source: *const c_char) 
         state_ref.is_executing = false;
         result
     }));
-    
     match result {
         Ok(Ok(_)) => 1,
         Ok(Err(error)) => { 
